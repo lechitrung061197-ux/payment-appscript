@@ -1,0 +1,879 @@
+/**
+ * ============================================================================
+ * AI_GATEWAY.GS — PAYMENT ALL
+ * ============================================================================
+ * Generic, permission-controlled bridge between AI and the Payment All workbook.
+ *
+ * READ tools:
+ *   - AI may inspect any business sheet, schema, rows, search, and aggregate.
+ *   - Sensitive credential columns are always blocked.
+ *
+ * SAFE actions:
+ *   - syncFlow
+ *   - syncCustomers
+ *   - sync both
+ *   - invoice preview
+ *   - generate/regenerate invoice PDF
+ *
+ * PROTECTED actions (PIN required; PIN is NEVER sent to OpenAI):
+ *   - create invoice
+ *   - change customer payout fee
+ *
+ * IMPORTANT:
+ *   Existing accounting logic remains in Flow.gs / CustomerV2.3.gs / InvoicePdf.gs.
+ *   This file does not reimplement accounting formulas.
+ * ============================================================================
+ */
+
+const PAYMENT_AI_CFG = Object.freeze({
+  HEADER_ROW: 2,
+  DATA_START_ROW: 3,
+  BUSINESS_TIMEZONE: 'America/New_York',
+  MAX_READ_ROWS: 200,
+  MAX_SEARCH_HITS: 120,
+  MAX_TOOL_OUTPUT_CHARS: 85000,
+  PENDING_ACTION_TTL_MS: 5 * 60 * 1000,
+  MAX_PIN_ATTEMPTS: 5,
+
+  PROP_SPREADSHEET_ID: 'PAYMENT_SPREADSHEET_ID',
+  PROP_ACTION_PIN_HASH: 'PAYMENT_ACTION_PIN_HASH',
+  PENDING_PREFIX: 'PAYMENT_AI_PENDING_ACTION_',
+
+  SENSITIVE_HEADERS: [
+    'Client ID',
+    'Client Secret',
+    'API Key',
+    'API Token',
+    'Access Token',
+    'Refresh Token',
+    'Password',
+    'PIN',
+    'Bot Token',
+    'OpenAI API Key'
+  ]
+});
+
+
+/************************* TOOL DEFINITIONS *************************/
+
+function payAiToolDefinitions_() {
+  const filterItem = {
+    type: 'object',
+    properties: {
+      column: { type: 'string', description: 'Exact sheet header name.' },
+      op: {
+        type: 'string',
+        enum: ['eq','neq','contains','starts_with','gt','gte','lt','lte','between','in','blank','not_blank','date_between'],
+        description: 'Filter operator.'
+      },
+      value: { type: 'string', description: 'Primary comparison value. Use YYYY-MM-DD for dates. For in, comma-separate values. Use empty string when unused.' },
+      value2: { type: 'string', description: 'Second value for between/date_between; otherwise empty string.' }
+    },
+    required: ['column','op','value','value2'],
+    additionalProperties: false
+  };
+
+  const metricItem = {
+    type: 'object',
+    properties: {
+      op: { type: 'string', enum: ['count','sum','avg','min','max'] },
+      column: { type: 'string', description: 'Exact numeric header. For count of rows, use empty string.' },
+      alias: { type: 'string', description: 'Short output label.' }
+    },
+    required: ['op','column','alias'],
+    additionalProperties: false
+  };
+
+  return [
+    {
+      type: 'function',
+      name: 'get_system_guide',
+      description: 'Read the Payment All architecture/business-rule guide. Use when you need to understand which sheet owns a concept or how customer vs treasury logic works.',
+      strict: true,
+      parameters: { type: 'object', properties: {}, required: [], additionalProperties: false }
+    },
+    {
+      type: 'function',
+      name: 'list_sheets',
+      description: 'List workbook sheets, row counts, and visible headers. Credential columns are omitted.',
+      strict: true,
+      parameters: { type: 'object', properties: {}, required: [], additionalProperties: false }
+    },
+    {
+      type: 'function',
+      name: 'get_sheet_schema',
+      description: 'Get exact visible headers and row count for one sheet. Use before querying an unfamiliar sheet.',
+      strict: true,
+      parameters: {
+        type: 'object',
+        properties: { sheet: { type: 'string' } },
+        required: ['sheet'],
+        additionalProperties: false
+      }
+    },
+    {
+      type: 'function',
+      name: 'read_sheet_rows',
+      description: 'Read filtered rows from one sheet. Can paginate and sort. Prefer filters and only needed columns instead of pulling an entire large sheet at once.',
+      strict: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string' },
+          columns: { type: 'array', items: { type: 'string' }, description: 'Exact headers to return. Empty array means all non-sensitive columns.' },
+          filters: { type: 'array', items: filterItem },
+          limit: { type: 'integer', minimum: 1, maximum: 200 },
+          offset: { type: 'integer', minimum: 0 },
+          sort_by: { type: 'string', description: 'Exact header to sort by, or empty string.' },
+          sort_direction: { type: 'string', enum: ['asc','desc','none'] }
+        },
+        required: ['sheet','columns','filters','limit','offset','sort_by','sort_direction'],
+        additionalProperties: false
+      }
+    },
+    {
+      type: 'function',
+      name: 'aggregate_sheet',
+      description: 'Calculate count/sum/avg/min/max across ALL matching rows in Apps Script, so the AI does not have to manually add money. Supports one optional group_by field.',
+      strict: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string' },
+          filters: { type: 'array', items: filterItem },
+          metrics: { type: 'array', minItems: 1, items: metricItem },
+          group_by: { type: 'string', description: 'Exact header to group by, or empty string.' }
+        },
+        required: ['sheet','filters','metrics','group_by'],
+        additionalProperties: false
+      }
+    },
+    {
+      type: 'function',
+      name: 'search_workbook',
+      description: 'Search visible business data across selected sheets (or all sheets) for a phrase such as transaction ID, invoice ID, customer name, prefix, reference, or key.',
+      strict: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string' },
+          sheets: { type: 'array', items: { type: 'string' }, description: 'Empty array means all sheets.' },
+          limit: { type: 'integer', minimum: 1, maximum: 120 }
+        },
+        required: ['query','sheets','limit'],
+        additionalProperties: false
+      }
+    },
+    {
+      type: 'function',
+      name: 'run_safe_action',
+      description: 'Run an approved non-destructive operational action. Invoice preview is safe. PDF generation changes PDF metadata only. Use empty strings for parameters not used by the selected action.',
+      strict: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['sync_flow','sync_customers','sync_both','preview_invoice','generate_invoice_pdf','validate_customer_system'] },
+          customer_key: { type: 'string' },
+          from_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty when unused.' },
+          to_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty when unused.' },
+          as_of_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty means today for preview.' },
+          settlement_key: { type: 'string' },
+          force: { type: 'boolean' }
+        },
+        required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force'],
+        additionalProperties: false
+      }
+    },
+    {
+      type: 'function',
+      name: 'request_protected_action',
+      description: 'Prepare a financial/data-changing action that requires the owner PIN. This NEVER executes the action immediately. It validates/previews, stores a 5-minute pending action, and asks the user to send /pin <PIN>. The PIN is handled locally and never sent to the AI.',
+      strict: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['create_invoice','set_customer_payout_fee'] },
+          customer_key: { type: 'string' },
+          from_date: { type: 'string' },
+          to_date: { type: 'string' },
+          as_of_date: { type: 'string' },
+          payout_fee_percent: { type: 'number', minimum: 0, maximum: 100 }
+        },
+        required: ['action','customer_key','from_date','to_date','as_of_date','payout_fee_percent'],
+        additionalProperties: false
+      }
+    }
+  ];
+}
+
+
+/************************* TOOL DISPATCH *************************/
+
+function payAiDispatchTool_(name, args, ctx) {
+  try {
+    switch (name) {
+      case 'get_system_guide':
+        return payAiToolResult_(true, { guide: payAiRuntimeGuide_() });
+      case 'list_sheets':
+        return payAiToolResult_(true, payAiListSheets_());
+      case 'get_sheet_schema':
+        return payAiToolResult_(true, payAiGetSheetSchema_(args.sheet));
+      case 'read_sheet_rows':
+        return payAiToolResult_(true, payAiReadSheetRows_(args));
+      case 'aggregate_sheet':
+        return payAiToolResult_(true, payAiAggregateSheet_(args));
+      case 'search_workbook':
+        return payAiToolResult_(true, payAiSearchWorkbook_(args));
+      case 'run_safe_action':
+        return payAiToolResult_(true, payAiRunSafeAction_(args));
+      case 'request_protected_action':
+        return payAiToolResult_(true, payAiRequestProtectedAction_(ctx, args));
+      default:
+        return payAiToolResult_(false, null, 'Unknown tool: ' + name);
+    }
+  } catch (err) {
+    return payAiToolResult_(false, null, err && err.message ? err.message : String(err));
+  }
+}
+
+function payAiToolResult_(ok, data, error) {
+  const out = { ok: !!ok };
+  if (ok) out.data = data;
+  else out.error = error || 'Unknown error';
+  return out;
+}
+
+
+/************************* SPREADSHEET CONTEXT *************************/
+
+function payAiSpreadsheet_() {
+  const props = PropertiesService.getScriptProperties();
+  let id = String(props.getProperty(PAYMENT_AI_CFG.PROP_SPREADSHEET_ID) || '').trim();
+
+  if (!id) {
+    const active = SpreadsheetApp.getActive();
+    if (!active) throw new Error('PAYMENT_SPREADSHEET_ID is not configured. Run setupPaymentAi() from the Payment All spreadsheet first.');
+    id = active.getId();
+    props.setProperty(PAYMENT_AI_CFG.PROP_SPREADSHEET_ID, id);
+  }
+
+  return SpreadsheetApp.openById(id);
+}
+
+function payAiActivateSpreadsheet_() {
+  const ss = payAiSpreadsheet_();
+  SpreadsheetApp.setActiveSpreadsheet(ss);
+  return ss;
+}
+
+function payAiSheet_(name) {
+  const ss = payAiSpreadsheet_();
+  const sh = ss.getSheetByName(String(name || '').trim());
+  if (!sh) throw new Error('Sheet not found: ' + name);
+  return sh;
+}
+
+function payAiHeaderMap_(sh) {
+  if (!sh || sh.getLastColumn() < 1) return {};
+  const headers = sh.getRange(PAYMENT_AI_CFG.HEADER_ROW, 1, 1, sh.getLastColumn()).getDisplayValues()[0];
+  const map = {};
+  headers.forEach(function(h, i) {
+    h = String(h || '').trim();
+    if (h) map[h] = i + 1;
+  });
+  return map;
+}
+
+function payAiVisibleHeaders_(sh) {
+  const map = payAiHeaderMap_(sh);
+  return Object.keys(map).filter(function(h) { return !payAiIsSensitiveHeader_(h); });
+}
+
+function payAiIsSensitiveHeader_(header) {
+  const h = String(header || '').trim().toLowerCase();
+  if (!h) return false;
+  if (PAYMENT_AI_CFG.SENSITIVE_HEADERS.some(function(x) { return h === x.toLowerCase(); })) return true;
+  return /(client\s*secret|api\s*key|api\s*token|access\s*token|refresh\s*token|password|passcode|\bpin\b|bot\s*token|secret\s*key)/i.test(h);
+}
+
+function payAiAssertVisibleHeader_(map, header) {
+  const h = String(header || '').trim();
+  if (!h || !map[h]) throw new Error('Header not found: ' + h);
+  if (payAiIsSensitiveHeader_(h)) throw new Error('Sensitive header is not available to AI: ' + h);
+  return h;
+}
+
+
+/************************* READ / SEARCH *************************/
+
+function payAiListSheets_() {
+  const ss = payAiSpreadsheet_();
+  return ss.getSheets().map(function(sh) {
+    return {
+      sheet: sh.getName(),
+      data_rows: Math.max(0, sh.getLastRow() - PAYMENT_AI_CFG.DATA_START_ROW + 1),
+      headers: payAiVisibleHeaders_(sh)
+    };
+  });
+}
+
+function payAiGetSheetSchema_(sheetName) {
+  const sh = payAiSheet_(sheetName);
+  return {
+    sheet: sh.getName(),
+    header_row: PAYMENT_AI_CFG.HEADER_ROW,
+    data_start_row: PAYMENT_AI_CFG.DATA_START_ROW,
+    data_rows: Math.max(0, sh.getLastRow() - PAYMENT_AI_CFG.DATA_START_ROW + 1),
+    headers: payAiVisibleHeaders_(sh)
+  };
+}
+
+function payAiReadSheetRows_(args) {
+  const sh = payAiSheet_(args.sheet);
+  const map = payAiHeaderMap_(sh);
+  const visible = payAiVisibleHeaders_(sh);
+
+  let columns = Array.isArray(args.columns) ? args.columns.map(String) : [];
+  if (!columns.length) columns = visible.slice();
+  columns = columns.map(function(c) { return payAiAssertVisibleHeader_(map, c); });
+
+  const filters = Array.isArray(args.filters) ? args.filters : [];
+  filters.forEach(function(f) { payAiAssertVisibleHeader_(map, f.column); });
+
+  const sortBy = String(args.sort_by || '').trim();
+  if (sortBy) payAiAssertVisibleHeader_(map, sortBy);
+
+  const rows = payAiReadObjects_(sh, map).filter(function(r) {
+    return payAiRowMatchesFilters_(r, filters);
+  });
+
+  if (sortBy && args.sort_direction !== 'none') {
+    const dir = args.sort_direction === 'desc' ? -1 : 1;
+    rows.sort(function(a, b) { return dir * payAiCompareValues_(a[sortBy], b[sortBy]); });
+  }
+
+  const offset = Math.max(0, Number(args.offset) || 0);
+  const limit = Math.min(PAYMENT_AI_CFG.MAX_READ_ROWS, Math.max(1, Number(args.limit) || 50));
+  const page = rows.slice(offset, offset + limit);
+
+  const data = page.map(function(r) {
+    const out = { _row: r._row };
+    columns.forEach(function(c) { out[c] = payAiJsonValue_(r[c]); });
+    return out;
+  });
+
+  return {
+    sheet: sh.getName(),
+    matched_rows: rows.length,
+    offset: offset,
+    returned_rows: data.length,
+    has_more: offset + data.length < rows.length,
+    columns: columns,
+    rows: data
+  };
+}
+
+function payAiAggregateSheet_(args) {
+  const sh = payAiSheet_(args.sheet);
+  const map = payAiHeaderMap_(sh);
+  const filters = Array.isArray(args.filters) ? args.filters : [];
+  filters.forEach(function(f) { payAiAssertVisibleHeader_(map, f.column); });
+
+  const metrics = Array.isArray(args.metrics) ? args.metrics : [];
+  if (!metrics.length) throw new Error('At least one metric is required.');
+  metrics.forEach(function(m) {
+    if (m.op !== 'count' || String(m.column || '').trim()) payAiAssertVisibleHeader_(map, m.column);
+  });
+
+  const groupBy = String(args.group_by || '').trim();
+  if (groupBy) payAiAssertVisibleHeader_(map, groupBy);
+
+  const rows = payAiReadObjects_(sh, map).filter(function(r) {
+    return payAiRowMatchesFilters_(r, filters);
+  });
+
+  const groups = {};
+  rows.forEach(function(r) {
+    const key = groupBy ? String(payAiJsonValue_(r[groupBy])) : '__ALL__';
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(r);
+  });
+
+  if (!rows.length && !groupBy) groups.__ALL__ = [];
+
+  const result = Object.keys(groups).map(function(groupKey) {
+    const rs = groups[groupKey];
+    const out = {};
+    if (groupBy) out[groupBy] = groupKey;
+
+    metrics.forEach(function(m) {
+      const alias = String(m.alias || '').trim() || (m.op + (m.column ? '_' + m.column : ''));
+      const values = m.column ? rs.map(function(r) { return payAiToNumber_(r[m.column]); }).filter(function(n) { return n !== null; }) : [];
+
+      if (m.op === 'count') out[alias] = m.column ? values.length : rs.length;
+      else if (m.op === 'sum') out[alias] = payAiRound_(values.reduce(function(a, b) { return a + b; }, 0), 6);
+      else if (m.op === 'avg') out[alias] = values.length ? payAiRound_(values.reduce(function(a, b) { return a + b; }, 0) / values.length, 6) : 0;
+      else if (m.op === 'min') out[alias] = values.length ? Math.min.apply(null, values) : 0;
+      else if (m.op === 'max') out[alias] = values.length ? Math.max.apply(null, values) : 0;
+    });
+
+    return out;
+  });
+
+  return {
+    sheet: sh.getName(),
+    matched_rows: rows.length,
+    group_by: groupBy,
+    results: result
+  };
+}
+
+function payAiSearchWorkbook_(args) {
+  const query = String(args.query || '').trim();
+  if (!query) throw new Error('Search query is required.');
+  const q = query.toLowerCase();
+  const ss = payAiSpreadsheet_();
+  const requested = Array.isArray(args.sheets) ? args.sheets.map(String).filter(Boolean) : [];
+  const limit = Math.min(PAYMENT_AI_CFG.MAX_SEARCH_HITS, Math.max(1, Number(args.limit) || 50));
+  const hits = [];
+
+  const sheets = requested.length
+    ? requested.map(function(n) { const s = ss.getSheetByName(n); if (!s) throw new Error('Sheet not found: ' + n); return s; })
+    : ss.getSheets();
+
+  for (let s = 0; s < sheets.length && hits.length < limit; s++) {
+    const sh = sheets[s];
+    const map = payAiHeaderMap_(sh);
+    const headers = payAiVisibleHeaders_(sh);
+    const rows = payAiReadObjects_(sh, map);
+
+    for (let i = 0; i < rows.length && hits.length < limit; i++) {
+      const row = rows[i];
+      const matchedCols = [];
+      headers.forEach(function(h) {
+        const value = payAiJsonValue_(row[h]);
+        if (String(value === null || value === undefined ? '' : value).toLowerCase().indexOf(q) !== -1) matchedCols.push(h);
+      });
+      if (!matchedCols.length) continue;
+
+      const preview = { _row: row._row };
+      matchedCols.slice(0, 5).forEach(function(h) { preview[h] = payAiJsonValue_(row[h]); });
+      ['Customer Key','Transaction Key','Transaction ID','PayPal Transaction ID','Invoice ID','Invoice Number','Settlement Key','Payout Key','Account Key','Label'].forEach(function(h) {
+        if (map[h] && !payAiIsSensitiveHeader_(h) && row[h] !== '' && row[h] !== null && row[h] !== undefined) preview[h] = payAiJsonValue_(row[h]);
+      });
+
+      hits.push({ sheet: sh.getName(), matched_columns: matchedCols.slice(0, 10), row: preview });
+    }
+  }
+
+  return { query: query, returned_hits: hits.length, truncated: hits.length >= limit, hits: hits };
+}
+
+function payAiReadObjects_(sh, map) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < PAYMENT_AI_CFG.DATA_START_ROW) return [];
+  const lastCol = sh.getLastColumn();
+  const values = sh.getRange(PAYMENT_AI_CFG.DATA_START_ROW, 1, lastRow - PAYMENT_AI_CFG.DATA_START_ROW + 1, lastCol).getValues();
+  const byIndex = {};
+  Object.keys(map).forEach(function(h) { byIndex[map[h] - 1] = h; });
+
+  return values.map(function(row, i) {
+    const o = { _row: PAYMENT_AI_CFG.DATA_START_ROW + i };
+    row.forEach(function(v, j) {
+      const h = byIndex[j];
+      if (h && !payAiIsSensitiveHeader_(h)) o[h] = v;
+    });
+    return o;
+  });
+}
+
+
+/************************* FILTERING *************************/
+
+function payAiRowMatchesFilters_(row, filters) {
+  return (filters || []).every(function(f) {
+    const actual = row[String(f.column || '').trim()];
+    const op = String(f.op || 'eq');
+    const v1 = String(f.value === null || f.value === undefined ? '' : f.value).trim();
+    const v2 = String(f.value2 === null || f.value2 === undefined ? '' : f.value2).trim();
+
+    if (op === 'blank') return actual === '' || actual === null || actual === undefined;
+    if (op === 'not_blank') return !(actual === '' || actual === null || actual === undefined);
+
+    if (op === 'contains') return String(payAiJsonValue_(actual)).toLowerCase().indexOf(v1.toLowerCase()) !== -1;
+    if (op === 'starts_with') return String(payAiJsonValue_(actual)).toLowerCase().indexOf(v1.toLowerCase()) === 0;
+    if (op === 'in') {
+      const set = v1.split(',').map(function(x) { return x.trim().toLowerCase(); }).filter(Boolean);
+      return set.indexOf(String(payAiJsonValue_(actual)).trim().toLowerCase()) !== -1;
+    }
+    if (op === 'date_between') {
+      const a = payAiDateKey_(actual), b = payAiDateKey_(v1), c = payAiDateKey_(v2);
+      return !!a && !!b && !!c && a >= b && a <= c;
+    }
+
+    const actualNum = payAiToNumber_(actual);
+    const v1Num = payAiToNumber_(v1);
+    const v2Num = payAiToNumber_(v2);
+    const numeric = actualNum !== null && v1Num !== null;
+
+    if (op === 'between') return numeric && v2Num !== null && actualNum >= v1Num && actualNum <= v2Num;
+    if (op === 'gt') return numeric ? actualNum > v1Num : payAiCompareValues_(actual, v1) > 0;
+    if (op === 'gte') return numeric ? actualNum >= v1Num : payAiCompareValues_(actual, v1) >= 0;
+    if (op === 'lt') return numeric ? actualNum < v1Num : payAiCompareValues_(actual, v1) < 0;
+    if (op === 'lte') return numeric ? actualNum <= v1Num : payAiCompareValues_(actual, v1) <= 0;
+
+    const aText = String(payAiJsonValue_(actual)).trim().toLowerCase();
+    const bText = v1.toLowerCase();
+    if (op === 'neq') return aText !== bText;
+    return aText === bText;
+  });
+}
+
+function payAiCompareValues_(a, b) {
+  if (a instanceof Date || b instanceof Date) {
+    const ad = payAiDateMs_(a), bd = payAiDateMs_(b);
+    if (ad !== null && bd !== null) return ad === bd ? 0 : (ad < bd ? -1 : 1);
+  }
+  const an = payAiToNumber_(a), bn = payAiToNumber_(b);
+  if (an !== null && bn !== null) return an === bn ? 0 : (an < bn ? -1 : 1);
+  const as = String(payAiJsonValue_(a)).toLowerCase(), bs = String(payAiJsonValue_(b)).toLowerCase();
+  return as === bs ? 0 : (as < bs ? -1 : 1);
+}
+
+
+/************************* SAFE ACTIONS *************************/
+
+function payAiRunSafeAction_(args) {
+  payAiActivateSpreadsheet_();
+  const action = String(args.action || '');
+
+  if (action === 'sync_flow') {
+    payAiRequireFunction_('syncFlow');
+    const result = syncFlow();
+    return { action: action, result: payAiJsonSafe_(result), message: 'Flow sync completed.' };
+  }
+
+  if (action === 'sync_customers') {
+    payAiRequireFunction_('syncCustomers');
+    const result = syncCustomers();
+    return { action: action, result: payAiJsonSafe_(result), message: 'Customer sync completed.' };
+  }
+
+  if (action === 'sync_both') {
+    payAiRequireFunction_('syncFlow');
+    payAiRequireFunction_('syncCustomers');
+    const flow = syncFlow();
+    const customers = syncCustomers();
+    return { action: action, flow: payAiJsonSafe_(flow), customers: payAiJsonSafe_(customers), message: 'Flow + customer sync completed.' };
+  }
+
+  if (action === 'preview_invoice') {
+    payAiRequireFunction_('previewCustomerInvoiceFromControl');
+    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
+    const preview = previewCustomerInvoiceFromControl();
+    return payAiSummarizePreview_(preview);
+  }
+
+  if (action === 'generate_invoice_pdf') {
+    if (!String(args.settlement_key || '').trim()) throw new Error('settlement_key is required.');
+    if (typeof invPdfGenerate_ !== 'function') throw new Error('InvoicePdf function invPdfGenerate_() is not available.');
+    const result = invPdfGenerate_(String(args.settlement_key).trim(), !!args.force);
+    return { action: action, result: payAiJsonSafe_(result) };
+  }
+
+  if (action === 'validate_customer_system') {
+    payAiRequireFunction_('validateCustomerSystem');
+    return { action: action, result: payAiJsonSafe_(validateCustomerSystem()) };
+  }
+
+  throw new Error('Unsupported safe action: ' + action);
+}
+
+function payAiSetInvoiceControl_(customerKey, fromDate, toDate, asOfDate) {
+  const ss = payAiActivateSpreadsheet_();
+  const sh = ss.getSheetByName('Invoice Control');
+  if (!sh) throw new Error('Missing Invoice Control sheet.');
+
+  const from = payAiParseDateInput_(fromDate);
+  const to = payAiParseDateInput_(toDate);
+  const asOf = asOfDate ? payAiParseDateInput_(asOfDate) : new Date();
+  if (!from || !to) throw new Error('from_date and to_date are required (YYYY-MM-DD or DD/MM/YYYY).');
+
+  sh.getRange('B3').setValue('INVOICE PREVIEW');
+  sh.getRange('B4').setValue(String(customerKey || '').trim().toUpperCase());
+  sh.getRange('B5').setValue(from).setNumberFormat('dd/MM/yyyy');
+  sh.getRange('B6').setValue(to).setNumberFormat('dd/MM/yyyy');
+  sh.getRange('B7').setValue(asOf).setNumberFormat('dd/MM/yyyy');
+  SpreadsheetApp.flush();
+}
+
+function payAiSummarizePreview_(p) {
+  if (!p) return { action: 'preview_invoice', message: 'Preview completed.', preview: null };
+  return {
+    action: 'preview_invoice',
+    customer_key: p.customer && p.customer.customerKey,
+    customer_name: p.customer && p.customer.customerName,
+    period_from: p.params && p.params.fromKey,
+    period_to: p.params && p.params.toKey,
+    as_of: p.params && p.params.asOfKey,
+    eligible_transactions: p.items ? p.items.length : (p.eligibleTransactions || 0),
+    gross_sales: p.grossSales,
+    refunds: p.refunds,
+    paypal_fees: p.paypalFees,
+    receiving_fees: p.receivingFees,
+    available_amount: p.availableAmount,
+    conversion_rate: p.conversionRate,
+    conversion_cost: p.conversionCost,
+    transfer_rate: p.transferRate,
+    transfer_minimum: p.transferMinimum,
+    transfer_cost: p.transferCost,
+    downstream_cost: p.downstreamCost,
+    net_before_payout_fee: p.netBeforePayoutFee,
+    payout_fee_rate: p.payoutFeeRate,
+    payout_fee_amount: p.payoutFeeAmount,
+    amount_due: p.amountDue,
+    source_currency: p.sourceCurrency,
+    payout_currency: p.payoutCurrency,
+    carry_forward_amount: p.carryForwardAmount,
+    late_refund_applied: p.lateRefundApplied,
+    late_refund_carry_forward: p.lateRefundCarryForward,
+    message: 'Invoice preview completed. No invoice was created.'
+  };
+}
+
+
+/************************* PROTECTED ACTIONS *************************/
+
+function payAiRequestProtectedAction_(ctx, args) {
+  if (!ctx || !ctx.chatId) throw new Error('Protected actions require a Telegram chat context.');
+  const action = String(args.action || '');
+  let previewInfo = null;
+
+  payAiActivateSpreadsheet_();
+
+  if (action === 'create_invoice') {
+    payAiRequireFunction_('previewCustomerInvoiceFromControl');
+    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
+    previewInfo = payAiSummarizePreview_(previewCustomerInvoiceFromControl());
+  } else if (action === 'set_customer_payout_fee') {
+    const current = payAiGetCustomerRow_(args.customer_key);
+    previewInfo = {
+      customer_key: current['Customer Key'],
+      customer_name: current['Customer Name'],
+      current_payout_fee_percent: payAiRound_((payAiToNumber_(current['Payout Fee %']) || 0) * 100, 4),
+      new_payout_fee_percent: Number(args.payout_fee_percent)
+    };
+  } else {
+    throw new Error('Unsupported protected action: ' + action);
+  }
+
+  const pending = {
+    action: action,
+    args: args,
+    preview: previewInfo,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + PAYMENT_AI_CFG.PENDING_ACTION_TTL_MS,
+    attempts: 0
+  };
+
+  PropertiesService.getScriptProperties().setProperty(
+    PAYMENT_AI_CFG.PENDING_PREFIX + String(ctx.chatId),
+    JSON.stringify(pending)
+  );
+
+  return {
+    status: 'PIN_REQUIRED',
+    action: action,
+    expires_in_minutes: Math.round(PAYMENT_AI_CFG.PENDING_ACTION_TTL_MS / 60000),
+    preview: previewInfo,
+    instruction: 'Ask the owner to send /pin <ACTION_PIN>. Do not ask for or expose any Google, PayPal, Telegram, or OpenAI password/token.'
+  };
+}
+
+function payAiExecutePendingAction_(chatId, rawPin) {
+  const props = PropertiesService.getScriptProperties();
+  const key = PAYMENT_AI_CFG.PENDING_PREFIX + String(chatId);
+  const raw = props.getProperty(key);
+  if (!raw) return { ok: false, error: 'No pending protected action. Ask AI to prepare the action first.' };
+
+  let pending;
+  try { pending = JSON.parse(raw); } catch (_) { props.deleteProperty(key); return { ok: false, error: 'Pending action is corrupted. Prepare it again.' }; }
+
+  if (!pending.expiresAt || Date.now() > Number(pending.expiresAt)) {
+    props.deleteProperty(key);
+    return { ok: false, error: 'Protected action expired. Prepare it again.' };
+  }
+
+  const savedHash = String(props.getProperty(PAYMENT_AI_CFG.PROP_ACTION_PIN_HASH) || '');
+  if (!savedHash) return { ok: false, error: 'Action PIN is not configured. Run setPaymentAiActionPin() from the spreadsheet.' };
+
+  const enteredHash = payAiSha256Hex_(String(rawPin || ''));
+  if (enteredHash !== savedHash) {
+    pending.attempts = Number(pending.attempts || 0) + 1;
+    if (pending.attempts >= PAYMENT_AI_CFG.MAX_PIN_ATTEMPTS) {
+      props.deleteProperty(key);
+      return { ok: false, error: 'Wrong PIN too many times. Pending action cancelled.' };
+    }
+    props.setProperty(key, JSON.stringify(pending));
+    return { ok: false, error: 'Wrong action PIN. Attempts remaining: ' + (PAYMENT_AI_CFG.MAX_PIN_ATTEMPTS - pending.attempts) };
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const result = payAiPerformProtectedAction_(pending.action, pending.args);
+    props.deleteProperty(key);
+    return { ok: true, action: pending.action, result: payAiJsonSafe_(result) };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function payAiCancelPendingAction_(chatId) {
+  PropertiesService.getScriptProperties().deleteProperty(PAYMENT_AI_CFG.PENDING_PREFIX + String(chatId));
+  return { ok: true, message: 'Pending protected action cancelled.' };
+}
+
+function payAiPerformProtectedAction_(action, args) {
+  payAiActivateSpreadsheet_();
+
+  if (action === 'create_invoice') {
+    payAiRequireFunction_('previewCustomerInvoiceFromControl');
+    payAiRequireFunction_('createCustomerInvoiceFromControl');
+    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
+    const preview = previewCustomerInvoiceFromControl();
+    const previewSummary = payAiSummarizePreview_(preview);
+    const created = createCustomerInvoiceFromControl();
+    return { preview: previewSummary, created: payAiJsonSafe_(created) };
+  }
+
+  if (action === 'set_customer_payout_fee') {
+    const percent = Number(args.payout_fee_percent);
+    if (!isFinite(percent) || percent < 0 || percent > 100) throw new Error('payout_fee_percent must be between 0 and 100.');
+
+    const ss = payAiSpreadsheet_();
+    const sh = ss.getSheetByName('Customers');
+    if (!sh) throw new Error('Missing Customers sheet.');
+    const map = payAiHeaderMap_(sh);
+    ['Customer Key','Payout Fee %'].forEach(function(h) { if (!map[h]) throw new Error('Customers missing header: ' + h); });
+    const rows = payAiReadObjects_(sh, map);
+    const key = String(args.customer_key || '').trim().toUpperCase();
+    const row = rows.find(function(r) { return String(r['Customer Key'] || '').trim().toUpperCase() === key; });
+    if (!row) throw new Error('Customer not found: ' + key);
+
+    const oldRate = payAiToNumber_(row['Payout Fee %']) || 0;
+    const newRate = percent / 100;
+    sh.getRange(row._row, map['Payout Fee %']).setValue(newRate).setNumberFormat('0.00%');
+    SpreadsheetApp.flush();
+    if (typeof syncCustomers === 'function') syncCustomers();
+
+    return { customer_key: key, old_percent: oldRate * 100, new_percent: percent };
+  }
+
+  throw new Error('Unsupported protected action: ' + action);
+}
+
+function payAiGetCustomerRow_(customerKey) {
+  const sh = payAiSheet_('Customers');
+  const map = payAiHeaderMap_(sh);
+  const key = String(customerKey || '').trim().toUpperCase();
+  const row = payAiReadObjects_(sh, map).find(function(r) {
+    return String(r['Customer Key'] || '').trim().toUpperCase() === key;
+  });
+  if (!row) throw new Error('Customer not found: ' + key);
+  return row;
+}
+
+
+/************************* RUNTIME GUIDE *************************/
+
+function payAiRuntimeGuide_() {
+  if (typeof getPaymentAiReadme === 'function') {
+    try { return String(getPaymentAiReadme() || ''); } catch (_) {}
+  }
+  if (typeof PAYMENT_AI_SYSTEM_GUIDE !== 'undefined') return String(PAYMENT_AI_SYSTEM_GUIDE || '');
+  return 'Payment All: Flow.gs owns treasury/reconciliation. CustomerV2.3 owns customer ledger/allocation/settlement. Invoice PDF is presentation only. Customer money becomes invoiceable only when Customer Allocation is AVAILABLE after PayPal withdrawal is matched to the receiving provider.';
+}
+
+
+/************************* HELPERS *************************/
+
+function payAiRequireFunction_(name) {
+  const available = {
+    syncFlow: typeof syncFlow === 'function',
+    syncCustomers: typeof syncCustomers === 'function',
+    previewCustomerInvoiceFromControl: typeof previewCustomerInvoiceFromControl === 'function',
+    validateCustomerSystem: typeof validateCustomerSystem === 'function',
+    createCustomerInvoiceFromControl: typeof createCustomerInvoiceFromControl === 'function'
+  };
+  if (!available[name]) throw new Error('Required function is not available in this Apps Script project: ' + name + '()');
+}
+
+function payAiJsonValue_(v) {
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return '';
+    return Utilities.formatDate(v, PAYMENT_AI_CFG.BUSINESS_TIMEZONE, 'yyyy-MM-dd HH:mm:ss');
+  }
+  if (typeof v === 'number' && !isFinite(v)) return 0;
+  return v;
+}
+
+function payAiJsonSafe_(v) {
+  if (v === undefined) return null;
+  try { return JSON.parse(JSON.stringify(v, function(k, x) { return payAiJsonValue_(x); })); }
+  catch (_) { return String(v); }
+}
+
+function payAiToNumber_(v) {
+  if (typeof v === 'number' && isFinite(v)) return v;
+  if (v === null || v === undefined || v === '') return null;
+  let s = String(v).trim().replace(/[^\d,.-]/g, '');
+  if (!s) return null;
+  if (s.indexOf(',') !== -1 && s.indexOf('.') !== -1) {
+    if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\./g, '').replace(',', '.');
+    else s = s.replace(/,/g, '');
+  } else if (s.indexOf(',') !== -1) {
+    const parts = s.split(',');
+    if (parts.length === 2 && parts[1].length <= 4) s = parts[0] + '.' + parts[1];
+    else s = s.replace(/,/g, '');
+  }
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+
+function payAiRound_(n, digits) {
+  const p = Math.pow(10, Number(digits || 0));
+  return Math.round((Number(n) + Number.EPSILON) * p) / p;
+}
+
+function payAiParseDateInput_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return value;
+  const s = String(value || '').trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12, 0, 0, 0);
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]), 12, 0, 0, 0);
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function payAiDateKey_(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) return Utilities.formatDate(v, PAYMENT_AI_CFG.BUSINESS_TIMEZONE, 'yyyy-MM-dd');
+  const d = payAiParseDateInput_(v);
+  if (!d) return '';
+  return Utilities.formatDate(d, PAYMENT_AI_CFG.BUSINESS_TIMEZONE, 'yyyy-MM-dd');
+}
+
+function payAiDateMs_(v) {
+  const d = v instanceof Date ? v : payAiParseDateInput_(v);
+  return d && !isNaN(d.getTime()) ? d.getTime() : null;
+}
+
+function payAiSha256Hex_(text) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(text || ''), Utilities.Charset.UTF_8);
+  return bytes.map(function(b) {
+    const n = b < 0 ? b + 256 : b;
+    return ('0' + n.toString(16)).slice(-2);
+  }).join('');
+}
