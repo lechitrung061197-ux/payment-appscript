@@ -32,6 +32,11 @@ const FLOW_CFG = Object.freeze({
    */
   SETTLEMENTS_SHEET: 'Settlements',
 
+  /* Cùng sheet khoá với collector Grey ở project khác. */
+  LOCK_SHEET: '_Sync Lock',
+  LOCK_WAIT_MS: 90000,
+  LOCK_STALE_MS: 600000,
+
   HEADER_ROW: 2,
   DATA_START_ROW: 3,
 
@@ -96,10 +101,224 @@ function paymentAllWithScriptLock_(
 
 function syncFlow() {
 
+  /*
+   * Hai lớp khoá, mỗi lớp một việc:
+   *
+   * paymentAllWithScriptLock_ chặn các entry point TRONG project này giẫm nhau.
+   * ScriptLock không xuyên được giữa các Apps Script project, mà collector Grey
+   * chạy ở project khác và cũng ghi sheet Transaction — nên cần thêm một khoá
+   * nằm trong chính spreadsheet dùng chung.
+   *
+   * Quan trọng vì flowWriteTransactionState_ ghi đè TOÀN BỘ vùng dữ liệu
+   * Transaction: chạy chồng với một bộ ghi khác là mất dòng, không phải trùng.
+   */
   return paymentAllWithScriptLock_(
     'syncFlow',
-    syncFlowCore_
+    function () {
+
+      const lock =
+        flowAcquireSyncLock_(
+          flowGetSpreadsheet_()
+        );
+
+      try {
+
+        return syncFlowCore_();
+
+      } finally {
+
+        flowReleaseSyncLock_(lock);
+
+      }
+
+    }
   );
+
+}
+
+
+/************************************************************
+ * ADVISORY LOCK DÙNG CHUNG VỚI COLLECTOR
+ *
+ * Cùng giao thức và cùng sheet với standalone/GreyGmailCollector.gs.
+ * Không dùng chung code được vì hai project khác nhau — sửa một bên
+ * thì phải sửa bên kia.
+ *
+ * Ghi token rồi đọc lại để xác nhận mình thắng. Vẫn còn khe hở rất
+ * nhỏ, nhưng đủ để hai bộ ghi-đè-toàn-sheet không chạy chồng nhau.
+ ************************************************************/
+
+function flowAcquireSyncLock_(
+  ss
+) {
+
+  let sheet =
+    ss.getSheetByName(
+      FLOW_CFG.LOCK_SHEET
+    );
+
+
+  if (!sheet) {
+
+    sheet =
+      ss.insertSheet(
+        FLOW_CFG.LOCK_SHEET
+      );
+
+    sheet.getRange('A1').setValue('holder');
+    sheet.getRange('B1').setValue('since');
+    sheet.hideSheet();
+
+  }
+
+
+  const token =
+    'FLOW|' +
+    Utilities.getUuid();
+
+
+  const deadline =
+    new Date().getTime() +
+    FLOW_CFG.LOCK_WAIT_MS;
+
+
+  while (
+    new Date().getTime() <
+    deadline
+  ) {
+
+    const holder =
+      flowString_(
+        sheet.getRange('A2').getValue()
+      );
+
+
+    const since =
+      sheet.getRange('B2').getValue();
+
+
+    const sinceMs =
+      since instanceof Date
+        ? since.getTime()
+        : 0;
+
+
+    const stale =
+      !sinceMs ||
+      (
+        new Date().getTime() -
+        sinceMs >
+        FLOW_CFG.LOCK_STALE_MS
+      );
+
+
+    if (
+      !holder ||
+      stale
+    ) {
+
+      sheet.getRange('A2').setValue(token);
+      sheet.getRange('B2').setValue(new Date());
+
+      SpreadsheetApp.flush();
+
+      Utilities.sleep(1200);
+
+
+      if (
+        flowString_(
+          sheet.getRange('A2').getValue()
+        ) === token
+      ) {
+
+        return {
+          sheet: sheet,
+          token: token
+        };
+
+      }
+
+    }
+
+
+    Utilities.sleep(3000);
+
+  }
+
+
+  throw new Error(
+    'Không lấy được sync lock sau ' +
+    (FLOW_CFG.LOCK_WAIT_MS / 1000) +
+    's — một collector khác đang ghi Transaction. Thử lại sau.'
+  );
+
+}
+
+
+/*
+ * So số dòng hiện tại với số dòng lúc flowLoadTransactionState_ đọc vào.
+ * Chỉ bắt được việc CHÈN THÊM dòng, nhưng đó đúng là thứ mà collector Grey
+ * làm (appendRow), nên đủ cho ca thực tế.
+ */
+function flowAssertTransactionUnchanged_(
+  sheet,
+  state
+) {
+
+  const expected =
+    FLOW_CFG.DATA_START_ROW +
+    state.oldRowCount -
+    1;
+
+
+  const actual =
+    sheet.getLastRow();
+
+
+  if (
+    state.oldRowCount > 0 &&
+    actual > expected
+  ) {
+
+    throw new Error(
+      'Sheet Transaction đã đổi trong lúc syncFlow chạy (' +
+      expected +
+      ' -> ' +
+      actual +
+      ' dòng). Huỷ lượt ghi để không xoá mất dòng của bộ ghi khác. Chạy lại syncFlow().'
+    );
+
+  }
+
+}
+
+
+function flowReleaseSyncLock_(
+  lock
+) {
+
+  if (!lock) {
+    return;
+  }
+
+
+  try {
+
+    if (
+      flowString_(
+        lock.sheet.getRange('A2').getValue()
+      ) === lock.token
+    ) {
+
+      lock.sheet.getRange('A2:B2').clearContent();
+
+      SpreadsheetApp.flush();
+
+    }
+
+  } catch (ignored) {
+    /* lock tự hết hạn sau LOCK_STALE_MS */
+  }
 
 }
 
@@ -329,6 +548,18 @@ function syncFlowCore_() {
   /**********************************************************
    * 9. WRITE TRANSACTION
    **********************************************************/
+
+  /*
+   * Lưới cuối dưới advisory lock: nếu sheet đã dài ra kể từ lúc đọc thì có bộ
+   * ghi khác vừa chèn dòng, và bản trong bộ nhớ này đã cũ. Ghi đè lúc đó là
+   * xoá mất dòng của họ, nên huỷ hẳn lượt này. Lần chạy sau sẽ đọc lại và làm
+   * đúng — không mất gì ngoài một lượt.
+   */
+  flowAssertTransactionUnchanged_(
+    txSheet,
+    txState
+  );
+
 
   flowWriteTransactionState_(
     txSheet,

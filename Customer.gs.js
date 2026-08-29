@@ -262,7 +262,7 @@ function syncCustomers_() {
    * invoiced sale can keep its historical allocation even if a later PayPal
    * refund reduces the current sale Net Amount.
    */
-  const lateRefundState = custBuildLateRefundState_(ss, ledgerRecords);
+  const lateRefundState = custBuildRefundOwedState_(ss, ledgerRecords);
   const settlementStatusByKey = custBuildSettlementStatusMap_(ss);
 
   const txRows = custReadTransactionRows_(shTx, hTx);
@@ -281,7 +281,13 @@ function syncCustomers_() {
   custSyncSettlementPayments_(ss, now);
   custWriteCustomerLedger_(shLedger, hLedger, ledgerRecords);
   custWriteCustomerAllocations_(shAlloc, hAlloc, allocations);
-  custUpdateCustomerSummary_(ss, customerState, ledgerRecords, allocations, lateRefundState, now);
+
+  /*
+   * Phải đọc SAU khi allocation đã ghi xuống: hàm này đọc sheet Customer
+   * Allocation, gọi sớm hơn là đọc phải bản chụp cũ.
+   */
+  const reversalState=custBuildWithdrawalReversalState_(ss, txRows);
+  custUpdateCustomerSummary_(ss, customerState, ledgerRecords, allocations, lateRefundState, reversalState, now);
   custRefreshInvoiceControlCustomerDropdown_();
 
   SpreadsheetApp.flush();
@@ -597,7 +603,28 @@ function custAssertNoReassignedPrefixes_(ss, ledgerRecords){
     (keys.length>5?' · +'+(keys.length-5)+' more':''));
 }
 
-function custBuildLateRefundState_(ss, ledgerRows){
+/*
+ * KHOẢN KHÁCH NỢ LẠI TRÊN MỘT SALE
+ *
+ * Refund muộn và refund vượt hoá ra là cùng một câu hỏi: khách đã được ghi có
+ * bao nhiêu so với thứ đơn hàng thực sự mang lại?
+ *
+ *   trueNet    = gross - fee - refund   (ĐƯỢC PHÉP ÂM, đó là cả vấn đề)
+ *   invoicedNet= tổng 'PayPal Net Amount' của các dòng SALE thuộc settlement
+ *                effective, bằng 0 nếu chưa từng lên hoá đơn
+ *   owed       = max(0, invoicedNet - trueNet)
+ *
+ *   chưa invoice, hoàn vượt   ->  0 - (-1.47) = 1.47   (đúng phần phí bị giữ)
+ *   invoice 26.47, hoàn hết   ->  26.47 - (-1.47) = 27.94
+ *   invoice 97, hoàn 50       ->  97 - 47 = 50         (y hệt hành vi cũ)
+ *   bình thường               ->  97 - 97 = 0
+ *
+ * Nhờ vậy đây là mở rộng cơ chế sẵn có chứ không phải hệ thống thứ hai.
+ *
+ * Line Type trong sheet vẫn là LATE_REFUND_ADJUSTMENT, không được đổi: đổi là
+ * mất dấu tiêu thụ của các hoá đơn cũ và khấu trừ lại lần thứ hai.
+ */
+function custBuildRefundOwedState_(ss, ledgerRows){
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
   const shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), hi=custHeaderMap_(shItems);
   const sets=custReadRowsObjects_(shSet,hs), items=custReadRowsObjects_(shItems,hi);
@@ -619,20 +646,29 @@ function custBuildLateRefundState_(ss, ledgerRows){
     const ledgerKey=custLedgerField_(l,'ledgerKey','Ledger Key'); if(!ledgerKey)return;
     const history=byLedger[ledgerKey]||[];
     const sales=history.filter(it=>custUpper_(it['Line Type']||'SALE')==='SALE');
-    if(!sales.length)return;
 
     sales.sort((a,b)=>{
-      const ad=custDate_(a['Created At'])||active[custStr_(a['Settlement Key'])].issuedAt;
-      const bd=custDate_(b['Created At'])||active[custStr_(b['Settlement Key'])].issuedAt;
+      const ad=custDate_(a['Created At'])||(active[custStr_(a['Settlement Key'])]||{}).issuedAt;
+      const bd=custDate_(b['Created At'])||(active[custStr_(b['Settlement Key'])]||{}).issuedAt;
       return custTime_(ad)-custTime_(bd);
     });
 
-    const first=sales[0];
-    const firstSettlement=active[custStr_(first['Settlement Key'])]||{};
-    const firstInvoiceAt=custDate_(first['Created At'])||firstSettlement.issuedAt||null;
-    const baselineRefund=Math.max(0,custNum_(first['Refund Amount']));
+    const hasInvoiceHistory=sales.length>0;
+    const first=hasInvoiceHistory?sales[0]:null;
+    const firstSettlement=first?(active[custStr_(first['Settlement Key'])]||{}):{};
+    const firstInvoiceAt=first?(custDate_(first['Created At'])||firstSettlement.issuedAt||null):null;
+
+    /* Ảnh chụp refund lúc lên hoá đơn lần đầu; phân bổ vẫn cần nó. */
+    const baselineRefund=first?Math.max(0,custNum_(first['Refund Amount'])):0;
     const currentRefund=Math.max(0,custNum_(custLedgerField_(l,'refundAmount','Refund Amount')));
-    const totalLate=custRound2_(Math.max(0,currentRefund-baselineRefund));
+
+    const gross=custNum_(custLedgerField_(l,'grossAmount','Gross Amount'));
+    const paypalFee=custNum_(custLedgerField_(l,'paypalFee','PayPal Fee'));
+    /* KHÔNG kẹp về 0 ở đây — phần âm chính là thứ đang bị đánh rơi. */
+    const trueNet=custRound2_(gross-paypalFee-currentRefund);
+    const invoicedNet=custRound2_(sales.reduce((sum,it)=>sum+custNum_(it['PayPal Net Amount']),0));
+
+    const totalLate=custRound2_(Math.max(0,invoicedNet-trueNet));
 
     let consumed=0;
     history.filter(it=>custUpper_(it['Line Type'])==='LATE_REFUND_ADJUSTMENT').forEach(it=>{
@@ -642,14 +678,20 @@ function custBuildLateRefundState_(ss, ledgerRows){
     });
     consumed=custRound2_(consumed);
 
+    const outstanding=custRound2_(Math.max(0,totalLate-consumed));
+    if(totalLate<=CUST_CFG.EPSILON&&consumed<=CUST_CFG.EPSILON)return;
+
     out[ledgerKey]={
       ledgerKey:ledgerKey,
       customerKey:custLedgerField_(l,'customerKey','Customer Key'),
+      hasInvoiceHistory:hasInvoiceHistory,
+      invoicedNet:invoicedNet,
+      trueNet:trueNet,
       baselineRefund:baselineRefund,
       currentRefund:currentRefund,
       totalLate:totalLate,
       consumed:consumed,
-      outstanding:custRound2_(Math.max(0,totalLate-consumed)),
+      outstanding:outstanding,
       overConsumed:custRound2_(Math.max(0,consumed-totalLate)),
       firstInvoiceAt:firstInvoiceAt,
       currency:custUpper_(custLedgerField_(l,'currency','Currency')),
@@ -694,6 +736,87 @@ function custBuildRefundEventsByLedger_(ss){
   Object.keys(out).forEach(k=>out[k].sort((a,b)=>custTime_(a.date)-custTime_(b.date)));
   return out;
 }
+
+/*
+ * ĐẢO CHIỀU WITHDRAWAL
+ *
+ * Khác bản chất với refund: đây không phải đơn hàng bị hoàn, mà là tiền đã xuất
+ * hoá đơn nhưng chưa từng tới nơi. Nên tính riêng, nhưng đi chung đường tiêu thụ
+ * và kết chuyển với refund.
+ *
+ * Khoá theo Customer Allocation Key chứ không theo ledger key: một sale có thể
+ * trải trên nhiều withdrawal, và chỉ withdrawal bị hoàn mới phải thu lại.
+ */
+function custBuildWithdrawalReversalState_(ss,txRows){
+  const returned={};
+  (txRows||[]).forEach(t=>{
+    if(t.provider==='PAYPAL'&&t.type==='PAYPAL_WITHDRAWAL'&&t.reconcileStatus==='RETURNED'){
+      returned[t.transactionKey]=t;
+    }
+  });
+  const out={};
+  if(!Object.keys(returned).length)return out;
+
+  const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
+  const shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), hi=custHeaderMap_(shItems);
+  const shA=custRequireSheet_(ss,CUST_CFG.ALLOCATION_SHEET), ha=custHeaderMap_(shA);
+
+  const effective={};
+  custReadRowsObjects_(shSet,hs).forEach(s2=>{
+    const k=custStr_(s2['Settlement Key']);
+    if(k&&custIsEffectiveSettlementStatus_(s2['Status']))effective[k]=true;
+  });
+
+  /* Đã thu lại bao nhiêu, đọc từ chính lịch sử hoá đơn nên không tiêu hai lần. */
+  const consumedByAllocation={};
+  custReadRowsObjects_(shItems,hi).forEach(it=>{
+    if(custUpper_(it['Line Type'])!=='WITHDRAWAL_REVERSAL_ADJUSTMENT')return;
+    if(!effective[custStr_(it['Settlement Key'])])return;
+    custStr_(it['Customer Allocation Key']).split(',').forEach(raw=>{
+      const ak=custStr_(raw); if(!ak)return;
+      const amt=Math.max(0,-custNum_(it['Amount Included']));
+      consumedByAllocation[ak]=custRound2_((consumedByAllocation[ak]||0)+amt);
+    });
+  });
+
+  custReadRowsObjects_(shA,ha).forEach(a=>{
+    const wk=custStr_(a['PayPal Withdrawal Transaction Key']); if(!returned[wk])return;
+    if(!effective[custStr_(a['Settlement Key'])])return;
+    const invoiced=custRound2_(custNum_(a['Invoiced Amount']));
+    if(invoiced<=CUST_CFG.EPSILON)return;
+
+    const key=custStr_(a['Allocation Key']);
+    const consumed=custRound2_(consumedByAllocation[key]||0);
+    out[key]={
+      allocationKey:key,
+      customerKey:custCanonicalKey_(a['Customer Key']),
+      ledgerKey:custStr_(a['Customer Ledger Key']),
+      currency:custUpper_(a['Currency']),
+      owed:invoiced,
+      consumed:consumed,
+      outstanding:custRound2_(Math.max(0,invoiced-consumed)),
+      eventDate:custDate_(returned[wk].transactionDate),
+      withdrawalKey:wk
+    };
+  });
+  return out;
+}
+
+
+function custBuildEligibleReversalAdjustments_(ss,customer,reversalState,throughKey){
+  const entries=[];
+  Object.keys(reversalState||{}).forEach(k=>{
+    const st=reversalState[k];
+    if(custCanonicalKey_(st.customerKey)!==customer.customerKey)return;
+    if(st.outstanding<=CUST_CFG.EPSILON)return;
+    const dk=custBusinessDateKey_(st.eventDate);
+    if(dk&&throughKey&&dk>throughKey)return;
+    entries.push(st);
+  });
+  entries.sort((a,b)=>custTime_(a.eventDate)-custTime_(b.eventDate)||a.allocationKey.localeCompare(b.allocationKey));
+  return entries;
+}
+
 
 function custBuildEligibleLateRefundAdjustments_(ss,customer,ledgerByKey,lateState,throughKey){
   const eventMap=custBuildRefundEventsByLedger_(ss);
@@ -754,10 +877,24 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
     return !!(o&&custStr_(o.settlementKey)&&custIsEffectiveSettlementStatus_(statusByKey[custStr_(o.settlementKey)]));
   };
 
+  /*
+   * Withdrawal đã bị hoàn thì tiền quay lại PayPal, nên allocation khoá trên nó
+   * KHÔNG được giữ chỗ sức chứa của nguồn nữa — nguồn phải được phân bổ lại cho
+   * lần rút sau. Đây là chỗ ngược hẳn với late refund và dễ sai nhất: giữ chỗ
+   * nhầm thì tiền kẹt luôn.
+   */
+  const returnedWithdrawals={};
+  txRows.forEach(t=>{
+    if(t.provider==='PAYPAL'&&t.type==='PAYPAL_WITHDRAWAL'&&t.reconcileStatus==='RETURNED'){
+      returnedWithdrawals[t.transactionKey]=true;
+    }
+  });
+
   /* Historical invoiced allocations are a floor and can never shrink. */
   const lockedByLedger={};
   Object.keys(oldState).forEach(k=>{
     const o=oldState[k]; if(!isLockedByOld(o)||!o.customerLedgerKey)return;
+    if(returnedWithdrawals[custStr_(o.paypalWithdrawalTransactionKey)])return;
     lockedByLedger[o.customerLedgerKey]=custRound2_((lockedByLedger[o.customerLedgerKey]||0)+custNum_(o.allocatedAmount));
   });
 
@@ -776,8 +913,13 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
      * Sale đã invoice thì một refund muộn KHÔNG được viết lại phần đã phân bổ
      * cho withdrawal lịch sử. Chỉ hoàn phần chênh lệch về pool; phần đó được
      * tính thành LATE_REFUND_ADJUSTMENT ở hoá đơn sau.
+     *
+     * CHỈ áp dụng cho sale ĐÃ từng lên hoá đơn. Với sale chưa invoice mà bị
+     * hoàn vượt, `totalLate` là phần phí bị giữ lại — hoàn nó về pool sẽ cấp
+     * cho một đơn hàng đã mất trắng một khoản sức chứa và cho nó ăn mất
+     * withdrawal của người khác.
      */
-    if(late&&late.totalLate>CUST_CFG.EPSILON){
+    if(late&&late.hasInvoiceHistory&&late.totalLate>CUST_CFG.EPSILON){
       const preLateNet=Math.max(0,custRound2_(custNum_(src.grossAmount)-custNum_(src.paypalFee)-custNum_(late.baselineRefund)));
       sourceForAllocation=Math.min(preLateNet,custRound2_(sourceForAllocation+late.totalLate));
     }
@@ -791,18 +933,27 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
     (poolSources[k]||(poolSources[k]=[])).push(rec);
   });
 
-  const withdrawals=txRows.filter(t=>
+  /*
+   * Withdrawal bị RETURNED vẫn phải nằm trong bản đồ để Phase A phát lại được
+   * lịch sử đã khoá trên nó — loại thẳng ra là syncCustomers() chết vĩnh viễn
+   * với LOCKED ALLOCATION WITHDRAWAL MISSING. Nhưng Phase B thì không được
+   * phân bổ mới vào: tiền đó đã quay về PayPal.
+   */
+  const allWithdrawals=txRows.filter(t=>
     t.provider==='PAYPAL'&&t.type==='PAYPAL_WITHDRAWAL'&&t.direction==='OUT'&&
-    Math.abs(t.grossAmount)>CUST_CFG.EPSILON&&t.reconcileStatus!=='RETURNED'
+    Math.abs(t.grossAmount)>CUST_CFG.EPSILON
   ).sort((a,b)=>custTime_(a.transactionDate)-custTime_(b.transactionDate));
 
+  const withdrawals=allWithdrawals.filter(t=>t.reconcileStatus!=='RETURNED');
+
   const withdrawalByKey={};
-  withdrawals.forEach(w=>{
+  allWithdrawals.forEach(w=>{
     const receivingTx=w.matchedTransactionKey?txByKey[w.matchedTransactionKey]:null;
     const match=custDescribeReceivingMatch_(w,receivingTx);
     const gross=Math.abs(custRound2_(w.grossAmount));
     withdrawalByKey[w.transactionKey]={
       w,gross,remaining:gross,match,
+      returned:w.reconcileStatus==='RETURNED',
       feeTotal:match.available?custGetReceivingTransactionFee_(receivingTx):0
     };
   });
@@ -830,16 +981,28 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
     if(!wKey||!wRec)throw new Error('LOCKED ALLOCATION WITHDRAWAL MISSING: '+key+' -> '+(wKey||'(no withdrawal key)'));
 
     const amt=custRound2_(custNum_(old.allocatedAmount));
-    srcRec.remaining=custRound2_(srcRec.remaining-amt);
+    const reversed=!!wRec.returned;
+
+    /*
+     * Withdrawal bị hoàn: giữ nguyên dòng lịch sử để hoá đơn cũ bất biến, nhưng
+     * KHÔNG giữ chỗ sức chứa của nguồn — tiền đã về lại PayPal và sẽ đi ra ở
+     * lần rút sau. Khoản đã xuất hoá đơn được thu lại bằng
+     * WITHDRAWAL_REVERSAL_ADJUSTMENT chứ không phải bằng cách khoá nguồn.
+     */
+    if(!reversed){
+      srcRec.remaining=custRound2_(srcRec.remaining-amt);
+      if(srcRec.remaining<-0.01)throw new Error('LOCKED ALLOCATION EXCEEDS SOURCE: '+key+' vượt '+Math.abs(srcRec.remaining).toFixed(2));
+      srcRec.remaining=Math.max(0,srcRec.remaining);
+    }
+
     wRec.remaining=custRound2_(wRec.remaining-amt);
-    if(srcRec.remaining<-0.01)throw new Error('LOCKED ALLOCATION EXCEEDS SOURCE: '+key+' vượt '+Math.abs(srcRec.remaining).toFixed(2));
     if(wRec.remaining<-0.01)throw new Error('LOCKED ALLOCATION EXCEEDS WITHDRAWAL: '+key+' vượt '+Math.abs(wRec.remaining).toFixed(2));
-    srcRec.remaining=Math.max(0,srcRec.remaining);
     wRec.remaining=Math.max(0,wRec.remaining);
 
     const ledger=ledgerByTx[custPaypalTxIndexKey_(srcRec.src.accountKey,srcRec.src.transactionId)]||null;
     const notes=[];
     if(lateRefundState[ledgerKey]&&lateRefundState[ledgerKey].totalLate>CUST_CFG.EPSILON)notes.push('LOCKED · LATE REFUND HANDLED BY ADJUSTMENT');
+    if(reversed)notes.push('WITHDRAWAL RETURNED · THU LẠI BẰNG ADJUSTMENT');
 
     const available=custNum_(old.availableAmount);
     const invoiced=Math.min(available,Math.max(0,custNum_(old.invoicedAmount)));
@@ -858,7 +1021,12 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
       receivingTransactionKey:old.receivingTransactionKey, receivingReference:old.receivingReference,
       receivingFeeAllocated:custRound2_(custNum_(old.receivingFeeAllocated)),
       availableAmount:custRound2_(available), availableDate:old.availableDate,
-      allocationStatus:custUpper_(old.allocationStatus)||'AVAILABLE',
+      /*
+       * REVERSED chứ không phải AVAILABLE: tiền không tới nơi. Số tiền lịch sử
+       * giữ nguyên cho hoá đơn cũ bất biến, còn REVERSED giữ nó khỏi lọt vào
+       * hoá đơn mới, vì preview chỉ nhận AVAILABLE.
+       */
+      allocationStatus:reversed?'REVERSED':(custUpper_(old.allocationStatus)||'AVAILABLE'),
       invoicedAmount:custRound2_(invoiced), remainingAvailable:custRound2_(Math.max(0,available-invoiced)),
       settlementKey:custStr_(old.settlementKey), sourceUniqueKey:old.sourceUniqueKey||wRec.w.uniqueKey,
       lastSync:now, note:notes.join(' | ')
@@ -1170,7 +1338,7 @@ function custSyncSettlementPayments_(ss, now){
 }
 
 /*********************** CUSTOMER SUMMARY ************************/
-function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundState, now){
+function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundState, reversalState, now){
   const sh=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET), h=custHeaderMap_(sh);
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet), sets=custReadRowsObjects_(shSet,hs);
   const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), hp=custHeaderMap_(shPay), payouts=custReadRowsObjects_(shPay,hp);
@@ -1181,6 +1349,11 @@ function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundSt
   allocations.forEach(a=>(byCustAlloc[a.customerKey]||(byCustAlloc[a.customerKey]=[])).push(a));
   Object.keys(lateRefundState||{}).forEach(k=>{
     const st=lateRefundState[k], ck=custCanonicalKey_(st.customerKey); if(!ck)return;
+    refundCarryByCustomer[ck]=custRound2_((refundCarryByCustomer[ck]||0)+custNum_(st.outstanding));
+  });
+  /* Đảo chiều withdrawal cũng là khoản khách nợ lại, phải trừ khỏi Outstanding. */
+  Object.keys(reversalState||{}).forEach(k=>{
+    const st=reversalState[k], ck=custCanonicalKey_(st.customerKey); if(!ck)return;
     refundCarryByCustomer[ck]=custRound2_((refundCarryByCustomer[ck]||0)+custNum_(st.outstanding));
   });
 
@@ -1373,9 +1546,14 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
   const sourceCurrency=currencies[0]||'USD';
   const feeRule=custFindFeeRule_(ss,receivingProvider,customer.defaultPayoutProvider,sourceCurrency,params.asOfKey);
 
-  const lateState=custBuildLateRefundState_(ss,ledgers);
+  const lateState=custBuildRefundOwedState_(ss,ledgers);
   const lateEntries=custBuildEligibleLateRefundAdjustments_(ss,customer,ledgerByKey,lateState,params.toKey);
   lateEntries.forEach(x=>{if(x.currency&&x.currency!==sourceCurrency)throw new Error('Late refund currency '+x.currency+' does not match invoice currency '+sourceCurrency+'.');});
+
+  /* Đảo chiều withdrawal đi chung đường kết chuyển với refund. */
+  const reversalState=custBuildWithdrawalReversalState_(ss,custReadTransactionRows_(custRequireSheet_(ss,CUST_CFG.TRANSACTION_SHEET),custHeaderMap_(custRequireSheet_(ss,CUST_CFG.TRANSACTION_SHEET))));
+  const reversalEntries=custBuildEligibleReversalAdjustments_(ss,customer,reversalState,params.toKey);
+  reversalEntries.forEach(x=>{if(x.currency&&x.currency!==sourceCurrency)throw new Error('Withdrawal reversal currency '+x.currency+' does not match invoice currency '+sourceCurrency+'.');});
 
   const grouped={}; let gross=0,saleRefund=0,paypalFee=0,receivingFee=0,availableTotal=0,currentAmount=0,carryAmount=0;
   selected.forEach(a=>{
@@ -1413,7 +1591,13 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
   const transferCost=downstreamPricing.transferCost;
   const downstreamCost=downstreamPricing.downstreamCost;
   const beforeLateRefund=custRound2_(Math.max(0,availableTotal-downstreamCost));
-  const lateRefundOutstanding=custRound2_(lateEntries.reduce((sum,x)=>sum+custNum_(x.outstanding),0));
+  const reversalOutstanding=custRound2_(reversalEntries.reduce((sum,x)=>sum+custNum_(x.outstanding),0));
+  /*
+   * Refund và đảo chiều withdrawal cùng là "khách nợ lại", nên cộng chung rồi
+   * mới kẹp vào phần phải trả. Kẹp riêng từng loại sẽ cho phép tổng khấu trừ
+   * vượt quá số phải trả và đẩy Amount Due xuống âm.
+   */
+  const lateRefundOutstanding=custRound2_(lateEntries.reduce((sum,x)=>sum+custNum_(x.outstanding),0)+reversalOutstanding);
   const lateRefundApplied=custRound2_(Math.min(beforeLateRefund,lateRefundOutstanding));
   const lateRefundCarryForward=custRound2_(Math.max(0,lateRefundOutstanding-lateRefundApplied));
   const netBeforePayoutFee=custRound2_(Math.max(0,beforeLateRefund-lateRefundApplied));
@@ -1448,12 +1632,32 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
     refundRemaining=custRound2_(refundRemaining-take);
   });
 
+  /* Đảo chiều tiêu nốt phần còn lại sau refund, cùng một quỹ khấu trừ. */
+  reversalEntries.forEach(x=>{
+    if(refundRemaining<=CUST_CFG.EPSILON)return;
+    const take=custRound2_(Math.min(refundRemaining,x.outstanding)); if(take<=CUST_CFG.EPSILON)return;
+    const l=ledgerByKey[x.ledgerKey]||{};
+    adjustmentItems.push({
+      lineType:'WITHDRAWAL_REVERSAL_ADJUSTMENT',ledgerKey:x.ledgerKey,allocationKeys:[x.allocationKey],
+      transactionDate:x.eventDate,transactionDateDisplay:custBusinessDateTimeDisplay_(x.eventDate),periodClass:'WITHDRAWAL_REVERSAL',
+      paypalAccountKey:l['PayPal Account Key']||'',paypalTransactionId:l['PayPal Transaction ID']||'',
+      referenceId:l['Reference ID']||'',invoiceId:l['Invoice ID']||'',invoicePrefix:l['Invoice Prefix']||'',
+      item:'Withdrawal returned · '+x.withdrawalKey,buyerName:'',
+      grossAmount:0,paypalFee:0,refundAmount:0,paypalNetAmount:-take,receivingFeeAllocated:0,availableAmount:0,
+      amountIncluded:-take,currency:x.currency||sourceCurrency,
+      sourceUniqueKey:'WITHDRAWAL_REVERSAL|'+x.allocationKey,
+      note:'Tiền đã xuất hoá đơn nhưng withdrawal bị hoàn · thu lại '+take.toFixed(2)
+    });
+    refundRemaining=custRound2_(refundRemaining-take);
+  });
+
   const items=saleItems.concat(adjustmentItems).sort((a,b)=>custTime_(a.transactionDate)-custTime_(b.transactionDate)||a.lineType.localeCompare(b.lineType));
   const payoutCurrency=custDefaultPayoutCurrency_(customer.defaultPayoutProvider,sourceCurrency);
   const fingerprint=custFingerprint_({customer:customer.customerKey,from:params.fromKey,through:params.toKey,asOf:params.asOfKey,timezone:CUST_CFG.BUSINESS_TIMEZONE,
     payoutFeeRate,feeRule:[feeRule.ruleKey,feeRule.conversionRate,feeRule.transferRate,feeRule.transferMinimum],
     allocations:selected.map(a=>[a['Allocation Key'],custNum_(a['Remaining Available']),custNum_(a['Receiving Fee Allocated']),custStr_(a['Settlement Key'])]).sort(),
-    lateRefunds:lateEntries.map(x=>[x.ledgerKey,custNum_(x.outstanding),custTime_(x.eventDate)]).sort()});
+    lateRefunds:lateEntries.map(x=>[x.ledgerKey,custNum_(x.outstanding),custTime_(x.eventDate)]).sort(),
+    reversals:reversalEntries.map(x=>[x.allocationKey,custNum_(x.outstanding),custTime_(x.eventDate)]).sort()});
 
   return {params,customer,allocations:selected,items,saleItems,adjustmentItems,receivingProvider,sourceCurrency,payoutCurrency,
     grossSales:gross,refunds:totalRefunds,saleRefunds:saleRefund,paypalFees:paypalFee,receivingFees:receivingFee,availableAmount:availableTotal,
@@ -2129,13 +2333,36 @@ function custReportUnattributedSales_(ss,issues){
   const orphans=custSummarizeUnattributedSales_(build.allSourceRecords);
   if(!orphans.count)return orphans;
 
-  orphans.rows.slice(0,10).forEach(r=>{
+  /*
+   * Tách hai loại vì hành động khác hẳn nhau, và vì một cảnh báo không bao giờ
+   * tắt sẽ dạy người ta bỏ qua cảnh báo:
+   *
+   *   có prefix   -> sửa được, chỉ cần gán prefix đó cho một khách
+   *   không prefix -> nhiều khả năng không phải đơn của khách nào; tiền nằm lại
+   *                   PayPal là đúng, chỉ cần biết tổng chứ không cần liệt kê
+   */
+  const withPrefix=orphans.rows.filter(r=>custCanonicalPrefix_(r.invoicePrefix)||custStr_(r.invoiceId));
+  const noPrefix=orphans.rows.filter(r=>!custCanonicalPrefix_(r.invoicePrefix)&&!custStr_(r.invoiceId));
+
+  withPrefix.slice(0,10).forEach(r=>{
     issues.push('UNATTRIBUTED SALE '+r.accountKey+'|'+r.transactionId+
       ' · invoice '+(custStr_(r.invoiceId)||'(none)')+
       ' · prefix '+(custCanonicalPrefix_(r.invoicePrefix)||'(none)')+
-      ' · '+custNum_(r.netAmount).toFixed(2)+' '+custUpper_(r.currency));
+      ' · '+custNum_(r.netAmount).toFixed(2)+' '+custUpper_(r.currency)+
+      ' · gán prefix này cho một khách để sửa');
   });
-  issues.push('UNATTRIBUTED TOTAL: '+orphans.count+' sales · '+orphans.total.toFixed(2));
+  if(withPrefix.length){
+    issues.push('UNATTRIBUTED CÓ PREFIX: '+withPrefix.length+' sale · '+
+      custRound2_(withPrefix.reduce((sum,r)=>sum+custNum_(r.netAmount),0)).toFixed(2));
+  }
+  if(noPrefix.length){
+    issues.push('UNATTRIBUTED KHÔNG PREFIX: '+noPrefix.length+' sale · '+
+      custRound2_(noPrefix.reduce((sum,r)=>sum+custNum_(r.netAmount),0)).toFixed(2)+
+      ' · không có Invoice ID lẫn prefix, nhiều khả năng không phải đơn của khách');
+  }
+
+  orphans.withPrefix=withPrefix.length;
+  orphans.noPrefix=noPrefix.length;
   return orphans;
 }
 
@@ -2392,7 +2619,7 @@ function validateCustomerSystem(){
   const shTx=custRequireSheet_(ss,CUST_CFG.TRANSACTION_SHEET), hTx=custHeaderMap_(shTx), txs=custReadTransactionRows_(shTx,hTx);
   const shA=custRequireSheet_(ss,CUST_CFG.ALLOCATION_SHEET), hA=custHeaderMap_(shA), allocs=custReadRowsObjects_(shA,hA);
   const shL=custRequireSheet_(ss,CUST_CFG.LEDGER_SHEET), hL=custHeaderMap_(shL), ledgers=custReadRowsObjects_(shL,hL);
-  const late=custBuildLateRefundState_(ss,ledgers);
+  const late=custBuildRefundOwedState_(ss,ledgers);
   const sums={},issues=[];
   allocs.forEach(a=>{
     const k=custStr_(a['PayPal Withdrawal Transaction Key']);sums[k]=(sums[k]||0)+custNum_(a['Allocated Amount']);
