@@ -2116,6 +2116,101 @@ function custReportConservation_(ss,allocs,txs,issues){
   return out;
 }
 
+/*
+ * Liên kết hoá đơn -> tiền đã tiêu.
+ *
+ * Customer Allocation.'Settlement Key' là dây nối duy nhất giữa một invoice và
+ * số tiền nó đã tiêu, và custBuildCustomerAllocations_ chỉ lấy nó từ chính dòng
+ * allocation cũ — không có đường nào dựng lại từ sync. Xoá sheet Customer
+ * Allocation mà giữ Settlements là đứt dây vĩnh viễn: tiền đã xuất hoá đơn
+ * quay lại thành "chưa invoice" và sẽ được tính lần thứ hai, im lặng.
+ *
+ * Settlement Items có cột 'Customer Allocation Key' nên dựng lại được. Hai hàm
+ * dưới đây biến sự cố đó từ không-thể-phục-hồi thành thấy-được và sửa-được.
+ */
+function custBuildExpectedSettlementLinks_(ss){
+  const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
+  const shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), hi=custHeaderMap_(shItems);
+  const expected={};
+  if(!hi['Customer Allocation Key'])return expected;
+
+  const effective={};
+  custReadRowsObjects_(shSet,hs).forEach(s=>{
+    const key=custStr_(s['Settlement Key']);
+    if(key&&custIsEffectiveSettlementStatus_(s['Status']))effective[key]=true;
+  });
+
+  custReadRowsObjects_(shItems,hi).forEach(it=>{
+    const sk=custStr_(it['Settlement Key']); if(!effective[sk])return;
+    /* Một item có thể trải trên nhiều allocation, nối bằng dấu phẩy. */
+    custStr_(it['Customer Allocation Key']).split(',').forEach(raw=>{
+      const key=custStr_(raw); if(key)expected[key]=sk;
+    });
+  });
+  return expected;
+}
+
+function custReportBrokenSettlementLinks_(ss,issues){
+  const expected=custBuildExpectedSettlementLinks_(ss);
+  const keys=Object.keys(expected); if(!keys.length)return {broken:0,missing:0};
+
+  const shA=custRequireSheet_(ss,CUST_CFG.ALLOCATION_SHEET), ha=custHeaderMap_(shA);
+  const byKey={}; custReadRowsObjects_(shA,ha).forEach(r=>byKey[custStr_(r['Allocation Key'])]=r);
+
+  const brokenBySettlement={}; let missing=0, broken=0;
+  keys.forEach(k=>{
+    const r=byKey[k];
+    if(!r){ missing++; issues.push('SETTLEMENT ITEM TRỎ TỚI ALLOCATION KHÔNG TỒN TẠI · '+expected[k]+' -> '+k); return; }
+    if(custStr_(r['Settlement Key'])===expected[k])return;
+    broken++;
+    (brokenBySettlement[expected[k]]||(brokenBySettlement[expected[k]]=[])).push(k);
+  });
+
+  Object.keys(brokenBySettlement).forEach(sk=>{
+    issues.push('BROKEN SETTLEMENT LINK '+sk+' · '+brokenBySettlement[sk].length+
+      ' allocation không trỏ ngược lại · chạy repairAllocationSettlementLinks()');
+  });
+
+  return {broken,missing};
+}
+
+/*
+ * Sửa dây nối bị đứt. Chạy tay.
+ *
+ * Invoiced Amount = Available Amount là chính xác chứ không phải xấp xỉ: lúc
+ * create, newInvoiced = round2(min(available, already + remaining)) với
+ * already = 0 và remaining = available.
+ */
+function repairAllocationSettlementLinks(){
+  return custWithMutationLock_('repairAllocationSettlementLinks', function(){
+    const ss=SpreadsheetApp.getActive();
+    const expected=custBuildExpectedSettlementLinks_(ss);
+    const shA=custRequireSheet_(ss,CUST_CFG.ALLOCATION_SHEET), ha=custHeaderMap_(shA);
+    const byKey={}; custReadRowsObjects_(shA,ha).forEach(r=>byKey[custStr_(r['Allocation Key'])]=r);
+
+    const patches=[]; const missing=[];
+    Object.keys(expected).forEach(k=>{
+      const r=byKey[k];
+      if(!r){missing.push(k);return;}
+      if(custStr_(r['Settlement Key'])===expected[k])return;   /* đã đúng, không đụng */
+      const available=custNum_(r['Available Amount']);
+      patches.push({row:r._row,'Settlement Key':expected[k],'Invoiced Amount':available,'Remaining Available':0});
+    });
+
+    Logger.log('repairAllocationSettlementLinks: '+patches.length+' allocation cần sửa · '+
+      missing.length+' khoá trong Settlement Items không còn dòng allocation');
+    missing.slice(0,10).forEach(k=>Logger.log('  thiếu allocation: '+k));
+
+    if(patches.length){
+      custPatchColumns_(shA,ha,patches,['Settlement Key','Invoiced Amount','Remaining Available']);
+    }
+
+    const msg=patches.length?('Đã sửa '+patches.length+' liên kết'):'Không có liên kết nào cần sửa';
+    try{SpreadsheetApp.getActive().toast(msg+(missing.length?' · '+missing.length+' khoá mồ côi':''),'Repair Links',7);}catch(_){}
+    return {repaired:patches.length,missingAllocations:missing.length,missingKeys:missing.slice(0,20)};
+  });
+}
+
 /*********************** VALIDATION ************************/
 function validateCustomerSystem(){
   const ss=SpreadsheetApp.getActive(); syncCustomers_();
@@ -2140,6 +2235,7 @@ function validateCustomerSystem(){
   custReportReceivingMatchWarnings_(allocs,txs,issues);
   custReportOrphanPaidPayouts_(ss,issues);
   custReportUnattributedSales_(ss,issues);
+  custReportBrokenSettlementLinks_(ss,issues);
   const conservation=custReportConservation_(ss,allocs,txs,issues);
 
   const carry=custRound2_(Object.keys(late).reduce((sum,k)=>sum+custNum_(late[k].outstanding),0));

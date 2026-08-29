@@ -100,6 +100,7 @@ SAFETY
 - Exact row-2 headers matter; do not rename casually.
 - Stable keys/idempotency matter; repeated sync must not duplicate data.
 - Do not reintroduce Customer Transfer Allocation into invoice eligibility.
+- Customer Allocation "Settlement Key" is the only link between an invoice and the money it consumed, and sync cannot rebuild it. Never clear the Customer Allocation sheet unless Settlements and Settlement Items are cleared with it; otherwise invoiced money silently becomes available again and gets invoiced twice. If it was already cleared, run repairAllocationSettlementLinks(); validateCustomerSystem() reports BROKEN SETTLEMENT LINK when it is torn.
 - Do not expose secrets/tokens/passwords/PINs.
 - SAFE actions: read, aggregate, syncFlow, syncCustomers, preview, PDF generation.
 - Financial/data mutations are PROTECTED and require local Action PIN before execution.

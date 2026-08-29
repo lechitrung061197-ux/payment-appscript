@@ -7,6 +7,12 @@
  * Copy trọn file này vào project đó, sửa đúng khối CONFIG
  * bên dưới, chạy setupGreyDailyTrigger() một lần là xong.
  *
+ * Dùng được cho cả hai kiểu hộp thư: hộp thư riêng của từng
+ * Grey account, và hộp thư trung tâm nhận forward từ nhiều
+ * account. Account của mỗi email được suy ra từ header người
+ * nhận rồi đối chiếu cột Email của sheet Grey, nên không phụ
+ * thuộc vào việc khai đúng account key trong config.
+ *
  * NHIỆM VỤ DUY NHẤT: Gmail -> Transaction (dữ liệu thô).
  * Không tính Type / Direction / Gross / Net / Fee / Currency,
  * không normalize, không reconcile, không tính summary.
@@ -53,9 +59,14 @@ const GG_CFG = Object.freeze({
   // Payment All thật. Giống nhau ở mọi project.
   SPREADSHEET_ID: '1YherTvOxpqkmW5XJ_ydn_U-5dQLFeHhFn2Hpm4XvWos',
 
-  // Grey account mà hộp thư này nhận mail. GR001 / GR002 / GR003...
-  // Phải khớp Account Key trong sheet Grey.
-  GREY_ACCOUNT_KEY: 'GR001',
+  // Account được suy ra từ header người nhận của từng email, đối chiếu với
+  // cột Email của sheet Grey. Nhờ vậy một file dùng chung được cho cả hộp thư
+  // riêng của từng Grey account lẫn hộp thư trung tâm nhận forward.
+  //
+  // Giá trị dưới đây CHỈ là phương án dự phòng, dùng khi không tra được
+  // account nào từ header. Hộp thư riêng thì điền; hộp thư trung tâm nên
+  // để trống, vì đoán bừa còn tệ hơn bỏ sót.
+  FALLBACK_ACCOUNT_KEY: 'GR001',
 
   SENDER: 'hello@grey.co',
 
@@ -138,8 +149,7 @@ function setupGreyDailyTrigger() {
     .inTimezone(GG_CFG.TIMEZONE)
     .create();
 
-  Logger.log('Trigger đã tạo cho ' + GG_CFG.GREY_ACCOUNT_KEY +
-    ' — mỗi ngày gần ' +
+  Logger.log('Trigger đã tạo — mỗi ngày gần ' +
     String(GG_CFG.TRIGGER_HOUR).padStart(2, '0') + ':' +
     String(GG_CFG.TRIGGER_NEAR_MINUTE).padStart(2, '0') +
     ' (' + GG_CFG.TIMEZONE + '). Đã xoá ' + removed + ' trigger cũ.');
@@ -186,42 +196,68 @@ function ggRun_(lookbackDays) {
   const greyHeaders = ggHeaderMap_(greySheet);
   const txHeaders = ggHeaderMap_(txSheet);
 
-  ggRequireHeaders_(greyHeaders, ['Account Key', 'Label', 'Status', 'Last Sync', 'Sync Status'], 'Grey');
+  ggRequireHeaders_(greyHeaders, ['Account Key', 'Label', 'Status', 'Email', 'Last Sync', 'Sync Status'], 'Grey');
   ggRequireHeaders_(txHeaders, [
     'Transaction Date', 'Provider', 'Account Key', 'Label',
     'Reference', 'Source', 'Source ID', 'Sync Time', 'Unique Key'
   ].concat(GG_RAW_HEADERS), 'Transaction');
 
-  const account = ggFindGreyAccount_(greySheet, greyHeaders, GG_CFG.GREY_ACCOUNT_KEY);
-  if (!account) {
-    throw new Error('Không tìm thấy Grey account "' + GG_CFG.GREY_ACCOUNT_KEY + '" trong sheet Grey.');
+  const greyAccounts = ggLoadGreyAccounts_(greySheet, greyHeaders);
+  if (!greyAccounts.accounts.length) {
+    throw new Error('Sheet Grey không có account nào bật kèm cột Email.');
   }
 
+  const fallback = ggFallbackAccount_(greyAccounts);
+
   const lock = ggAcquireLock_(ss);
-  ggSetField_(greySheet, account.rowNumber, greyHeaders, 'Sync Status', 'SYNCING');
+
+  /* Chỉ những account thật sự có mail trong lượt này mới được đánh dấu. */
+  const touched = {};
+  const markSyncing = function (acc) {
+    if (touched[acc.accountKey]) return;
+    touched[acc.accountKey] = acc;
+    ggSetField_(greySheet, acc.rowNumber, greyHeaders, 'Sync Status', 'SYNCING');
+  };
+  if (fallback) markSyncing(fallback);
 
   try {
-    const stats = ggCollect_(txSheet, txHeaders, account, lookbackDays);
+    const stats = ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, markSyncing);
 
-    ggSetField_(greySheet, account.rowNumber, greyHeaders, 'Last Sync', new Date());
-    ggSetField_(greySheet, account.rowNumber, greyHeaders, 'Sync Status',
-      'RAW OK · ' + stats.created + ' new · ' + stats.updated + ' upd · ' +
-      stats.unchanged + ' same / ' + stats.scanned + ' mails');
+    const now = new Date();
+    Object.keys(touched).forEach(function (key) {
+      const acc = touched[key];
+      const per = stats.perAccount[key] || { created: 0, updated: 0, unchanged: 0 };
+      ggSetField_(greySheet, acc.rowNumber, greyHeaders, 'Last Sync', now);
+      ggSetField_(greySheet, acc.rowNumber, greyHeaders, 'Sync Status',
+        'RAW OK · ' + per.created + ' new · ' + per.updated + ' upd · ' +
+        per.unchanged + ' same' +
+        (stats.unmapped ? ' · ' + stats.unmapped + ' UNMAPPED' : '') +
+        (stats.ambiguous ? ' · ' + stats.ambiguous + ' AMBIGUOUS' : ''));
+    });
 
     SpreadsheetApp.flush();
 
     const secs = ((new Date().getTime() - started.getTime()) / 1000).toFixed(1);
-    Logger.log('GREY ' + account.accountKey + ' DONE in ' + secs + 's · ' +
-      'scanned ' + stats.scanned + ' · tx mails ' + stats.transactionMails +
+    Logger.log('GREY COLLECTOR DONE in ' + secs + 's · scanned ' + stats.scanned +
+      ' · tx mails ' + stats.transactionMails +
       ' · new ' + stats.created + ' · updated ' + stats.updated +
-      ' · unchanged ' + stats.unchanged + ' · no reference ' + stats.noReference);
+      ' · unchanged ' + stats.unchanged +
+      ' · no reference ' + stats.noReference +
+      ' · unmapped ' + stats.unmapped +
+      ' · ambiguous ' + stats.ambiguous);
+    Object.keys(stats.perAccount).forEach(function (key) {
+      const p = stats.perAccount[key];
+      Logger.log('  ' + key + ': ' + p.created + ' new · ' + p.updated + ' upd · ' + p.unchanged + ' same');
+    });
 
     return stats;
 
   } catch (err) {
     try {
-      ggSetField_(greySheet, account.rowNumber, greyHeaders, 'Sync Status',
-        'ERROR: ' + ggTruncate_(err.message || String(err), 300));
+      Object.keys(touched).forEach(function (key) {
+        ggSetField_(greySheet, touched[key].rowNumber, greyHeaders, 'Sync Status',
+          'ERROR: ' + ggTruncate_(err.message || String(err), 300));
+      });
       SpreadsheetApp.flush();
     } catch (ignored) { /* đừng để việc ghi trạng thái che mất lỗi gốc */ }
     throw err;
@@ -232,11 +268,22 @@ function ggRun_(lookbackDays) {
 }
 
 
+function ggFallbackAccount_(greyAccounts) {
+  const key = ggString_(GG_CFG.FALLBACK_ACCOUNT_KEY);
+  if (!key) return null;
+  const acc = greyAccounts.byKey[key];
+  if (!acc) {
+    throw new Error('FALLBACK_ACCOUNT_KEY "' + key + '" không có trong sheet Grey (hoặc đang DISABLED / thiếu Email).');
+  }
+  return acc;
+}
+
+
 /************************************************************
  * COLLECT
  ************************************************************/
 
-function ggCollect_(txSheet, txHeaders, account, lookbackDays) {
+function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, markSyncing) {
   const index = ggBuildIndex_(txSheet, txHeaders);
 
   const query = 'from:' + GG_CFG.SENDER +
@@ -245,7 +292,8 @@ function ggCollect_(txSheet, txHeaders, account, lookbackDays) {
 
   const stats = {
     scanned: 0, transactionMails: 0, ignored: 0,
-    created: 0, updated: 0, unchanged: 0, noReference: 0
+    created: 0, updated: 0, unchanged: 0, noReference: 0,
+    unmapped: 0, ambiguous: 0, perAccount: {}
   };
 
   let start = 0;
@@ -268,6 +316,33 @@ function ggCollect_(txSheet, txHeaders, account, lookbackDays) {
         if (!ggIsTransactionMail_(subject, bodyText)) { stats.ignored++; return; }
         stats.transactionMails++;
 
+        /*
+         * Account đến từ header người nhận, không từ config. Nhiều khớp thì
+         * bỏ qua chứ không đoán: đây là quy kết tiền theo account, gán sai
+         * còn tệ hơn bỏ sót.
+         */
+        const resolved = ggResolveGreyAccount_(message, greyAccounts);
+        let account = resolved.account;
+
+        if (resolved.status === 'AMBIGUOUS') {
+          stats.ambiguous++;
+          Logger.log('AMBIGUOUS: khớp nhiều account ' + resolved.matches.join(', ') +
+            ' — subject "' + ggTruncate_(subject, 80) + '"');
+          return;
+        }
+
+        if (!account) {
+          if (!fallback) {
+            stats.unmapped++;
+            Logger.log('UNMAPPED: không tra được account — subject "' +
+              ggTruncate_(subject, 80) + '" · header ' + ggTruncate_(resolved.debug, 200));
+            return;
+          }
+          account = fallback;
+        }
+
+        markSyncing(account);
+
         const raw = ggExtractRaw_(bodyText);
         const messageId = String(message.getId());
         if (!raw.reference) stats.noReference++;
@@ -281,6 +356,9 @@ function ggCollect_(txSheet, txHeaders, account, lookbackDays) {
         });
 
         stats[outcome]++;
+        const per = stats.perAccount[account.accountKey] ||
+          (stats.perAccount[account.accountKey] = { created: 0, updated: 0, unchanged: 0 });
+        per[outcome]++;
       });
     });
 
@@ -460,7 +538,7 @@ function ggAcquireLock_(ss) {
     sheet.hideSheet();
   }
 
-  const token = GG_CFG.GREY_ACCOUNT_KEY + '|' + Utilities.getUuid();
+  const token = (ggString_(GG_CFG.FALLBACK_ACCOUNT_KEY) || 'GREY') + '|' + Utilities.getUuid();
   const deadline = new Date().getTime() + GG_CFG.LOCK_WAIT_MS;
 
   while (new Date().getTime() < deadline) {
@@ -599,9 +677,18 @@ function ggEnsureRawHeaders_(sheet) {
 }
 
 
-function ggFindGreyAccount_(sheet, headers, accountKey) {
+/************************************************************
+ * NHẬN DIỆN GREY ACCOUNT
+ *
+ * Port từ bản mail.js cũ (commit 4e46b08), đã chạy thật với
+ * mail Grey. Đối chiếu email người nhận với cột Email của
+ * sheet Grey.
+ ************************************************************/
+
+function ggLoadGreyAccounts_(sheet, headers) {
+  const state = { accounts: [], byKey: {}, byEmail: {} };
   const lastRow = sheet.getLastRow();
-  if (lastRow < GG_CFG.DATA_START_ROW) return null;
+  if (lastRow < GG_CFG.DATA_START_ROW) return state;
 
   const rows = sheet.getRange(
     GG_CFG.DATA_START_ROW, 1,
@@ -609,22 +696,142 @@ function ggFindGreyAccount_(sheet, headers, accountKey) {
     sheet.getLastColumn()
   ).getValues();
 
-  for (let i = 0; i < rows.length; i++) {
-    const key = ggString_(rows[i][headers['Account Key']]);
-    if (key !== accountKey) continue;
+  rows.forEach(function (row, i) {
+    const accountKey = ggString_(row[headers['Account Key']]);
+    if (!accountKey) return;
+    if (ggString_(row[headers['Status']]).toUpperCase() === 'DISABLED') return;
 
-    if (ggString_(rows[i][headers['Status']]).toUpperCase() === 'DISABLED') {
-      throw new Error('Grey account "' + accountKey + '" đang DISABLED.');
+    const email = ggNormalizeEmail_(row[headers['Email']]);
+    if (!email) {
+      /* Không có Email thì không bao giờ tra ra account này. */
+      Logger.log('CẢNH BÁO: Grey account "' + accountKey + '" đang bật nhưng thiếu cột Email — mail của nó sẽ không tra được.');
+      return;
     }
 
-    return {
+    /* Hai account dùng chung một email thì mọi mail đều thành AMBIGUOUS. */
+    if (state.byEmail[email]) {
+      throw new Error('Hai Grey account dùng chung Email "' + email + '": ' +
+        state.byEmail[email].accountKey + ' và ' + accountKey + '.');
+    }
+
+    const account = {
       rowNumber: GG_CFG.DATA_START_ROW + i,
-      accountKey: key,
-      label: ggString_(rows[i][headers['Label']])
+      accountKey: accountKey,
+      label: ggString_(row[headers['Label']]),
+      email: email
+    };
+
+    state.accounts.push(account);
+    state.byKey[accountKey] = account;
+    state.byEmail[email] = account;
+  });
+
+  return state;
+}
+
+
+/*
+ * Gom mọi chỗ có thể chứa địa chỉ người nhận gốc. Với mail được
+ * forward, To là hộp thư trung tâm còn Delivered-To / X-Forwarded-To
+ * mới giữ địa chỉ Grey account ban đầu.
+ *
+ * Chỉ đọc khối header, KHÔNG đọc body: body mail giao dịch Grey có
+ * thể chứa địa chỉ email và sẽ khớp nhầm.
+ */
+function ggResolveGreyAccount_(message, greyAccounts) {
+  const parts = [];
+
+  parts.push(ggSafeStringCall_(function () { return message.getTo(); }));
+  parts.push(ggSafeStringCall_(function () { return message.getCc(); }));
+  parts.push(ggSafeStringCall_(function () { return message.getBcc(); }));
+
+  ['To', 'Cc', 'Delivered-To', 'X-Original-To', 'Envelope-To', 'X-Envelope-To',
+   'X-Forwarded-To', 'Resent-To', 'Original-Recipient', 'Final-Recipient'
+  ].forEach(function (name) {
+    parts.push(ggSafeStringCall_(function () { return message.getHeader(name); }));
+  });
+
+  parts.push(ggGetRawHeaderBlock_(message));
+
+  const headerText = parts.filter(Boolean).join('\n');
+
+  const matches = greyAccounts.accounts.filter(function (acc) {
+    return ggHeaderContainsEmail_(headerText, acc.email);
+  });
+
+  if (matches.length === 1) {
+    return { status: 'OK', account: matches[0], matches: [matches[0].email], debug: '' };
+  }
+
+  if (matches.length > 1) {
+    return {
+      status: 'AMBIGUOUS', account: null,
+      matches: matches.map(function (m) { return m.email; }), debug: ''
     };
   }
 
-  return null;
+  return {
+    status: 'UNMAPPED', account: null, matches: [],
+    debug: ggTruncate_(headerText.replace(/\s+/g, ' '), 500)
+  };
+}
+
+
+/* Chỉ phần header RFC822, cắt tại dòng trống đầu tiên. */
+function ggGetRawHeaderBlock_(message) {
+  try {
+    const raw = String(message.getRawContent() || '');
+    if (!raw) return '';
+
+    let at = raw.indexOf('\r\n\r\n');
+    let sep = 4;
+    if (at === -1) { at = raw.indexOf('\n\n'); sep = 2; }
+
+    /* Không tìm thấy ranh giới thì cắt cứng, đừng nuốt cả body. */
+    if (at === -1) return raw.substring(0, Math.min(raw.length, 12000));
+
+    return raw.substring(0, at + sep);
+  } catch (error) {
+    return '';
+  }
+}
+
+
+/*
+ * Ràng buộc biên hai đầu để foo@x.com không khớp xfoo@x.com.
+ */
+function ggHeaderContainsEmail_(headerText, email) {
+  const target = String(email || '').toLowerCase().trim();
+  if (!target) return false;
+
+  const regex = new RegExp(
+    '(^|[^a-z0-9._%+\\-])' + ggRegexEscape_(target) + '([^a-z0-9._%+\\-]|$)', 'i');
+
+  return regex.test(String(headerText || '').toLowerCase());
+}
+
+
+/* Nhận cả "user@x.com" lẫn "Name <user@x.com>". */
+function ggNormalizeEmail_(value) {
+  const text = ggString_(value).toLowerCase();
+  if (!text) return '';
+  const m = text.match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return m ? m[0].toLowerCase().trim() : '';
+}
+
+
+function ggRegexEscape_(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+
+/* getHeader() không có ở mọi phiên bản runtime. */
+function ggSafeStringCall_(fn) {
+  try {
+    return String(fn() || '');
+  } catch (error) {
+    return '';
+  }
 }
 
 
