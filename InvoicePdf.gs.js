@@ -698,15 +698,36 @@ function invPdfRenderSummary_(body, settlement, h) {
     .setFontSize(10.5)
     .setForegroundColor(INV_PDF_CFG.DARK_COLOR);
 
+  /*
+   * TẠM ỨNG
+   * -------
+   * Hai dòng này nằm SAU dòng phí, phản chiếu đúng thứ tự tính bên
+   * Customer.gs: tiền ứng là vốn của chủ cho mượn, không phải doanh thu của
+   * khách, nên phí không chạm vào nó ở cả hai chiều.
+   *
+   * Cột chỉ mọc ra khi bản Customer.gs mới ghi vào, nên hoá đơn cũ không có
+   * cột này vẫn render như trước — đọc thiếu cột phải là im lặng, không phải nổ.
+   */
+  const advanceGiven = h['Advance Amount'] ? invPdfNum_(v[h['Advance Amount'] - 1]) : 0;
+  const advanceRepaid = h['Advance Recovered'] ? invPdfNum_(v[h['Advance Recovered'] - 1]) : 0;
+
   const rows = [
     ['Sales', invPdfMoney_(v[h['Gross Sales'] - 1], sourceCurrency)],
     ['Refunds', invPdfMoneySignedFee_(v[h['Refunds'] - 1], sourceCurrency)],
     ['PayPal Fees', invPdfMoneySignedFee_(v[h['PayPal Fees'] - 1], sourceCurrency)],
     ['Transfer Fees', invPdfMoneySignedFee_(transferFees, sourceCurrency)],
     ['Net Before Payout Fee', invPdfMoney_(v[h['Net Before Payout Fee'] - 1], payoutCurrency)],
-    ['Payout Fee (' + invPdfPercent_(payoutFeeRate) + ')', invPdfMoneySignedFee_(v[h['Payout Fee Amount'] - 1], payoutCurrency)],
-    ['AMOUNT DUE', invPdfMoney_(amountDue, payoutCurrency)]
+    ['Payout Fee (' + invPdfPercent_(payoutFeeRate) + ')', invPdfMoneySignedFee_(v[h['Payout Fee Amount'] - 1], payoutCurrency)]
   ];
+
+  if (advanceRepaid > 0.0001) {
+    rows.push(['Advance Repayment', invPdfMoneySignedFee_(advanceRepaid, payoutCurrency)]);
+  }
+  if (advanceGiven > 0.0001) {
+    rows.push(['Advance', '+' + advanceGiven.toFixed(2) + ' ' + payoutCurrency]);
+  }
+
+  rows.push(['AMOUNT DUE', invPdfMoney_(amountDue, payoutCurrency)]);
 
   const table = body.appendTable(rows);
   table.setBorderWidth(0.35);
@@ -751,6 +772,22 @@ function invPdfRenderSummary_(body, settlement, h) {
       .setFontFamily(INV_PDF_CFG.FONT_FAMILY)
       .setFontSize(8.25)
       .setForegroundColor(INV_PDF_CFG.DARK_COLOR);
+  }
+
+  /*
+   * Khách phải thấy phần ứng còn nợ. Không hiện thì kỳ sau bị trừ mà không
+   * hiểu vì sao, và người phải giải thích là bạn.
+   */
+  const advanceLeft = h['Advance Outstanding After'] ? invPdfNum_(v[h['Advance Outstanding After'] - 1]) : 0;
+  if (advanceLeft > 0.0001) {
+    const advNote = body.appendParagraph(
+      'Advance balance carried forward: ' + advanceLeft.toFixed(2) + ' ' + payoutCurrency +
+      ' — recovered from future invoices.'
+    );
+    advNote.editAsText()
+      .setFontFamily(INV_PDF_CFG.FONT_FAMILY)
+      .setFontSize(7.5)
+      .setForegroundColor(INV_PDF_CFG.MUTED_COLOR);
   }
 
   const paid = invPdfNum_(v[h['Amount Paid'] - 1]);

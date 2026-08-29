@@ -40,7 +40,7 @@ SHEET MAP
 - Paypal: PayPal source transactions/events; Invoice Prefix identifies customer.
 - Transaction: real money movement + Reconcile Status + Matched Transaction Key.
 - Grey / USDT: provider account summaries.
-- Customers: customer config + PayPal Total, Matched, Available, Invoiced, Outstanding, Pending in PayPal.
+- Customers: customer config + PayPal Total, Matched, Available, Invoiced, Outstanding, Pending in PayPal, Advance Outstanding, Refund Owed. The last two are what the customer owes back; both are derived every sync.
 - Customer Ledger: PayPal sale ownership and actual PayPal fee/refund impact.
 - Customer Allocation: customer share of PayPal withdrawals and receiving match. AVAILABLE rows are invoiceable.
 - Fee Rules: invoice pricing config.
@@ -86,6 +86,16 @@ Downstream Cost = Conversion Cost + Transfer Cost.
 Net Before Payout Fee = available base after downstream cost and current adjustments.
 Payout Fee % comes from customer/settlement and is NOT hard-coded.
 Amount Due = final payable amount, never negative.
+
+ADVANCE
+An advance is money the operator pays the customer BEFORE they have earned it — typically while PayPal is still holding funds. It is entered per invoice (Invoice Control B8, or advance_amount) and it INCREASES Amount Due on that invoice.
+It is recovered ONLY by deducting from later invoices. There is no cash repayment path.
+Outstanding advance is never stored: it is recomputed as sum(ADVANCE) - sum(ADVANCE_RECOVERY) over Settlement Items of EFFECTIVE settlements only. A failed or cancelled create leaves no debt.
+Recovery is capped so Amount Due never goes negative; the remainder carries to the next invoice.
+Advance and its recovery sit OUTSIDE the payout fee, on purpose: it is the operator's own money being lent and repaid, so charging the payout fee on it would be charging a fee on your own capital. Late refund is different and sits BEFORE the fee, because refunded money was never really earned.
+Priority needs no rule: late refund reduces the fee base first, so a refund-heavy period automatically leaves less for advance recovery and the rest carries.
+Customers.Advance Outstanding shows the current balance per customer. Read it there; do not reconstruct it from Settlement Items unless asked to audit.
+An advance cannot be forced back: if the customer stops trading it stays open forever. validateCustomerSystem() reports outstanding advances with age.
 
 LATE REFUND
 Issued invoices are immutable.

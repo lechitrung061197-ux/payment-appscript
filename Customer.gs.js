@@ -707,6 +707,103 @@ function custLedgerField_(row,prop,header){
 }
 
 /*
+ * TẠM ỨNG — KHÁCH CÒN NỢ BAO NHIÊU
+ * ============================================================================
+ * Ứng trước là tiền của bạn đưa sớm cho khách, và chỉ thu lại bằng cách trừ
+ * vào hoá đơn sau. Số còn nợ KHÔNG được lưu ở đâu cả: mỗi lần cần, cộng lại từ
+ * Settlement Items của các hoá đơn đã có hiệu lực —
+ *
+ *     còn nợ = tổng ADVANCE − tổng ADVANCE_RECOVERY
+ *
+ * Vì hoá đơn đã phát hành là bất biến, tổng đó không trôi được, không sửa tay
+ * được, và không thể trừ hai lần. Đó chính là mẹo đang giữ cho refund
+ * carry-forward an toàn ([[custBuildRefundOwedState_]]) — dùng lại, đừng phát
+ * minh một ô "số dư" để rồi phải canh cho nó đúng.
+ *
+ * Hệ quả cố ý: hoá đơn ở trạng thái CREATING/FAILED/CANCELLED không tính. Một
+ * lần tạo hỏng không để lại khoản nợ ma.
+ */
+function custBuildAdvanceOwedState_(ss){
+  const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
+  const shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), hi=custHeaderMap_(shItems);
+
+  const active={};
+  custReadRowsObjects_(shSet,hs).forEach(s=>{
+    const key=custStr_(s['Settlement Key']); if(!key||!custIsEffectiveSettlementStatus_(s['Status']))return;
+    active[key]={issuedAt:custDate_(s['Issued At']||s['Created At']),invoiceNumber:custStr_(s['Invoice Number'])};
+  });
+
+  const out={};
+  const touch=key=>out[key]||(out[key]={customerKey:key,given:0,recovered:0,outstanding:0,oldestOpenAt:null,oldestOpenInvoice:''});
+
+  custReadRowsObjects_(shItems,hi).forEach(it=>{
+    const sk=custStr_(it['Settlement Key']); const set=active[sk]; if(!set)return;
+    const type=custUpper_(it['Line Type']); if(type!=='ADVANCE'&&type!=='ADVANCE_RECOVERY')return;
+    const customerKey=custCanonicalKey_(it['Customer Key']); if(!customerKey)return;
+
+    /* Amount Included mang dấu: ADVANCE dương, ADVANCE_RECOVERY âm. */
+    const amount=Math.abs(custNum_(it['Amount Included']));
+    if(amount<=CUST_CFG.EPSILON)return;
+    const rec=touch(customerKey);
+
+    if(type==='ADVANCE'){
+      rec.given=custRound2_(rec.given+amount);
+      /*
+       * Tuổi của khoản ứng cũ nhất, để validate còn nói được "cái này nằm bao
+       * lâu rồi". Một khoản ứng không tự đòi được: khách ngừng giao dịch là nó
+       * nằm mãi, và đó là chuyện phải nhìn thấy chứ không phải đoán.
+       */
+      const at=custDate_(it['Created At'])||set.issuedAt||null;
+      if(at&&(!rec.oldestOpenAt||custTime_(at)<custTime_(rec.oldestOpenAt))){
+        rec.oldestOpenAt=at; rec.oldestOpenInvoice=set.invoiceNumber||custStr_(it['Invoice Number']);
+      }
+    }else{
+      rec.recovered=custRound2_(rec.recovered+amount);
+    }
+  });
+
+  Object.keys(out).forEach(k=>{
+    const r=out[k];
+    r.outstanding=custRound2_(Math.max(0,r.given-r.recovered));
+    /* Thu vượt phần đã ứng là lỗi kiểm toán, không được nuốt. */
+    r.overRecovered=custRound2_(Math.max(0,r.recovered-r.given));
+    if(r.outstanding<=CUST_CFG.EPSILON){r.oldestOpenAt=null;r.oldestOpenInvoice='';}
+  });
+
+  return out;
+}
+
+function custAdvanceOutstandingFor_(advanceState,customerKey){
+  const rec=advanceState&&advanceState[custCanonicalKey_(customerKey)];
+  return rec?custNum_(rec.outstanding):0;
+}
+
+/*
+ * Toán của khoản ứng, tách riêng và thuần tuý để test được đúng thứ đang chạy
+ * chứ không phải một bản dựng lại trong file test.
+ *
+ * amountDueBeforeAdvance đã trừ phí xong. Ứng và thu hồi đều nằm NGOÀI phí:
+ * đó là vốn của chủ cho mượn rồi thu về, tính phí lên nó là tự thu phí trên
+ * tiền của chính mình.
+ *
+ * Thu trước, cấp sau. Kẹp thu hồi theo phần thực sự trả được nên Amount Due
+ * không bao giờ âm; phần chưa thu được carry sang hoá đơn kế.
+ */
+function custComputeAdvance_(amountDueBeforeAdvance,advanceGiven,advanceOutstandingBefore){
+  const due=custRound2_(Math.max(0,custNum_(amountDueBeforeAdvance)));
+  const given=custRound2_(Math.max(0,custNum_(advanceGiven)));
+  const owed=custRound2_(Math.max(0,custNum_(advanceOutstandingBefore)));
+  const recovered=custRound2_(Math.min(due,owed));
+  const carryForward=custRound2_(Math.max(0,owed-recovered));
+  return {
+    recovered:recovered,
+    carryForward:carryForward,
+    outstandingAfter:custRound2_(carryForward+given),
+    amountDue:custRound2_(Math.max(0,due-recovered)+given)
+  };
+}
+
+/*
  * Refund event map is only used to respect the invoice Through Date.
  * The accounting amount still comes from the immutable invoice snapshot vs
  * the current ledger refund delta above.
@@ -1346,8 +1443,15 @@ function custSyncSettlementPayments_(ss, now){
 
 /*********************** CUSTOMER SUMMARY ************************/
 function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundState, reversalState, now){
-  const sh=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET), h=custHeaderMap_(sh);
+  const sh=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET);
+  /*
+   * Hai khoản khách nợ lại vốn không hiện ở đâu ngoài validateCustomerSystem().
+   * Đưa lên đây để chúng nằm cạnh các số đầu bảng, cùng nhịp refresh — thứ
+   * người ta không nhìn thấy là thứ người ta quên mất.
+   */
+  const h=custEnsureHeaders_(sh,['Advance Outstanding','Refund Owed']);
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet), sets=custReadRowsObjects_(shSet,hs);
+  const advanceState=custBuildAdvanceOwedState_(ss);
   const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), hp=custHeaderMap_(shPay), payouts=custReadRowsObjects_(shPay,hp);
   /* One read for the whole sheet, so the unchanged-check below stays cheap. */
   const currentByRow={}; custReadRowsObjects_(sh,h).forEach(r=>currentByRow[r._row]=r);
@@ -1377,6 +1481,7 @@ function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundSt
     paypalTotal=custRound2_(paypalTotal); matched=custRound2_(matched); available=custRound2_(available);
     invoiced=custRound2_(Math.min(available,invoiced));
     const refundCarry=custRound2_(refundCarryByCustomer[c.customerKey]||0);
+    const advanceOwed=custAdvanceOutstandingFor_(advanceState,c.customerKey);
     const outstanding=custRound2_(Math.max(0,available-invoiced-refundCarry));
     const pending=custRound2_(Math.max(0,paypalTotal-matched));
     let lastSettlement=null,lastPayout=null;
@@ -1392,9 +1497,10 @@ function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundSt
     if(custAmountSame_(cur['PayPal Total'],paypalTotal)&&custAmountSame_(cur['Matched Amount'],matched)&&
        custAmountSame_(cur['Available Amount'],available)&&custAmountSame_(cur['Invoiced Amount'],invoiced)&&
        custAmountSame_(cur['Outstanding Amount'],outstanding)&&custAmountSame_(cur['Pending in PayPal'],pending)&&
+       custAmountSame_(cur['Advance Outstanding'],advanceOwed)&&custAmountSame_(cur['Refund Owed'],refundCarry)&&
        custStr_(cur['Sync Status'])===syncStatus)return;
 
-    [['PayPal Total',paypalTotal],['Matched Amount',matched],['Available Amount',available],['Invoiced Amount',invoiced],['Outstanding Amount',outstanding],['Pending in PayPal',pending],['Last Settlement',lastSettlement||''],['Last Payout',lastPayout||''],['Last Sync',now],['Sync Status',syncStatus]]
+    [['PayPal Total',paypalTotal],['Matched Amount',matched],['Available Amount',available],['Invoiced Amount',invoiced],['Outstanding Amount',outstanding],['Pending in PayPal',pending],['Advance Outstanding',advanceOwed],['Refund Owed',refundCarry],['Last Settlement',lastSettlement||''],['Last Payout',lastPayout||''],['Last Sync',now],['Sync Status',syncStatus]]
       .forEach(([k,v])=>custSetCellByHeader_(sh,h,c.rowNumber,k,v));
   });
 }
@@ -1484,7 +1590,9 @@ function previewCustomerStatementFromControlCore_(){
   paypalTotal=custRound2_(paypalTotal);matched=custRound2_(matched);available=custRound2_(available);invoiced=custRound2_(invoiced);
   const outstanding=custRound2_(Math.max(0,available-invoiced)),pending=custRound2_(Math.max(0,paypalTotal-matched));
   const control=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);
-  [['B14',paypalTotal],['B15',matched],['B16',available],['B17',invoiced],['B18',outstanding],['B19',pending]].forEach(([a,v])=>control.getRange(a).setValue(v));
+  custEnsureControlAdvanceCells_(control);
+  const advanceOwed=custAdvanceOutstandingFor_(custBuildAdvanceOwedState_(ss),params.customerKey);
+  [['B14',paypalTotal],['B15',matched],['B16',available],['B17',invoiced],['B18',outstanding],['B19',pending],['B20',advanceOwed]].forEach(([a,v])=>control.getRange(a).setValue(v));
   custWriteControlDetails_(control,rows.map(r=>({date:custBusinessDateTimeDisplay_(custDate_(r['Transaction Date'])),tx:r['PayPal Transaction ID'],invoice:r['Invoice ID'],item:custItemFromMap_(itemMap,r['PayPal Account Key'],r['PayPal Transaction ID']),gross:r['Gross Amount'],paypalFee:r['PayPal Fee'],refund:r['Refund Amount'],paypalNet:r['Net Amount'],receivingFee:'',available:'',included:'',status:r['Status']})));
   control.getRange('E21').setValue('OK · US TIME '+CUST_CFG.BUSINESS_TIMEZONE);control.getRange('E22').setValue('STATEMENT READY');
   return {rows:rows.length,paypalTotal,matched,available,invoiced,outstanding,pending};
@@ -1562,6 +1670,13 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
   const reversalEntries=custBuildEligibleReversalAdjustments_(ss,customer,reversalState,params.toKey);
   reversalEntries.forEach(x=>{if(x.currency&&x.currency!==sourceCurrency)throw new Error('Withdrawal reversal currency '+x.currency+' does not match invoice currency '+sourceCurrency+'.');});
 
+  /*
+   * Không lọc theo To Date như late refund. Khoản ứng không gắn với một giao
+   * dịch PayPal nào để mà hỏi "xảy ra trong kỳ chưa" — nó là tiền đang nợ, và
+   * tiền đang nợ thì hoá đơn nào cũng phải thu, không đợi kỳ.
+   */
+  const advanceState=custBuildAdvanceOwedState_(ss);
+
   const grouped={}; let gross=0,saleRefund=0,paypalFee=0,receivingFee=0,availableTotal=0,currentAmount=0,carryAmount=0;
   selected.forEach(a=>{
     const l=ledgerByKey[custStr_(a['Customer Ledger Key'])]; if(!l)throw new Error('Missing Customer Ledger: '+a['Customer Ledger Key']);
@@ -1608,7 +1723,31 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
   const lateRefundApplied=custRound2_(Math.min(beforeLateRefund,lateRefundOutstanding));
   const lateRefundCarryForward=custRound2_(Math.max(0,lateRefundOutstanding-lateRefundApplied));
   const netBeforePayoutFee=custRound2_(Math.max(0,beforeLateRefund-lateRefundApplied));
-  const payoutFeeRate=customer.payoutFeeRate, payoutFeeAmount=custRound2_(netBeforePayoutFee*payoutFeeRate), amountDue=custRound2_(Math.max(0,netBeforePayoutFee-payoutFeeAmount));
+  const payoutFeeRate=customer.payoutFeeRate, payoutFeeAmount=custRound2_(netBeforePayoutFee*payoutFeeRate);
+  const amountDueBeforeAdvance=custRound2_(Math.max(0,netBeforePayoutFee-payoutFeeAmount));
+
+  /*
+   * TẠM ỨNG — CỘNG VÀ TRỪ SAU PHÍ, CÓ LÝ DO
+   *
+   * Tiền ứng là tiền BẠN cho mượn, không phải tiền khách kiếm được. Tính phí %
+   * lên nó là tự thu phí trên chính tiền của mình; và lúc thu về cũng vậy, thu
+   * 1000 không được làm co lại cơ sở tính phí của kỳ đó. Nên cả hai chiều đều
+   * nằm NGOÀI payoutFeeAmount.
+   *
+   * Khác hẳn late refund — cái đó trừ TRƯỚC phí, và đúng như vậy: tiền bị hoàn
+   * là tiền chưa từng thực sự kiếm được, nên không được tính phí lên nó. Hai
+   * khoản khấu trừ ở hai tầng không phải mâu thuẫn, đó là khác biệt giữa "chưa
+   * từng kiếm được" và "tôi đã đưa anh tiền mặt rồi".
+   *
+   * Thứ tự ưu tiên tự đúng mà không cần luật riêng: late refund ăn trước vì nó
+   * đứng trước trong chuỗi, làm netBeforePayoutFee co lại, nên kỳ nào bị refund
+   * nặng thì phần thu hồi ứng tự động nhường và carry sang kỳ sau.
+   */
+  const advanceGiven=custRound2_(Math.max(0,custNum_(params.advanceAmount)));
+  const advanceOutstandingBefore=custAdvanceOutstandingFor_(advanceState,customer.customerKey);
+  const adv=custComputeAdvance_(amountDueBeforeAdvance,advanceGiven,advanceOutstandingBefore);
+  const advanceRecovered=adv.recovered, advanceCarryForward=adv.carryForward;
+  const advanceOutstandingAfter=adv.outstandingAfter, amountDue=adv.amountDue;
   const totalRefunds=custRound2_(saleRefund+lateRefundApplied);
   const cRow=custReadCustomerSheetRow_(ss,customer.customerKey);
   const itemMap=custBuildPaypalItemMap_(ss);
@@ -1658,17 +1797,58 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
     refundRemaining=custRound2_(refundRemaining-take);
   });
 
-  const items=saleItems.concat(adjustmentItems).sort((a,b)=>custTime_(a.transactionDate)-custTime_(b.transactionDate)||a.lineType.localeCompare(b.lineType));
+  /* Ứng và thu hồi tính bằng tiền trả cho khách, nên cần biết đơn vị trước. */
   const payoutCurrency=custDefaultPayoutCurrency_(customer.defaultPayoutProvider,sourceCurrency);
+
+  /*
+   * Hai dòng này LÀ bản ghi của khoản ứng. Không có ô "số dư" nào ngoài chúng:
+   * lần sau custBuildAdvanceOwedState_ cộng lại đúng từ đây. Đổi Line Type là
+   * mất dấu và cho ứng lại lần thứ hai — y như cảnh báo ở LATE_REFUND_ADJUSTMENT.
+   */
+  const advanceItems=[];
+  if(advanceRecovered>CUST_CFG.EPSILON){
+    advanceItems.push({
+      lineType:'ADVANCE_RECOVERY',ledgerKey:'',allocationKeys:[],transactionDate:params.toDateValue,
+      transactionDateDisplay:custBusinessDateTimeDisplay_(params.toDateValue),periodClass:'ADVANCE',
+      paypalAccountKey:'',paypalTransactionId:'',referenceId:'',invoiceId:'',invoicePrefix:'',
+      item:'Advance repayment',buyerName:'',
+      grossAmount:0,paypalFee:0,refundAmount:0,paypalNetAmount:0,receivingFeeAllocated:0,availableAmount:0,
+      amountIncluded:-advanceRecovered,currency:payoutCurrency,
+      sourceUniqueKey:'ADVANCE_RECOVERY|'+customer.customerKey+'|'+params.fromKey+'|'+params.toKey,
+      note:'Recovering earlier advance · outstanding was '+advanceOutstandingBefore.toFixed(2)
+    });
+  }
+  if(advanceGiven>CUST_CFG.EPSILON){
+    advanceItems.push({
+      lineType:'ADVANCE',ledgerKey:'',allocationKeys:[],transactionDate:params.toDateValue,
+      transactionDateDisplay:custBusinessDateTimeDisplay_(params.toDateValue),periodClass:'ADVANCE',
+      paypalAccountKey:'',paypalTransactionId:'',referenceId:'',invoiceId:'',invoicePrefix:'',
+      item:'Advance'+(custStr_(params.advanceNote)?' · '+custStr_(params.advanceNote):''),buyerName:'',
+      grossAmount:0,paypalFee:0,refundAmount:0,paypalNetAmount:0,receivingFeeAllocated:0,availableAmount:0,
+      amountIncluded:advanceGiven,currency:payoutCurrency,
+      sourceUniqueKey:'ADVANCE|'+customer.customerKey+'|'+params.fromKey+'|'+params.toKey,
+      note:'Paid ahead of earnings · recovered from later invoices'
+    });
+  }
+
+  const items=saleItems.concat(adjustmentItems).concat(advanceItems).sort((a,b)=>custTime_(a.transactionDate)-custTime_(b.transactionDate)||a.lineType.localeCompare(b.lineType));
   const fingerprint=custFingerprint_({customer:customer.customerKey,from:params.fromKey,through:params.toKey,asOf:params.asOfKey,timezone:CUST_CFG.BUSINESS_TIMEZONE,
     payoutFeeRate,feeRule:[feeRule.ruleKey,feeRule.conversionRate,feeRule.transferRate,feeRule.transferMinimum],
     allocations:selected.map(a=>[a['Allocation Key'],custNum_(a['Remaining Available']),custNum_(a['Receiving Fee Allocated']),custStr_(a['Settlement Key'])]).sort(),
     lateRefunds:lateEntries.map(x=>[x.ledgerKey,custNum_(x.outstanding),custTime_(x.eventDate)]).sort(),
-    reversals:reversalEntries.map(x=>[x.allocationKey,custNum_(x.outstanding),custTime_(x.eventDate)]).sort()});
+    reversals:reversalEntries.map(x=>[x.allocationKey,custNum_(x.outstanding),custTime_(x.eventDate)]).sort(),
+    /*
+     * Tiền ứng là đầu vào TAY, nên bắt buộc phải nằm trong vân tay. Thiếu nó là
+     * preview 0 rồi create 1000 — đúng cái lỗ vừa bịt, mở lại bằng cửa khác.
+     * Số đang nợ cũng vào, để một hoá đơn khác thu mất phần đó giữa chừng thì
+     * create phải từ chối chứ không lặng lẽ thu hai lần.
+     */
+    advance:[advanceGiven,advanceOutstandingBefore]});
 
   return {params,customer,allocations:selected,items,saleItems,adjustmentItems,receivingProvider,sourceCurrency,payoutCurrency,
     grossSales:gross,refunds:totalRefunds,saleRefunds:saleRefund,paypalFees:paypalFee,receivingFees:receivingFee,availableAmount:availableTotal,
     currentPeriodAmount:currentAmount,carryForwardAmount:carryAmount,lateRefundOutstanding,lateRefundApplied,lateRefundCarryForward,
+    advanceGiven,advanceRecovered,advanceOutstandingBefore,advanceOutstandingAfter,advanceCarryForward,amountDueBeforeAdvance,
     feeRule,conversionRate:feeRule.conversionRate,conversionCost,transferRate:feeRule.transferRate,transferMinimum:feeRule.transferMinimum,transferCost,downstreamCost,netBeforePayoutFee,payoutFeeRate,payoutFeeAmount,amountDue,
     paypalTotalSnapshot:custNum_(cRow['PayPal Total']),matchedSnapshot:custNum_(cRow['Matched Amount']),availableSnapshot:custNum_(cRow['Available Amount']),invoicedSnapshot:custNum_(cRow['Invoiced Amount']),outstandingSnapshot:custNum_(cRow['Outstanding Amount']),fingerprint};
 }
@@ -1682,9 +1862,14 @@ function custRenderInvoicePreview_(ss,p){
   [['B14',p.paypalTotalSnapshot],['B15',p.matchedSnapshot],['B16',p.availableSnapshot],['B17',p.invoicedSnapshot],['B18',p.outstandingSnapshot],['B19',pendingSnapshot]]
     .forEach(([a,v])=>sh.getRange(a).setValue(v));
 
+  sh.getRange('B20').setValue(p.advanceOutstandingBefore);
+
   const validation='OK · '+p.feeRule.ruleKey+' · Carry-forward '+p.carryForwardAmount.toFixed(2)+' '+p.sourceCurrency+
     (p.lateRefundApplied>CUST_CFG.EPSILON?' · Late refund -'+p.lateRefundApplied.toFixed(2):'')+
-    (p.lateRefundCarryForward>CUST_CFG.EPSILON?' · Refund carry '+p.lateRefundCarryForward.toFixed(2):'');
+    (p.lateRefundCarryForward>CUST_CFG.EPSILON?' · Refund carry '+p.lateRefundCarryForward.toFixed(2):'')+
+    (p.advanceGiven>CUST_CFG.EPSILON?' · Advance +'+p.advanceGiven.toFixed(2):'')+
+    (p.advanceRecovered>CUST_CFG.EPSILON?' · Advance repaid -'+p.advanceRecovered.toFixed(2):'')+
+    (p.advanceOutstandingAfter>CUST_CFG.EPSILON?' · Advance owed '+p.advanceOutstandingAfter.toFixed(2):'');
 
   [
     ['E4',p.saleItems.length],
@@ -1810,7 +1995,7 @@ function custCreateCustomerInvoicePrepared_(ss,p,writeControlStatus){
   const now=new Date();
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), shAlloc=custRequireSheet_(ss,CUST_CFG.ALLOCATION_SHEET), shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), shTx=custRequireSheet_(ss,CUST_CFG.TRANSACTION_SHEET);
   custEnsureHeaders_(shPay,['Customer Key','Settlement Key']);
-  custEnsureHeaders_(shSet,['Preview Fingerprint']);
+  custEnsureHeaders_(shSet,['Preview Fingerprint','Advance Amount','Advance Recovered','Advance Outstanding After']);
   const hs=custHeaderMap_(shSet), hi=custHeaderMap_(shItems), ha=custHeaderMap_(shAlloc), hp=custHeaderMap_(shPay), htx=custHeaderMap_(shTx);
   const existingSettlement=custFindSettlementByFingerprint_(shSet,hs,p.fingerprint);
   const existingStatus=existingSettlement?custUpper_(existingSettlement['Status']):'';
@@ -1831,6 +2016,10 @@ function custCreateCustomerInvoicePrepared_(ss,p,writeControlStatus){
   if(p.carryForwardAmount>CUST_CFG.EPSILON)notes.push('Includes prior eligible carry-forward: '+p.carryForwardAmount.toFixed(2)+' '+p.sourceCurrency);
   if(p.lateRefundApplied>CUST_CFG.EPSILON)notes.push('Late refund adjustment applied: '+p.lateRefundApplied.toFixed(2)+' '+p.sourceCurrency);
   if(p.lateRefundCarryForward>CUST_CFG.EPSILON)notes.push('Late refund balance carried forward: '+p.lateRefundCarryForward.toFixed(2)+' '+p.sourceCurrency);
+  if(p.advanceGiven>CUST_CFG.EPSILON)notes.push('Advance issued: '+p.advanceGiven.toFixed(2)+' '+p.payoutCurrency+(custStr_(p.params.advanceNote)?' · '+custStr_(p.params.advanceNote):''));
+  if(p.advanceRecovered>CUST_CFG.EPSILON)notes.push('Advance repaid: '+p.advanceRecovered.toFixed(2)+' '+p.payoutCurrency);
+  /* Khách phải thấy phần còn nợ, không thì kỳ sau bị trừ mà không hiểu vì sao. */
+  if(p.advanceOutstandingAfter>CUST_CFG.EPSILON)notes.push('Advance balance carried forward: '+p.advanceOutstandingAfter.toFixed(2)+' '+p.payoutCurrency);
 
   let payoutKey='', txKey='';
   /*
@@ -1853,7 +2042,7 @@ function custCreateCustomerInvoicePrepared_(ss,p,writeControlStatus){
     'Payout Fee %':p.payoutFeeRate,'Payout Fee Amount':p.payoutFeeAmount,'Amount Due':p.amountDue,'Amount Paid':0,'Outstanding Payable':p.amountDue,'Currency':p.sourceCurrency,
     'PayPal Total Snapshot':p.paypalTotalSnapshot,'Matched Snapshot':p.matchedSnapshot,'Available Snapshot':p.availableSnapshot,'Invoiced Snapshot':p.invoicedSnapshot,'Outstanding Snapshot':p.outstandingSnapshot,
     'Fee Rule Key':p.feeRule.ruleKey,'Payout Provider':p.customer.defaultPayoutProvider,'Payout Account Key':p.customer.defaultPayoutAccountKey,'Payout Currency':p.payoutCurrency,
-    'Status':'CREATING','Created At':existingSettlement?(existingSettlement['Created At']||now):now,'Issued At':'','Paid At':'','Last Sync':now,'PDF File ID':existingSettlement?(existingSettlement['PDF File ID']||''):'','PDF URL':existingSettlement?(existingSettlement['PDF URL']||''):'','PDF Generated At':existingSettlement?(existingSettlement['PDF Generated At']||''):'','Preview Fingerprint':p.fingerprint,'Note':notes.join(' | ')
+    'Status':'CREATING','Created At':existingSettlement?(existingSettlement['Created At']||now):now,'Issued At':'','Paid At':'','Last Sync':now,'PDF File ID':existingSettlement?(existingSettlement['PDF File ID']||''):'','PDF URL':existingSettlement?(existingSettlement['PDF URL']||''):'','PDF Generated At':existingSettlement?(existingSettlement['PDF Generated At']||''):'','Preview Fingerprint':p.fingerprint,'Advance Amount':p.advanceGiven,'Advance Recovered':p.advanceRecovered,'Advance Outstanding After':p.advanceOutstandingAfter,'Note':notes.join(' | ')
   };
   if(existingSettlement)custWriteObjectToRow_(shSet,hs,existingSettlement._row,settlementObj);else custAppendObjectRow_(shSet,hs,settlementObj);
 
@@ -2199,7 +2388,7 @@ function repairCustomerPayoutDropdowns(){
 }
 
 /*********************** CONTROL HELPERS ************************/
-function handleCustomerControlEdit_(e){ if(!e||!e.range||e.range.getSheet().getName()!==CUST_CFG.CONTROL_SHEET)return; const a=e.range.getA1Notation(); if(['B3','B4','B5','B6','B7'].indexOf(a)!==-1){PropertiesService.getDocumentProperties().deleteProperty(CUST_CFG.PREVIEW_PROP);custClearControlPreview_(SpreadsheetApp.getActive());if(a==='B4'){try{custFillControlCustomerConfig_(SpreadsheetApp.getActive(),custGetCustomerByKey_(SpreadsheetApp.getActive(),custCanonicalKey_(e.range.getValue())));}catch(_){}}} }
+function handleCustomerControlEdit_(e){ if(!e||!e.range||e.range.getSheet().getName()!==CUST_CFG.CONTROL_SHEET)return; const a=e.range.getA1Notation(); if(['B3','B4','B5','B6','B7','B8','C8'].indexOf(a)!==-1){PropertiesService.getDocumentProperties().deleteProperty(CUST_CFG.PREVIEW_PROP);custClearControlPreview_(SpreadsheetApp.getActive());if(a==='B4'){try{custFillControlCustomerConfig_(SpreadsheetApp.getActive(),custGetCustomerByKey_(SpreadsheetApp.getActive(),custCanonicalKey_(e.range.getValue())));}catch(_){}}} }
 function custReadControlParams_(ss){
   const sh=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET), key=custCanonicalKey_(sh.getRange('B4').getValue());
   if(!key)throw new Error('Select Customer in B4.');
@@ -2208,7 +2397,26 @@ function custReadControlParams_(ss){
   if(!fromInfo||!toInfo)throw new Error('From Date and To Date are required.');
   if(fromInfo.key>toInfo.key)throw new Error('From Date cannot be after To Date.');
   if(!asOfInfo){sh.getRange('B7').setValue(new Date());asOfInfo=custReadControlDateCell_(sh.getRange('B7'));}
-  return {customerKey:key,fromKey:fromInfo.key,toKey:toInfo.key,asOfKey:asOfInfo.key,fromDisplay:fromInfo.display,toDisplay:toInfo.display,asOfDisplay:asOfInfo.display,fromDateValue:fromInfo.value,toDateValue:toInfo.value,asOfDateValue:asOfInfo.value};
+  custEnsureControlAdvanceCells_(sh);
+  const adv=custNormalizeAdvanceInput_(sh.getRange('B8').getValue(),sh.getRange('C8').getValue());
+  return {customerKey:key,fromKey:fromInfo.key,toKey:toInfo.key,asOfKey:asOfInfo.key,fromDisplay:fromInfo.display,toDisplay:toInfo.display,asOfDisplay:asOfInfo.display,fromDateValue:fromInfo.value,toDateValue:toInfo.value,asOfDateValue:asOfInfo.value,
+    advanceAmount:adv.amount,advanceNote:adv.note};
+}
+
+/*
+ * Hàng 8 và hàng 20 vốn để trống trên Invoice Control, nên nhãn tự mọc ra lần
+ * đầu dùng — không bắt ai chạy setup rồi quên. Chỉ ghi khi ô nhãn đang trống,
+ * để người dùng đổi chữ hiển thị mà không bị ghi đè mỗi lần chạy.
+ */
+function custEnsureControlAdvanceCells_(sh){
+  if(!custStr_(sh.getRange('A8').getValue())){
+    sh.getRange('A8').setValue('Advance Amount');
+    sh.getRange('B8').setNumberFormat('0.00');
+  }
+  if(!custStr_(sh.getRange('A20').getValue())){
+    sh.getRange('A20').setValue('Advance Outstanding');
+    sh.getRange('B20').setNumberFormat('0.00');
+  }
 }
 function custNormalizeInvoiceParams_(ss,args){
   args=args||{};
@@ -2219,7 +2427,24 @@ function custNormalizeInvoiceParams_(ss,args){
   const asOfInfo=custParseInvoiceParamDate_(args.asOfKey||args.as_of_date||args.asOf||new Date());
   if(!fromInfo||!toInfo)throw new Error('from_date and to_date are required.');
   if(fromInfo.key>toInfo.key)throw new Error('from_date cannot be after to_date.');
-  return {customerKey:key,fromKey:fromInfo.key,toKey:toInfo.key,asOfKey:asOfInfo.key,fromDisplay:fromInfo.display,toDisplay:toInfo.display,asOfDisplay:asOfInfo.display,fromDateValue:fromInfo.value,toDateValue:toInfo.value,asOfDateValue:asOfInfo.value};
+  const adv=custNormalizeAdvanceInput_(args.advanceAmount!==undefined?args.advanceAmount:args.advance_amount,
+    args.advanceNote!==undefined?args.advanceNote:args.advance_note);
+  return {customerKey:key,fromKey:fromInfo.key,toKey:toInfo.key,asOfKey:asOfInfo.key,fromDisplay:fromInfo.display,toDisplay:toInfo.display,asOfDisplay:asOfInfo.display,fromDateValue:fromInfo.value,toDateValue:toInfo.value,asOfDateValue:asOfInfo.value,
+    advanceAmount:adv.amount,advanceNote:adv.note};
+}
+
+/*
+ * Tiền ứng là con số, không phải chữ. Ô trống là 0, và số âm bị chặn thẳng:
+ * "ứng âm" nếu có nghĩa gì thì cũng là thu hồi, mà thu hồi đã tự động rồi —
+ * cho phép nó là mở một đường thứ hai làm thay đổi Amount Due mà không ai
+ * kiểm.
+ */
+function custNormalizeAdvanceInput_(rawAmount,rawNote){
+  const s=custStr_(rawAmount);
+  const amount=s===''?0:custRound2_(custNum_(rawAmount));
+  if(!isFinite(amount))throw new Error('Advance Amount must be a number.');
+  if(amount<0)throw new Error('Advance Amount cannot be negative. Recovery of an existing advance is automatic.');
+  return {amount:amount,note:custStr_(rawNote)};
 }
 function custParseInvoiceParamDate_(value){
   if(value instanceof Date&&!isNaN(value.getTime())){
@@ -2243,7 +2468,7 @@ function custParseInvoiceParamDate_(value){
 }
 function custGetCustomerByKey_(ss,key){ const sh=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET),h=custHeaderMap_(sh),state=custReadCustomers_(sh,h),c=state.customersByKey[custCanonicalKey_(key)]; if(!c)throw new Error('Customer not found: '+key); return c; }
 function custFillControlCustomerConfig_(ss,c){const sh=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);sh.getRange('B9').setValue(c.customerName);sh.getRange('B10').setValue(c.payoutFeeRate).setNumberFormat('0.00%');sh.getRange('B11').setValue(c.defaultPayoutProvider);sh.getRange('B12').setValue(c.defaultPayoutAccountKey);}
-function custClearControlOutput_(ss){const sh=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);sh.getRange('B9:B19').clearContent();custClearControlPreview_(ss);}
+function custClearControlOutput_(ss){const sh=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);sh.getRange('B9:B20').clearContent();custClearControlPreview_(ss);}
 function custClearControlPreview_(ss){const sh=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);sh.getRange('E4:E22').clearContent();const max=Math.max(0,sh.getLastRow()-28);if(max>0)sh.getRange(29,1,max,12).clearContent();}
 function custWriteControlDetails_(sh,rows){
   const max=Math.max(0,sh.getLastRow()-28);if(max>0)sh.getRange(29,1,max,12).clearContent();if(!rows.length)return;
@@ -2370,6 +2595,30 @@ function custReportPayoutDestinationDrift_(ss,issues){
     issues.push('PAYOUT LỆCH ĐÍCH SO VỚI HOÁ ĐƠN '+custStr_(p['Payout Key'])+' ('+status+' '+
       custNum_(p['Amount']).toFixed(2)+') · '+custStr_(s['Invoice Number'])+' ghi '+drift.join(', ')+
       ' · tiền đúng số nhưng hoá đơn khai sai chỗ đã chi');
+  });
+}
+
+/*
+ * Khoản ứng chỉ thu lại được bằng hoá đơn sau — nghĩa là nếu khách ngừng giao
+ * dịch thì nó nằm đó mãi và không có cơ chế nào tự đòi. Nên nêu kèm TUỔI: một
+ * khoản ứng ba tháng chưa thu là chuyện kinh doanh phải nằm trước mắt, không
+ * phải một con số nằm im trong cột.
+ */
+function custReportOutstandingAdvances_(ss,issues){
+  const state=custBuildAdvanceOwedState_(ss);
+  const now=new Date();
+  Object.keys(state).sort().forEach(key=>{
+    const r=state[key];
+    /* Thu vượt phần đã ứng: hoặc lịch sử hỏng, hoặc có ai sửa tay. */
+    if(r.overRecovered>CUST_CFG.EPSILON){
+      issues.push('THU HỒI ỨNG VƯỢT SỐ ĐÃ ỨNG '+key+' · đã ứng '+r.given.toFixed(2)+
+        ' nhưng thu '+r.recovered.toFixed(2));
+    }
+    if(r.outstanding<=CUST_CFG.EPSILON)return;
+    const days=r.oldestOpenAt?Math.floor((now.getTime()-custTime_(r.oldestOpenAt))/86400000):null;
+    issues.push('ỨNG CHƯA THU HỒI '+key+' · '+r.outstanding.toFixed(2)+
+      (days!==null?' · khoản sớm nhất '+days+' ngày'+(r.oldestOpenInvoice?' ('+r.oldestOpenInvoice+')':''):'')+
+      ' · chỉ thu lại được bằng hoá đơn sau');
   });
 }
 
@@ -2690,6 +2939,7 @@ function validateCustomerSystem(){
   custReportReceivingMatchWarnings_(allocs,txs,issues);
   custReportOrphanPaidPayouts_(ss,issues);
   custReportPayoutDestinationDrift_(ss,issues);
+  custReportOutstandingAdvances_(ss,issues);
   custReportUnattributedSales_(ss,issues);
   custReportBrokenSettlementLinks_(ss,issues);
   /*

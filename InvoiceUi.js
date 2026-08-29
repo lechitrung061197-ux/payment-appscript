@@ -125,9 +125,11 @@ function uiShapePreview_(p) {
       included: custNum_(i.amountIncluded),
       kind: i.lineType === 'LATE_REFUND_ADJUSTMENT'
         ? 'LATE_REFUND'
-        : (i.periodClass === 'CARRY_FORWARD'
+        : (i.periodClass === 'ADVANCE'
+          ? 'ADVANCE'
+          : (i.periodClass === 'CARRY_FORWARD'
             ? 'CARRY_FORWARD'
-            : (i.periodClass === 'MIXED_PERIOD' ? 'MIXED' : 'CURRENT'))
+            : (i.periodClass === 'MIXED_PERIOD' ? 'MIXED' : 'CURRENT')))
     };
   });
 
@@ -161,6 +163,11 @@ function uiShapePreview_(p) {
     payoutFeeRate: custNum_(p.payoutFeeRate),
     payoutFeeAmount: custNum_(p.payoutFeeAmount),
     amountDue: custNum_(p.amountDue),
+
+    advanceGiven: custNum_(p.advanceGiven),
+    advanceRecovered: custNum_(p.advanceRecovered),
+    advanceOutstandingBefore: custNum_(p.advanceOutstandingBefore),
+    advanceOutstandingAfter: custNum_(p.advanceOutstandingAfter),
 
     carryForwardAmount: custNum_(p.carryForwardAmount),
     lateRefundApplied: custNum_(p.lateRefundApplied),

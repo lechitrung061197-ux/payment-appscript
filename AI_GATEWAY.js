@@ -14,6 +14,7 @@
  *   - sync both
  *   - invoice preview
  *   - generate/regenerate invoice PDF
+ *   - create a DRAFT manual payout (an intention; only a human can set it PAID)
  *
  * PROTECTED actions (PIN required; PIN is NEVER sent to OpenAI):
  *   - create invoice
@@ -179,6 +180,8 @@ function payAiToolDefinitions_() {
           as_of_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty means today for preview.' },
           settlement_key: { type: 'string' },
           force: { type: 'boolean' },
+          advance_amount: { type: 'number', description: 'preview_invoice only: money to advance to the customer on this invoice, on top of what they earned. It increases Amount Due now and is recovered from later invoices. Use 0 for a normal invoice.' },
+          advance_note: { type: 'string', description: 'preview_invoice only: why the advance is being given. Empty otherwise.' },
           provider: { type: 'string', description: 'create_manual_payout only: USDT or PINGPONG. Empty otherwise.' },
           account_key: { type: 'string', description: 'create_manual_payout only: which treasury account the money will leave, e.g. USDT1. Must already exist and not be disabled. Empty otherwise.' },
           amount: { type: 'number', description: 'create_manual_payout only: amount to pay out, greater than 0. Use 0 otherwise.' },
@@ -187,7 +190,7 @@ function payAiToolDefinitions_() {
           category: { type: 'string', description: 'create_manual_payout only: EXPENSE, REFUND, TRANSFER, ADJUSTMENT or OTHER. Never CUSTOMER_PAYOUT — invoices own that. Empty otherwise.' },
           note: { type: 'string', description: 'create_manual_payout only: what this payment is for, in the owner\'s own words. Empty otherwise.' }
         },
-        required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force','provider','account_key','amount','fee','payee','category','note'],
+        required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force','advance_amount','advance_note','provider','account_key','amount','fee','payee','category','note'],
         additionalProperties: false
       }
     },
@@ -204,9 +207,11 @@ function payAiToolDefinitions_() {
           from_date: { type: 'string' },
           to_date: { type: 'string' },
           as_of_date: { type: 'string' },
+          advance_amount: { type: 'number', description: 'create_invoice only: money to advance to the customer on this invoice, recovered from later invoices. Use 0 unless the owner explicitly asked for an advance.' },
+          advance_note: { type: 'string', description: 'create_invoice only: why the advance is being given. Empty otherwise.' },
           payout_fee_percent: { type: 'number', minimum: 0, maximum: 100 }
         },
-        required: ['action','customer_key','from_date','to_date','as_of_date','payout_fee_percent'],
+        required: ['action','customer_key','from_date','to_date','as_of_date','advance_amount','advance_note','payout_fee_percent'],
         additionalProperties: false
       }
     }
@@ -760,12 +765,27 @@ function payAiTreasuryAccountKeys_(ss, provider) {
 }
 
 function payAiInvoiceParamsFromArgs_(args) {
-  return {
+  const out = {
     customer_key: String(args.customer_key || '').trim().toUpperCase(),
     from_date: String(args.from_date || '').trim(),
     to_date: String(args.to_date || '').trim(),
     as_of_date: String(args.as_of_date || '').trim()
   };
+
+  /*
+   * Chỉ gắn khi thật sự có số. Để advance_amount = 0 lọt vào cũng vô hại, nhưng
+   * bỏ hẳn thì các đường gọi cũ giữ nguyên hình dạng params như trước.
+   *
+   * Số này đi thẳng vào fingerprint bên Customer.gs, nên preview và create bắt
+   * buộc thấy cùng một con số — không có cách nào duyệt 0 rồi tạo 1000.
+   */
+  const advance = payAiToNumber_(args.advance_amount);
+  if (advance !== null && advance > 0) {
+    out.advance_amount = advance;
+    out.advance_note = String(args.advance_note || '').trim();
+  }
+
+  return out;
 }
 
 function payAiSummarizePreview_(p) {
@@ -804,6 +824,10 @@ function payAiSummarizePreview_(p) {
     carry_forward_amount: p.carryForwardAmount,
     late_refund_applied: p.lateRefundApplied,
     late_refund_carry_forward: p.lateRefundCarryForward,
+    advance_given: p.advanceGiven,
+    advance_recovered: p.advanceRecovered,
+    advance_outstanding_before: p.advanceOutstandingBefore,
+    advance_outstanding_after: p.advanceOutstandingAfter,
     message: 'Invoice preview completed. No invoice was created.'
   };
 }
