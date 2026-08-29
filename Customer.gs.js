@@ -1177,6 +1177,7 @@ function previewCustomerStatementFromControlCore_(){
   const ss=SpreadsheetApp.getActive(); syncCustomers_();
   const params=custReadControlParams_(ss), customer=custGetCustomerByKey_(ss,params.customerKey);
   custFillControlCustomerConfig_(ss,customer); custClearControlPreview_(ss);
+  const itemMap=custBuildPaypalItemMap_(ss);
   const shL=custRequireSheet_(ss,CUST_CFG.LEDGER_SHEET), hL=custHeaderMap_(shL);
   const rows=custReadRowsObjects_(shL,hL).filter(r=>custCanonicalKey_(r['Customer Key'])===params.customerKey&&custBusinessDateKeyInRange_(custDate_(r['Transaction Date']),params.fromKey,params.toKey));
   const selected={}; rows.forEach(r=>selected[custStr_(r['Ledger Key'])]=true);
@@ -1189,7 +1190,7 @@ function previewCustomerStatementFromControlCore_(){
   const outstanding=custRound2_(Math.max(0,available-invoiced)),pending=custRound2_(Math.max(0,paypalTotal-matched));
   const control=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);
   [['B14',paypalTotal],['B15',matched],['B16',available],['B17',invoiced],['B18',outstanding],['B19',pending]].forEach(([a,v])=>control.getRange(a).setValue(v));
-  custWriteControlDetails_(control,rows.map(r=>({date:custBusinessDateTimeDisplay_(custDate_(r['Transaction Date'])),tx:r['PayPal Transaction ID'],invoice:r['Invoice ID'],item:custLedgerItemLookup_(ss,r['PayPal Transaction ID'],r['PayPal Account Key']),gross:r['Gross Amount'],paypalFee:r['PayPal Fee'],refund:r['Refund Amount'],paypalNet:r['Net Amount'],receivingFee:'',available:'',included:'',status:r['Status']})));
+  custWriteControlDetails_(control,rows.map(r=>({date:custBusinessDateTimeDisplay_(custDate_(r['Transaction Date'])),tx:r['PayPal Transaction ID'],invoice:r['Invoice ID'],item:custItemFromMap_(itemMap,r['PayPal Account Key'],r['PayPal Transaction ID']),gross:r['Gross Amount'],paypalFee:r['PayPal Fee'],refund:r['Refund Amount'],paypalNet:r['Net Amount'],receivingFee:'',available:'',included:'',status:r['Status']})));
   control.getRange('E21').setValue('OK · US TIME '+CUST_CFG.BUSINESS_TIMEZONE);control.getRange('E22').setValue('STATEMENT READY');
   return {rows:rows.length,paypalTotal,matched,available,invoiced,outstanding,pending};
 }
@@ -1297,12 +1298,13 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
   const payoutFeeRate=customer.payoutFeeRate, payoutFeeAmount=custRound2_(netBeforePayoutFee*payoutFeeRate), amountDue=custRound2_(Math.max(0,netBeforePayoutFee-payoutFeeAmount));
   const totalRefunds=custRound2_(saleRefund+lateRefundApplied);
   const cRow=custReadCustomerSheetRow_(ss,customer.customerKey);
+  const itemMap=custBuildPaypalItemMap_(ss);
 
   const saleItems=Object.keys(grouped).map(k=>{
     const x=grouped[k]; let pc='CURRENT_PERIOD'; if(x.hasCarry&&!x.hasCurrent)pc='CARRY_FORWARD'; else if(x.hasCarry&&x.hasCurrent)pc='MIXED_PERIOD';
     return {lineType:'SALE',ledgerKey:k,allocationKeys:x.allocationKeys,transactionDate:x.ledger['Transaction Date'],transactionDateDisplay:custBusinessDateTimeDisplay_(custDate_(x.ledger['Transaction Date'])),periodClass:pc,
       paypalAccountKey:x.ledger['PayPal Account Key'],paypalTransactionId:x.ledger['PayPal Transaction ID'],referenceId:x.ledger['Reference ID'],invoiceId:x.ledger['Invoice ID'],invoicePrefix:x.ledger['Invoice Prefix'],
-      item:custLedgerItemLookup_(ss,x.ledger['PayPal Transaction ID'],x.ledger['PayPal Account Key']),buyerName:'',grossAmount:custNum_(x.ledger['Gross Amount']),paypalFee:custNum_(x.ledger['PayPal Fee']),
+      item:custItemFromMap_(itemMap,x.ledger['PayPal Account Key'],x.ledger['PayPal Transaction ID']),buyerName:'',grossAmount:custNum_(x.ledger['Gross Amount']),paypalFee:custNum_(x.ledger['PayPal Fee']),
       refundAmount:lateState[k]?custNum_(lateState[k].baselineRefund):custNum_(x.ledger['Refund Amount']),
       paypalNetAmount:lateState[k]?Math.max(0,custRound2_(custNum_(x.ledger['Gross Amount'])-custNum_(x.ledger['PayPal Fee'])-custNum_(lateState[k].baselineRefund))):custNum_(x.ledger['Net Amount']),
       receivingFeeAllocated:x.receivingFeeAllocated,availableAmount:x.availableAmount,amountIncluded:x.amountIncluded,currency:custUpper_(x.ledger['Currency']),sourceUniqueKey:custStr_(x.ledger['Source Unique Key']),note:pc==='CARRY_FORWARD'?'CARRY_FORWARD':(pc==='MIXED_PERIOD'?'MIXED_PERIOD':'')};
@@ -1317,7 +1319,7 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
     adjustmentItems.push({
       lineType:'LATE_REFUND_ADJUSTMENT',ledgerKey:x.ledgerKey,allocationKeys:[],transactionDate:x.eventDate,transactionDateDisplay:custBusinessDateTimeDisplay_(x.eventDate),periodClass:'LATE_REFUND',
       paypalAccountKey:l['PayPal Account Key'],paypalTransactionId:l['PayPal Transaction ID'],referenceId:l['Reference ID'],invoiceId:l['Invoice ID'],invoicePrefix:l['Invoice Prefix'],
-      item:'Late refund adjustment · '+(custLedgerItemLookup_(ss,l['PayPal Transaction ID'],l['PayPal Account Key'])||l['Invoice ID']||l['PayPal Transaction ID']),buyerName:'',
+      item:'Late refund adjustment · '+(custItemFromMap_(itemMap,l['PayPal Account Key'],l['PayPal Transaction ID'])||l['Invoice ID']||l['PayPal Transaction ID']),buyerName:'',
       grossAmount:0,paypalFee:0,refundAmount:take,paypalNetAmount:-take,receivingFeeAllocated:0,availableAmount:0,amountIncluded:-take,currency:custUpper_(l['Currency']),
       sourceUniqueKey:'LATE_REFUND|'+x.ledgerKey,note:'Refund occurred after prior invoice · applied '+take.toFixed(2)
     });
@@ -1456,6 +1458,15 @@ function createCustomerInvoice(params){
     const ss=SpreadsheetApp.getActive();
     syncCustomers_();
     const p=custBuildInvoicePreview_(ss,true,custNormalizeInvoiceParams_(ss,params));
+    /*
+     * Optional, but every caller that showed a preview to a human must send it:
+     * what gets created has to be exactly what they looked at. Left optional so
+     * AI_GATEWAY's PIN-protected path keeps working unchanged.
+     */
+    const expected=custStr_(params&&(params.expectedFingerprint||params.expected_fingerprint));
+    if(expected&&expected!==p.fingerprint){
+      throw new Error('Source data changed since preview. Preview again before creating.');
+    }
     return custCreateCustomerInvoicePrepared_(ss,p,false);
   });
 }
@@ -1905,7 +1916,21 @@ function custWriteControlDetails_(sh,rows){
   sh.getRange(29,1,vals.length,12).setValues(vals);sh.getRange(29,1,vals.length,1).setNumberFormat('@');sh.getRange(29,5,vals.length,7).setNumberFormat('0.00');
 }
 function custReadCustomerSheetRow_(ss,key){ const sh=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET),h=custHeaderMap_(sh); return custReadRowsObjects_(sh,h).find(r=>custCanonicalKey_(r['Customer Key'])===key)||{}; }
-function custLedgerItemLookup_(ss,txId,accountKey){ const sh=custRequireSheet_(ss,CUST_CFG.PAYPAL_SHEET),h=custHeaderMap_(sh); const rows=custReadRowsObjects_(sh,h); const r=rows.find(x=>custStr_(x['Transaction ID'])===custStr_(txId)&&custCanonicalKey_(x['Account Key'])===custCanonicalKey_(accountKey)); return r?custStr_(r['Item']):''; }
+/*
+ * Item description per PayPal transaction, built once per run.
+ * This used to be a per-row lookup that re-read the entire Paypal sheet for
+ * every invoice line, so a 52-line preview cost 52 full sheet reads.
+ */
+function custBuildPaypalItemMap_(ss){
+  const sh=custRequireSheet_(ss,CUST_CFG.PAYPAL_SHEET), h=custHeaderMap_(sh);
+  const map={};
+  custReadRowsObjects_(sh,h).forEach(r=>{
+    const k=custPaypalTxIndexKey_(r['Account Key'],r['Transaction ID']);
+    if(k)map[k]=custStr_(r['Item']);
+  });
+  return map;
+}
+function custItemFromMap_(map,accountKey,txId){return (map&&map[custPaypalTxIndexKey_(accountKey,txId)])||'';}
 
 /*********************** ON EDIT CUSTOMER ************************/
 function handleCustomerEdit_(e){

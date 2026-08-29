@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<style>
+  :root{
+    --ink:#1f2328; --muted:#656d76; --line:#d8dee4; --bg:#ffffff; --panel:#f6f8fa;
+    --accent:#0969da; --good:#1a7f37; --bad:#cf222e; --warn:#9a6700;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}
+  .wrap{display:flex;flex-direction:column;height:100vh}
+
+  .bar{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .f{display:flex;flex-direction:column;gap:3px}
+  .f label{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+  select,input[type=date]{font:inherit;padding:5px 7px;border:1px solid var(--line);border-radius:5px;background:#fff;color:var(--ink)}
+  select{min-width:230px}
+
+  button{font:inherit;font-weight:600;padding:6px 14px;border-radius:5px;border:1px solid var(--line);background:#fff;color:var(--ink);cursor:pointer}
+  button:hover:not(:disabled){background:var(--panel)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover:not(:disabled){filter:brightness(1.08);background:var(--accent)}
+  button.go{background:var(--good);border-color:var(--good);color:#fff}
+  button.go:hover:not(:disabled){filter:brightness(1.08);background:var(--good)}
+
+  .body{flex:1;overflow:auto;padding:14px 16px}
+  .msg{padding:10px 12px;border-radius:6px;margin-bottom:12px;white-space:pre-wrap;word-break:break-word}
+  .msg.err{background:#ffebe9;border:1px solid #ffcecb;color:var(--bad)}
+  .msg.info{background:#ddf4ff;border:1px solid #b6e3ff;color:#0a3069}
+  .msg.ok{background:#dafbe1;border:1px solid #aceebb;color:var(--good)}
+
+  .hint{color:var(--muted);padding:26px 4px;text-align:center}
+
+  .sum{display:grid;grid-template-columns:1fr 1fr;gap:0 26px;border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:12px}
+  .row{display:flex;justify-content:space-between;gap:14px;padding:3px 0}
+  .row span:first-child{color:var(--muted)}
+  .row span:last-child{font-variant-numeric:tabular-nums;font-weight:600}
+  .row.neg span:last-child{color:var(--bad)}
+  .row.total{border-top:2px solid var(--ink);margin-top:6px;padding-top:7px;font-size:15px}
+  .row.total span{font-weight:700}
+  .meta{color:var(--muted);font-size:12px;margin-bottom:10px}
+
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{padding:5px 7px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+  th:nth-child(-n+4),td:nth-child(-n+4){text-align:left}
+  th{position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
+  td.num{font-variant-numeric:tabular-nums}
+  .tag{display:inline-block;padding:1px 6px;border-radius:9px;font-size:10px;font-weight:700}
+  .tag.CURRENT{background:#eef2f5;color:var(--muted)}
+  .tag.CARRY_FORWARD{background:#fff4d6;color:var(--warn)}
+  .tag.MIXED{background:#fff4d6;color:var(--warn)}
+  .tag.LATE_REFUND{background:#ffebe9;color:var(--bad)}
+  .scroll{max-height:100%;overflow:auto;border:1px solid var(--line);border-radius:8px}
+
+  .foot{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:11px 16px;border-top:1px solid var(--line);background:var(--panel)}
+  .status{color:var(--muted);font-size:12px}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .done{text-align:center;padding:34px 16px}
+  .done h2{margin:0 0 6px;font-size:19px}
+  .done p{color:var(--muted);margin:0 0 18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="bar">
+    <div class="f">
+      <label for="cus">Khách hàng</label>
+      <select id="cus"><option value="">Đang tải…</option></select>
+    </div>
+    <div class="f"><label for="from">Từ ngày</label><input type="date" id="from"></div>
+    <div class="f"><label for="to">Đến ngày</label><input type="date" id="to"></div>
+    <div class="f"><label for="asof">As of</label><input type="date" id="asof"></div>
+    <button id="btnPreview" class="primary">Xem trước</button>
+  </div>
+
+  <div class="body" id="body">
+    <div class="hint">Chọn khách hàng và khoảng ngày, rồi bấm <b>Xem trước</b>.</div>
+  </div>
+
+  <div class="foot">
+    <span class="status" id="status"></span>
+    <span>
+      <button id="btnClose">Đóng</button>
+      <button id="btnCreate" class="go" disabled>Tạo invoice</button>
+    </span>
+  </div>
+
+</div>
+
+<script>
+var preview = null;   // last successful preview, incl. the fingerprint
+var busy    = false;
+
+function $(id){ return document.getElementById(id); }
+function money(v, ccy){
+  var n = Number(v||0);
+  return n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) + (ccy ? ' '+ccy : '');
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+function setBusy(on, text){
+  busy = on;
+  $('btnPreview').disabled = on;
+  $('btnClose').disabled   = on;
+  // Create stays disabled unless a fresh preview is on screen.
+  $('btnCreate').disabled  = on || !preview;
+  $('status').innerHTML = on ? '<span class="spin"></span>' + esc(text||'Đang chạy…') : esc(text||'');
+}
+
+function showMessage(kind, text){
+  $('body').innerHTML = '<div class="msg '+kind+'">'+esc(text)+'</div>';
+}
+
+/*
+ * Any change to the inputs invalidates the preview. Creating from a stale
+ * preview is exactly what the fingerprint check exists to prevent, and the
+ * button should not even offer it.
+ */
+function invalidate(){
+  preview = null;
+  $('btnCreate').disabled = true;
+}
+
+function todayISO(d){
+  var x = d || new Date();
+  return x.getFullYear() + '-' + String(x.getMonth()+1).padStart(2,'0') + '-' + String(x.getDate()).padStart(2,'0');
+}
+
+function init(){
+  var now = new Date();
+  $('from').value = todayISO(new Date(now.getFullYear(), now.getMonth(), 1));
+  $('to').value   = todayISO(now);
+  $('asof').value = todayISO(now);
+
+  ['cus','from','to','asof'].forEach(function(id){
+    $(id).addEventListener('change', invalidate);
+  });
+
+  $('btnPreview').addEventListener('click', doPreview);
+  $('btnCreate').addEventListener('click', doCreate);
+  $('btnClose').addEventListener('click', function(){ google.script.host.close(); });
+
+  setBusy(true, 'Đang tải danh sách khách…');
+  google.script.run
+    .withSuccessHandler(function(list){
+      var sel = $('cus');
+      sel.innerHTML = '<option value="">— Chọn khách hàng —</option>';
+      (list||[]).forEach(function(c){
+        var o = document.createElement('option');
+        o.value = c.customerKey;
+        o.textContent = c.customerKey + ' — ' + c.customerName;
+        sel.appendChild(o);
+      });
+      setBusy(false, (list||[]).length + ' khách hàng');
+    })
+    .withFailureHandler(function(e){
+      setBusy(false, '');
+      showMessage('err', e && e.message ? e.message : String(e));
+    })
+    .uiListCustomers();
+}
+
+function params(){
+  return {
+    customer_key: $('cus').value,
+    from_date:    $('from').value,
+    to_date:      $('to').value,
+    as_of_date:   $('asof').value
+  };
+}
+
+function doPreview(){
+  if (busy) return;
+  var p = params();
+  if (!p.customer_key) { showMessage('err', 'Chưa chọn khách hàng.'); return; }
+  if (!p.from_date || !p.to_date) { showMessage('err', 'Chưa chọn khoảng ngày.'); return; }
+
+  invalidate();
+  showMessage('info', 'Đang đồng bộ và tính toán… Bước này chạy syncCustomers nên có thể mất vài chục giây.');
+  setBusy(true, 'Đang xem trước…');
+
+  google.script.run
+    .withSuccessHandler(function(res){
+      preview = res;
+      render(res);
+      setBusy(false, res.itemCount + ' giao dịch · fee rule ' + (res.feeRuleKey||'—'));
+      $('btnCreate').disabled = false;
+    })
+    .withFailureHandler(function(e){
+      setBusy(false, '');
+      // Verbatim: every safety rule reports through a thrown message.
+      showMessage('err', e && e.message ? e.message : String(e));
+    })
+    .uiPreviewInvoice(p);
+}
+
+function doCreate(){
+  if (busy || !preview) return;
+
+  var ok = confirm(
+    'Tạo invoice cho ' + preview.customerName + '\n' +
+    'Kỳ ' + preview.periodFrom + ' → ' + preview.periodTo + '\n\n' +
+    'AMOUNT DUE: ' + money(preview.amountDue, preview.payoutCurrency) + '\n\n' +
+    'Thao tác này tạo nghĩa vụ chi tiền. Tiếp tục?'
+  );
+  if (!ok) return;
+
+  var p = params();
+  p.expected_fingerprint = preview.fingerprint;   // refuse if data moved
+
+  setBusy(true, 'Đang tạo invoice…');
+  google.script.run
+    .withSuccessHandler(function(res){ renderDone(res); })
+    .withFailureHandler(function(e){
+      setBusy(false, '');
+      showMessage('err', e && e.message ? e.message : String(e));
+    })
+    .uiCreateInvoice(p);
+}
+
+function render(r){
+  var ccy = r.sourceCurrency;
+  var rows = (r.items||[]).map(function(i){
+    return '<tr>' +
+      '<td>'+esc(i.date)+'</td>' +
+      '<td>'+esc(i.transactionId)+'</td>' +
+      '<td>'+esc(i.invoiceId)+'</td>' +
+      '<td>'+esc(i.item)+'</td>' +
+      '<td class="num">'+money(i.gross)+'</td>' +
+      '<td class="num">'+money(i.paypalFee)+'</td>' +
+      '<td class="num">'+money(i.refund)+'</td>' +
+      '<td class="num">'+money(i.receivingFee)+'</td>' +
+      '<td class="num">'+money(i.included)+'</td>' +
+      '<td><span class="tag '+i.kind+'">'+i.kind.replace('_',' ')+'</span></td>' +
+      '</tr>';
+  }).join('');
+
+  var notes = [];
+  if (r.carryForwardAmount     > 0.005) notes.push('Gồm carry-forward kỳ trước: ' + money(r.carryForwardAmount, ccy));
+  if (r.lateRefundApplied      > 0.005) notes.push('Trừ late refund: ' + money(r.lateRefundApplied, ccy));
+  if (r.lateRefundCarryForward > 0.005) notes.push('Late refund còn treo sang kỳ sau: ' + money(r.lateRefundCarryForward, ccy));
+  if (r.itemsTruncated)                 notes.push('Bảng chỉ hiện ' + (r.items||[]).length + '/' + r.itemCount + ' dòng.');
+
+  $('body').innerHTML =
+    '<div class="meta">' + esc(r.customerKey) + ' — ' + esc(r.customerName) +
+      ' · kỳ ' + esc(r.periodFrom) + ' → ' + esc(r.periodTo) +
+      ' · as of ' + esc(r.asOf) +
+      ' · nhận qua ' + esc(r.receivingProvider||'—') + '</div>' +
+
+    (notes.length ? '<div class="msg info">' + esc(notes.join('\n')) + '</div>' : '') +
+
+    '<div class="sum">' +
+      '<div>' +
+        '<div class="row"><span>Sales</span><span>'+money(r.grossSales,ccy)+'</span></div>' +
+        '<div class="row neg"><span>Refunds</span><span>-'+money(r.refunds)+'</span></div>' +
+        '<div class="row neg"><span>PayPal fees</span><span>-'+money(r.paypalFees)+'</span></div>' +
+        '<div class="row neg"><span>Receiving fees</span><span>-'+money(r.receivingFees)+'</span></div>' +
+        '<div class="row"><span>Available</span><span>'+money(r.availableAmount,ccy)+'</span></div>' +
+      '</div>' +
+      '<div>' +
+        '<div class="row neg"><span>Conversion ('+(r.conversionRate*100).toFixed(2)+'%)</span><span>-'+money(r.conversionCost)+'</span></div>' +
+        '<div class="row neg"><span>Transfer ('+(r.transferRate*100).toFixed(2)+'%)</span><span>-'+money(r.transferCost)+'</span></div>' +
+        '<div class="row"><span>Net before payout fee</span><span>'+money(r.netBeforePayoutFee,ccy)+'</span></div>' +
+        '<div class="row neg"><span>Payout fee ('+(r.payoutFeeRate*100).toFixed(2)+'%)</span><span>-'+money(r.payoutFeeAmount)+'</span></div>' +
+        '<div class="row total"><span>AMOUNT DUE</span><span>'+money(r.amountDue,r.payoutCurrency)+'</span></div>' +
+      '</div>' +
+    '</div>' +
+
+    '<div class="scroll"><table>' +
+      '<thead><tr><th>Ngày</th><th>PayPal Tx</th><th>Invoice ID</th><th>Item</th>' +
+      '<th>Gross</th><th>PP fee</th><th>Refund</th><th>Recv fee</th><th>Included</th><th>Loại</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+    '</table></div>';
+}
+
+function renderDone(res){
+  setBusy(false, '');
+  preview = null;
+  $('btnCreate').disabled = true;
+  $('btnPreview').disabled = false;
+
+  $('body').innerHTML =
+    '<div class="done">' +
+      '<h2>' + esc(res.invoiceNumber || res.settlementKey) + '</h2>' +
+      '<p>' + (res.existing
+                ? 'Invoice này đã được tạo trước đó từ cùng preview — không tạo thêm bản mới.'
+                : 'Đã tạo invoice.') +
+        (res.payoutKey ? '<br>Payout ' + esc(res.payoutKey) + ' ở trạng thái DRAFT (chưa chi).'
+                       : '<br>Không có payout: Amount Due bằng 0.') +
+        (res.lateRefundCarryForward > 0.005
+                ? '<br>Late refund còn treo: ' + money(res.lateRefundCarryForward)
+                : '') +
+      '</p>' +
+      '<button id="btnPdf" class="primary">Tạo PDF</button>' +
+      '<div id="pdfOut" style="margin-top:14px"></div>' +
+    '</div>';
+
+  $('btnPdf').addEventListener('click', function(){
+    var b = $('btnPdf');
+    b.disabled = true;
+    $('pdfOut').innerHTML = '<span class="spin"></span> Đang tạo PDF…';
+    google.script.run
+      .withSuccessHandler(function(pdf){
+        $('pdfOut').innerHTML = '<div class="msg ok">' +
+          (pdf.existing ? 'PDF đã có sẵn. ' : 'Đã tạo PDF. ') +
+          '<a href="' + esc(pdf.url) + '" target="_blank">Mở trong Drive</a></div>';
+        b.disabled = false;
+      })
+      .withFailureHandler(function(e){
+        $('pdfOut').innerHTML = '<div class="msg err">' + esc(e && e.message ? e.message : String(e)) + '</div>';
+        b.disabled = false;
+      })
+      .uiGenerateInvoicePdf(res.settlementKey);
+  });
+}
+
+init();
+</script>
+</body>
+</html>

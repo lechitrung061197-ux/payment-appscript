@@ -1,0 +1,14 @@
+# Files kept in the repo but NOT part of the Payment All Apps Script project.
+#
+# standalone/ holds the Grey Gmail collector, which runs in its own Apps Script
+# project bound to each Grey mailbox. Pushing it here would put a second writer
+# to the Transaction sheet inside the same project by accident.
+standalone/**
+
+# Sheet exports carry Client ID / Client Secret in the Account tab.
+**/*.xlsx
+
+.git/**
+.gitignore
+.claspignore
+.DS_Store
