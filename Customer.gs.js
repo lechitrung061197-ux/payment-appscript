@@ -1163,8 +1163,15 @@ function custDescribeReceivingMatch_(w,tx){
     };
   }
 
+  /*
+   * Trạng thái lạ rơi vào mặc định IN_TRANSIT, mà IN_TRANSIT nghĩa là "đang
+   * trên đường về và sẽ tự khớp". Với provider nhận chưa được hỗ trợ thì điều
+   * đó sai: tiền sẽ không bao giờ khớp. Nói đúng lý do, đừng để hệ thống trấn
+   * an nhầm.
+   */
   let status='IN_TRANSIT';
-  if(w.reconcileStatus==='OVERDUE')status='OVERDUE';
+  if(w.reconcileStatus==='UNSUPPORTED_PROVIDER')status='UNSUPPORTED_PROVIDER';
+  else if(w.reconcileStatus==='OVERDUE')status='OVERDUE';
   else if(w.reconcileStatus==='UNMATCHED')status='UNMATCHED';
   else if(w.reconcileStatus==='ARRIVED'&&!tx)status='ERROR_NO_RECEIVING_MATCH';
   else if(w.reconcileStatus==='ARRIVED'&&tx)status='ERROR_RECEIVING_MATCH_REJECTED';
@@ -2638,6 +2645,22 @@ function validateCustomerSystem(){
   custReportOrphanPaidPayouts_(ss,issues);
   custReportUnattributedSales_(ss,issues);
   custReportBrokenSettlementLinks_(ss,issues);
+  /*
+   * Provider nhận chưa được hỗ trợ: tiền sẽ không bao giờ tự khớp, nên phải
+   * hiện thành số tiền cụ thể đang kẹt chứ không chỉ là một trạng thái lạ.
+   */
+  (function(){
+    const stuck={};
+    allocs.forEach(a=>{
+      if(custUpper_(a['Allocation Status'])!=='UNSUPPORTED_PROVIDER')return;
+      const prov=custUpper_(a['Receiving Provider'])||'(chưa rõ)';
+      stuck[prov]=custRound2_((stuck[prov]||0)+custNum_(a['Allocated Amount']));
+    });
+    Object.keys(stuck).forEach(prov=>{
+      issues.push('RECEIVING PROVIDER CHƯA HỖ TRỢ: '+prov+' · '+stuck[prov].toFixed(2)+
+        ' đang kẹt · cần collector cho provider này, hoặc sửa Linked Provider trong sheet Account');
+    });
+  })();
   custReportAllocationIntegrity_(ss,allocs,txs,issues);
   /*
    * AVAILABLE mà thiếu Available Date sẽ bị điều kiện As-Of loại khỏi mọi hoá

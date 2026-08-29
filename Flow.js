@@ -32,6 +32,18 @@ const FLOW_CFG = Object.freeze({
    */
   SETTLEMENTS_SHEET: 'Settlements',
 
+  /*
+   * Provider nhận mà reconcile THẬT SỰ biết cách đối chiếu.
+   *
+   * Sheet Account cho phép điền Linked Provider bất kỳ, nên danh sách này là
+   * thứ duy nhất phân biệt "đã khai đích đến và hệ thống tới được" với "đã khai
+   * đích đến nhưng không ai đi đón". Thiếu nó thì tiền kẹt im lặng ở OVERDUE.
+   *
+   * Thêm provider mới vào đây CHƯA đủ: còn cần collector và bộ chuẩn hoá raw
+   * của provider đó, cộng một nhánh reconcile.
+   */
+  RECEIVING_PROVIDERS: ['GREY'],
+
   /* Cùng sheet khoá với collector Grey ở project khác. */
   LOCK_SHEET: '_Sync Lock',
   LOCK_WAIT_MS: 90000,
@@ -5266,6 +5278,28 @@ function flowFinalizePaypalStatus_(
       }
 
 
+      /*
+       * Đã khai đích đến nhưng reconcile không biết provider đó. Không được để
+       * rơi vào IN_TRANSIT/OVERDUE: hai trạng thái đó nói rằng tiền đang trên
+       * đường về và sẽ tự khớp, trong khi thực tế không có ai đi đón. Nó sẽ
+       * nằm OVERDUE vĩnh viễn mà không ai biết tại sao.
+       */
+      if (
+        FLOW_CFG.RECEIVING_PROVIDERS.indexOf(
+          destinationProvider.toUpperCase()
+        ) === -1
+      ) {
+
+        row[
+          h['Reconcile Status']
+        ] =
+          'UNSUPPORTED_PROVIDER';
+
+        return;
+
+      }
+
+
       const date =
         flowMillis_(
           row[
@@ -6014,6 +6048,88 @@ function flowUpdateUsdtSummary_(
  * ACCOUNT MAP
  ************************************************************/
 
+/*
+ * Cột Enabled không nằm trong hợp đồng header của Flow (chỉ Paypal.gs đọc nó),
+ * nên phải kiểm tra sự tồn tại trước: thiếu cột thì coi như account đang bật,
+ * đừng nuốt mất cảnh báo chỉ vì workbook chưa có cột đó.
+ */
+function flowWarnUnsupportedLink_(
+  key,
+  row,
+  h
+) {
+
+  const provider =
+    flowString_(
+      row[
+        h['Provider']
+      ]
+    )
+      .toUpperCase();
+
+
+  if (provider !== 'PAYPAL') {
+    return;
+  }
+
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      h,
+      'Enabled'
+    )
+  ) {
+
+    const enabled =
+      flowString_(
+        row[
+          h['Enabled']
+        ]
+      )
+        .toUpperCase();
+
+
+    if (
+      enabled &&
+      enabled !== 'TRUE' &&
+      enabled !== 'YES' &&
+      enabled !== '1' &&
+      enabled !== 'ACTIVE'
+    ) {
+      return;
+    }
+
+  }
+
+
+  const linked =
+    flowString_(
+      row[
+        h['Linked Provider']
+      ]
+    )
+      .toUpperCase();
+
+
+  if (
+    !linked ||
+    FLOW_CFG.RECEIVING_PROVIDERS.indexOf(linked) !== -1
+  ) {
+    return;
+  }
+
+
+  Logger.log(
+    'CẢNH BÁO: PayPal account "' + key +
+    '" khai Linked Provider = "' + linked +
+    '" mà reconcile chưa hỗ trợ. Withdrawal của nó sẽ mang trạng thái ' +
+    'UNSUPPORTED_PROVIDER và tiền nằm lại Pending in PayPal cho tới khi ' +
+    'có collector cho provider đó.'
+  );
+
+}
+
+
 function flowReadAccountMap_(
   sheet,
   h
@@ -6064,9 +6180,24 @@ function flowReadAccountMap_(
 
         };
 
+
+        /*
+         * Cảnh báo ngay khi vừa cấu hình sai, đừng đợi tới lần rút đầu tiên
+         * rồi mới phát hiện tiền kẹt. Reconcile chỉ biết đường tới các
+         * provider trong FLOW_CFG.RECEIVING_PROVIDERS.
+         *
+         * Chỉ soi account PayPal đang bật: Linked Provider của dòng Grey hay
+         * của account đã tắt không nói lên điều gì về đường rút đang chạy, báo
+         * chúng chỉ tạo nhiễu rồi người ta thôi đọc log.
+         */
+        flowWarnUnsupportedLink_(
+          key,
+          row,
+          h
+        );
+
       }
     );
-
 
   return result;
 
