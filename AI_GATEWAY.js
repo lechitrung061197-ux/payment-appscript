@@ -167,20 +167,27 @@ function payAiToolDefinitions_() {
     {
       type: 'function',
       name: 'run_safe_action',
-      description: 'Run an approved non-destructive operational action. Invoice preview is safe. PDF generation changes PDF metadata only. Use empty strings for parameters not used by the selected action.',
+      description: 'Run an approved non-destructive operational action. Invoice preview is safe. PDF generation changes PDF metadata only. create_manual_payout writes a DRAFT payout row for money the owner is about to spend from a treasury account: it is an intention, not a payment — no balance changes and no transaction exists until the owner sets Status to PAID by hand. Use empty strings and 0 for parameters not used by the selected action.',
       strict: true,
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['sync_flow','sync_customers','sync_both','preview_invoice','generate_invoice_pdf','validate_customer_system'] },
+          action: { type: 'string', enum: ['sync_flow','sync_customers','sync_both','preview_invoice','generate_invoice_pdf','validate_customer_system','create_manual_payout'] },
           customer_key: { type: 'string' },
           from_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty when unused.' },
           to_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty when unused.' },
           as_of_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty means today for preview.' },
           settlement_key: { type: 'string' },
-          force: { type: 'boolean' }
+          force: { type: 'boolean' },
+          provider: { type: 'string', description: 'create_manual_payout only: USDT or PINGPONG. Empty otherwise.' },
+          account_key: { type: 'string', description: 'create_manual_payout only: which treasury account the money will leave, e.g. USDT1. Must already exist and not be disabled. Empty otherwise.' },
+          amount: { type: 'number', description: 'create_manual_payout only: amount to pay out, greater than 0. Use 0 otherwise.' },
+          fee: { type: 'number', description: 'create_manual_payout only: known fee, 0 if none.' },
+          payee: { type: 'string', description: 'create_manual_payout only: who or what is being paid. Empty otherwise.' },
+          category: { type: 'string', description: 'create_manual_payout only: EXPENSE, REFUND, TRANSFER, ADJUSTMENT or OTHER. Never CUSTOMER_PAYOUT — invoices own that. Empty otherwise.' },
+          note: { type: 'string', description: 'create_manual_payout only: what this payment is for, in the owner\'s own words. Empty otherwise.' }
         },
-        required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force'],
+        required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force','provider','account_key','amount','fee','payee','category','note'],
         additionalProperties: false
       }
     },
@@ -585,7 +592,171 @@ function payAiRunSafeAction_(args) {
     return { action: action, result: payAiJsonSafe_(validateCustomerSystem()) };
   }
 
+  if (action === 'create_manual_payout') {
+    return payAiCreateManualPayout_(args);
+  }
+
   throw new Error('Unsupported safe action: ' + action);
+}
+
+
+/************************* MANUAL PAYOUT *************************/
+
+/*
+ * Chỉ những loại này. CUSTOMER_PAYOUT cố tình vắng mặt: đó là lãnh địa của
+ * engine hoá đơn, nơi mỗi đồng phải truy được về allocation đã tiêu. Một dòng
+ * tay đội lốt payout khách sẽ trốn được cổng settlement của Flow.
+ */
+const PAY_AI_MANUAL_CATEGORIES = Object.freeze([
+  'EXPENSE',
+  'REFUND',
+  'TRANSFER',
+  'ADJUSTMENT',
+  'OTHER'
+]);
+
+
+/*
+ * Lệnh chi viết tay, luôn dừng ở DRAFT.
+ *
+ * Vì sao không cần PIN: DRAFT không phải giao dịch, nó là ý định. Flow loại
+ * DRAFT khỏi mọi số dư (flowTransactionCounts_), và không có transaction nào
+ * được sinh ra cho tới khi có người đổi Status thành PAID trong sheet. Nên thứ
+ * hàm này tạo ra là một tờ giấy chờ ký, không phải tiền rời đi.
+ *
+ * Điều đó chỉ đúng chừng nào các bất biến dưới đây còn nguyên. Chúng không
+ * phải kiểm tra phòng hờ — chúng là toàn bộ lý do action này được xếp loại an
+ * toàn. Ai đó thêm đường cho AI ghi Status khác DRAFT là phá vỡ lập luận này.
+ */
+function payAiCreateManualPayout_(args) {
+  const ss = payAiSpreadsheet_();
+  payAiActivateSpreadsheet_();
+
+  const provider = String(args.provider || '').trim().toUpperCase();
+  if (provider !== 'USDT' && provider !== 'PINGPONG') {
+    throw new Error('provider must be USDT or PINGPONG (Flow only settles those). Got: ' + (provider || '(empty)'));
+  }
+
+  const category = String(args.category || 'EXPENSE').trim().toUpperCase();
+  if (category === 'CUSTOMER_PAYOUT') {
+    throw new Error('CUSTOMER_PAYOUT belongs to the invoice engine. Create an invoice instead; a manual row cannot carry a settlement.');
+  }
+  if (PAY_AI_MANUAL_CATEGORIES.indexOf(category) === -1) {
+    throw new Error('category must be one of: ' + PAY_AI_MANUAL_CATEGORIES.join(', ') + '. Got: ' + category);
+  }
+
+  const amount = payAiToNumber_(args.amount);
+  if (amount === null || !(amount > 0)) throw new Error('amount must be greater than 0.');
+
+  const feeRaw = payAiToNumber_(args.fee);
+  const fee = feeRaw === null ? 0 : feeRaw;
+  if (fee < 0) throw new Error('fee cannot be negative.');
+
+  const payee = String(args.payee || '').trim();
+  if (!payee) throw new Error('payee is required: say who or what is being paid.');
+
+  const note = String(args.note || '').trim();
+  if (!note) throw new Error('note is required: say what this payment is for.');
+
+  /*
+   * Tài khoản phải có thật và đang bật. Kiểm ở đây để hỏng thì hỏng ngay lúc
+   * hỏi, thay vì đẻ ra một dòng mà lần sync sau mới dán nhãn ACCOUNT NOT FOUND
+   * rồi nằm đó chờ ai đó tình cờ nhìn thấy.
+   */
+  const accountKey = String(args.account_key || '').trim().toUpperCase();
+  if (!accountKey) throw new Error('account_key is required: which treasury account does the money leave from?');
+  const known = payAiTreasuryAccountKeys_(ss, provider);
+  if (known.indexOf(accountKey) === -1) {
+    throw new Error('Account not found or disabled on the ' + provider + ' sheet: ' + accountKey +
+      '. Enabled accounts: ' + (known.length ? known.join(', ') : '(none)'));
+  }
+
+  const sh = ss.getSheetByName('Payouts');
+  if (!sh) throw new Error('Missing Payouts sheet.');
+  if (typeof custHeaderMap_ !== 'function' || typeof custWritePayoutDraftRow_ !== 'function' ||
+      typeof custNextKey_ !== 'function') {
+    throw new Error('Customer module is not loaded; manual payout needs its Payouts helpers.');
+  }
+  const h = custHeaderMap_(sh);
+  ['Payout Key','Provider','Account Key','Payee','Category','Amount','Fee','Currency','Status','Note']
+    .forEach(function(k) { if (!h[k]) throw new Error('Payouts sheet missing header: ' + k); });
+
+  const now = new Date();
+  const payoutKey = custNextKey_(sh, h, 'Payout Key', 'PO-', 6);
+  const currency = provider === 'USDT' ? 'USDT' : 'USD';
+
+  const obj = {
+    'Payout Key': payoutKey,
+    'Payout Date': '',
+    'Provider': provider,
+    'Account Key': accountKey,
+    'Payee': payee,
+    'Category': category,
+    'Amount': amount,
+    'Fee': fee,
+    'Total Deducted': payAiRound_(amount + fee, 2),
+    'Currency': currency,
+    'Reference': '',
+    /* Bất biến 1: không bao giờ là gì khác DRAFT. */
+    'Status': 'DRAFT',
+    'Validation': 'DRAFT',
+    'Transaction Key': '',
+    'Created At': now,
+    'Paid At': '',
+    'Note': note + ' | MANUAL VIA AI ' + Utilities.formatDate(now, 'Asia/Ho_Chi_Minh', 'yyyy-MM-dd HH:mm'),
+    /* Bất biến 2: không đội lốt được payout khách. */
+    'Customer Key': '',
+    'Settlement Key': ''
+  };
+
+  const row = custWritePayoutDraftRow_(ss, sh, h, obj);
+  SpreadsheetApp.flush();
+
+  /*
+   * Cố tình KHÔNG tạo dòng Transaction. Flow sở hữu sheet đó và sẽ dựng
+   * POTX|<payoutKey> đúng cách vào lúc Status thành PAID. Viết trước một dòng
+   * DRAFT ở đây là đoán trước ngữ nghĩa của Flow cho một khoản chi mà nó chưa
+   * từng thấy.
+   */
+  return {
+    action: 'create_manual_payout',
+    payout_key: payoutKey,
+    row: row,
+    provider: provider,
+    account_key: accountKey,
+    payee: payee,
+    category: category,
+    amount: amount,
+    fee: fee,
+    total_deducted: obj['Total Deducted'],
+    currency: currency,
+    status: 'DRAFT',
+    message: 'DRAFT payout ' + payoutKey + ' created on row ' + row + '. Nothing has moved and no balance changed: ' +
+      'it stays an intention until the owner sets Status to PAID on the Payouts sheet. ' +
+      'Report the payout key and say plainly that it is still DRAFT.'
+  };
+}
+
+
+/*
+ * Khoá tài khoản đang bật của một provider chi tiền. Sheet Pingpong viết hoa
+ * kiểu khác USDT, nên tra tên sheet chứ đừng suy ra từ tên provider.
+ */
+function payAiTreasuryAccountKeys_(ss, provider) {
+  const sheetName = provider === 'USDT' ? 'USDT' : (provider === 'PINGPONG' ? 'Pingpong' : '');
+  const sh = sheetName ? ss.getSheetByName(sheetName) : null;
+  if (!sh) return [];
+
+  const map = payAiHeaderMap_(sh);
+  if (!map['Account Key']) return [];
+
+  const out = [];
+  payAiReadObjects_(sh, map).forEach(function(r) {
+    const key = String(r['Account Key'] || '').trim().toUpperCase();
+    const status = map['Status'] ? String(r['Status'] || '').trim().toUpperCase() : '';
+    if (key && status !== 'DISABLED') out.push(key);
+  });
+  return out;
 }
 
 function payAiInvoiceParamsFromArgs_(args) {

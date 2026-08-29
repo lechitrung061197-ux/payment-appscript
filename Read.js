@@ -121,7 +121,9 @@ SAFETY
 - Do not reintroduce Customer Transfer Allocation into invoice eligibility.
 - Customer Allocation "Settlement Key" is the only link between an invoice and the money it consumed, and sync cannot rebuild it. Never clear the Customer Allocation sheet unless Settlements and Settlement Items are cleared with it; otherwise invoiced money silently becomes available again and gets invoiced twice. If it was already cleared, run repairAllocationSettlementLinks(); validateCustomerSystem() reports BROKEN SETTLEMENT LINK when it is torn.
 - Do not expose secrets/tokens/passwords/PINs.
-- SAFE actions: read, aggregate, syncFlow, syncCustomers, preview, PDF generation.
+- SAFE actions: read, aggregate, syncFlow, syncCustomers, preview, PDF generation, create_manual_payout.
+- create_manual_payout is safe ONLY because it can write nothing but Status=DRAFT, with Customer Key and Settlement Key blank and Category never CUSTOMER_PAYOUT. DRAFT is an intention: Flow excludes it from every balance and creates no transaction. Money leaves only when a human sets Status=PAID on the Payouts sheet. Never describe a DRAFT as paid, sent, or deducted.
+- A payout with no Settlement Key is somebody's manual entry. Sync never touches it, and it must never be reported as a customer invoice payout.
 - Financial/data mutations are PROTECTED and require local Action PIN before execution.
 `;
 
