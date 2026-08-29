@@ -26,6 +26,12 @@ const FLOW_CFG = Object.freeze({
   PAYOUTS_SHEET: 'Payouts',
   TRANSACTION_SHEET: 'Transaction',
 
+  /*
+   * Read-only. Flow never writes Settlements; it only needs to know whether a
+   * payout is backed by a real invoice before moving treasury money.
+   */
+  SETTLEMENTS_SHEET: 'Settlements',
+
   HEADER_ROW: 2,
   DATA_START_ROW: 3,
 
@@ -38,11 +44,67 @@ const FLOW_CFG = Object.freeze({
 });
 
 
+var PAYMENT_ALL_LOCK_DEPTH =
+  typeof PAYMENT_ALL_LOCK_DEPTH === 'number'
+    ? PAYMENT_ALL_LOCK_DEPTH
+    : 0;
+
+
+function paymentAllWithScriptLock_(
+  label,
+  fn
+) {
+
+  if (
+    PAYMENT_ALL_LOCK_DEPTH > 0
+  ) {
+
+    return fn();
+
+  }
+
+
+  const lock =
+    LockService.getScriptLock();
+
+
+  lock.waitLock(
+    30000
+  );
+
+
+  PAYMENT_ALL_LOCK_DEPTH++;
+
+
+  try {
+
+    return fn();
+
+  } finally {
+
+    PAYMENT_ALL_LOCK_DEPTH--;
+    lock.releaseLock();
+
+  }
+
+}
+
+
 /************************************************************
  * MAIN
  ************************************************************/
 
 function syncFlow() {
+
+  return paymentAllWithScriptLock_(
+    'syncFlow',
+    syncFlowCore_
+  );
+
+}
+
+
+function syncFlowCore_() {
 
   const startedAt = new Date();
 
@@ -243,7 +305,8 @@ function syncFlow() {
       poh,
       payoutAccountMaps,
       txState,
-      th
+      th,
+      flowReadSettlementStatusMap_(ss)
     );
 
 
@@ -370,6 +433,12 @@ function syncFlow() {
   Logger.log(
     'Payout INVALID: ' +
     payoutResult.invalid
+  );
+
+  /* Counted apart from INVALID: this one needs a person to look, not a retype. */
+  Logger.log(
+    'Payout BLOCKED (settlement): ' +
+    payoutResult.blocked
   );
 
 
@@ -1237,13 +1306,15 @@ function flowSyncPayoutsToTransaction_(
   h,
   providerMaps,
   state,
-  th
+  th,
+  settlementStatusMap
 ) {
 
   let paid = 0;
   let draft = 0;
   let cancelled = 0;
   let invalid = 0;
+  let blocked = 0;
 
 
   /**********************************************************
@@ -1701,6 +1772,123 @@ function flowSyncPayoutsToTransaction_(
 
 
       /********************************************************
+       * SETTLEMENT VALIDATION
+       *
+       * Everything past the check above is PAID, so this is the last gate
+       * before real treasury money moves. A payout is only as real as the
+       * invoice behind it: CREATING means a create that never finished,
+       * FAILED and CANCELLED never happened at all.
+       *
+       * Skipped entirely when there is no Settlements sheet, so Flow still
+       * runs standalone on a workbook without the Customer module.
+       ********************************************************/
+
+      if (settlementStatusMap) {
+
+        const settlementKey =
+          h['Settlement Key']
+            ? flowCell_(
+                row,
+                h,
+                'Settlement Key'
+              )
+            : '';
+
+
+        const category =
+          flowCell_(
+            row,
+            h,
+            'Category'
+          )
+            .toUpperCase();
+
+
+        let blockReason = '';
+
+
+        /*
+         * CUSTOMER_PAYOUT is only ever written by the invoice engine, always
+         * with a Settlement Key. A blank key means the row was edited by hand,
+         * which is exactly how someone would route around this guard.
+         */
+        if (
+          !settlementKey &&
+          category ===
+            'CUSTOMER_PAYOUT'
+        ) {
+
+          blockReason =
+            'MISSING SETTLEMENT';
+
+        } else if (
+          settlementKey &&
+          !flowIsEffectiveSettlementStatus_(
+            settlementStatusMap[
+              settlementKey
+            ]
+          )
+        ) {
+
+          blockReason =
+            'SETTLEMENT NOT EFFECTIVE (' +
+            (
+              settlementStatusMap[
+                settlementKey
+              ] ||
+              'MISSING'
+            ) +
+            ')';
+
+        }
+
+
+        if (blockReason) {
+
+          row[
+            h['Validation']
+          ] =
+            blockReason;
+
+
+          /*
+           * An existing transaction already marked PAID records money that
+           * really left. Leave it counted so a mistaken edit to
+           * Settlement.Status cannot inflate the treasury balance; the
+           * Validation cell is what tells a human to look.
+           */
+          const alreadyPaidOut =
+            existingTx &&
+            flowCell_(
+              existingTx,
+              th,
+              'Reconcile Status'
+            )
+              .toUpperCase() ===
+              'PAID';
+
+
+          if (!alreadyPaidOut) {
+
+            flowSetExistingPayoutTxState_(
+              existingTx,
+              th,
+              'INVALID'
+            );
+
+          }
+
+
+          blocked++;
+
+          return;
+
+        }
+
+      }
+
+
+      /********************************************************
        * PROVIDER VALIDATION
        ********************************************************/
 
@@ -2072,7 +2260,10 @@ function flowSyncPayoutsToTransaction_(
       cancelled,
 
     invalid:
-      invalid
+      invalid,
+
+    blocked:
+      blocked
 
   };
 
@@ -4872,6 +5063,122 @@ function flowFinalizePaypalStatus_(
 /************************************************************
  * WHETHER TX COUNTS IN BALANCE
  ************************************************************/
+
+/************************************************************
+ * SETTLEMENT STATUS (READ-ONLY)
+ *
+ * Flow reads the Settlements sheet itself rather than calling into
+ * Customer.gs. A guard must not depend on the runtime behaviour of the very
+ * layer it is guarding: the Customer sweeper only cancels DRAFT payouts, so it
+ * cannot be the last line of defence for real treasury movement.
+ *
+ * Returns null when there is no usable Settlements sheet, which tells the
+ * caller to skip the guard entirely and behave exactly as before.
+ ************************************************************/
+
+function flowReadSettlementStatusMap_(
+  ss
+) {
+
+  const sheet =
+    flowOptionalSheet_(
+      ss,
+      FLOW_CFG.SETTLEMENTS_SHEET
+    );
+
+
+  if (!sheet) {
+    return null;
+  }
+
+
+  const h =
+    flowHeaderMap_(
+      sheet
+    );
+
+
+  if (
+    !h['Settlement Key'] ||
+    !h['Status']
+  ) {
+    return null;
+  }
+
+
+  const map = {};
+
+
+  flowReadRows_(
+    sheet
+  ).forEach(
+    row => {
+
+      const key =
+        flowCell_(
+          row,
+          h,
+          'Settlement Key'
+        );
+
+
+      if (!key) {
+        return;
+      }
+
+
+      map[key] =
+        flowCell_(
+          row,
+          h,
+          'Status'
+        )
+          .toUpperCase();
+
+    }
+  );
+
+
+  return map;
+
+}
+
+
+/*
+ * Settlement status is owned by Customer.gs. Defer to its helper so the list of
+ * real-invoice statuses lives in exactly one place, and fall back to the same
+ * three only if that file is somehow unavailable.
+ */
+function flowIsEffectiveSettlementStatus_(
+  status
+) {
+
+  if (
+    typeof custIsEffectiveSettlementStatus_ ===
+    'function'
+  ) {
+
+    return custIsEffectiveSettlementStatus_(
+      status
+    );
+
+  }
+
+
+  const s =
+    String(status || '')
+      .trim()
+      .toUpperCase();
+
+
+  return (
+    s === 'ISSUED' ||
+    s === 'PARTIALLY_PAID' ||
+    s === 'PAID'
+  );
+
+}
+
 
 function flowTransactionCounts_(
   row,

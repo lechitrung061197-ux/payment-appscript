@@ -178,6 +178,12 @@ function generateLatestInvoicePdf() {
     const key = invPdfStr_(row[headers['Settlement Key'] - 1]);
     if (!key) return;
 
+    // An unfinished or failed create is not an invoice; never pick it as "latest".
+    if (headers['Status'] &&
+        !invPdfIsEffectiveSettlementStatus_(row[headers['Status'] - 1])) {
+      return;
+    }
+
     const created = invPdfDate_(row[headers['Created At'] - 1]);
     const time = created ? created.getTime() : 0;
 
@@ -188,7 +194,7 @@ function generateLatestInvoicePdf() {
   });
 
   if (!newestKey) {
-    throw new Error('Could not find a settlement to generate.');
+    throw new Error('Could not find an issued settlement to generate.');
   }
 
   return invPdfGenerate_(newestKey, false);
@@ -257,6 +263,12 @@ function generateMissingInvoicePdfs() {
     const key = invPdfStr_(row[headers['Settlement Key'] - 1]);
     const pdfId = invPdfStr_(row[headers['PDF File ID'] - 1]);
 
+    // Skip non-issued settlements, otherwise one FAILED row aborts the batch.
+    if (headers['Status'] &&
+        !invPdfIsEffectiveSettlementStatus_(row[headers['Status'] - 1])) {
+      return;
+    }
+
     if (key && !pdfId) {
       keys.push(key);
     }
@@ -281,6 +293,26 @@ function generateMissingInvoicePdfs() {
  *************************************************/
 
 function invPdfGenerate_(settlementKey, forceRegenerate) {
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(
+      'invPdfGenerate',
+      function() {
+        return invPdfGenerateCore_(settlementKey, forceRegenerate);
+      }
+    );
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return invPdfGenerateCore_(settlementKey, forceRegenerate);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function invPdfGenerateCore_(settlementKey, forceRegenerate) {
   const ss = SpreadsheetApp.getActive();
   const settlementsSheet = invPdfRequireSheet_(ss, INV_PDF_CFG.SETTLEMENTS_SHEET);
   const itemsSheet = invPdfRequireSheet_(ss, INV_PDF_CFG.ITEMS_SHEET);
@@ -372,6 +404,15 @@ function invPdfGenerate_(settlementKey, forceRegenerate) {
   if (!settlement) {
     throw new Error('Settlement not found: ' + settlementKey);
   }
+
+  /*
+   * Only a real invoice may become a customer-facing document. A settlement at
+   * CREATING is an unfinished create and FAILED/CANCELLED never happened, so
+   * rendering either would put a document in a customer's hands for money that
+   * was never invoiced. PDF generation is a SAFE action for the AI gateway, so
+   * this is the only gate on that path.
+   */
+  invPdfRequireEffectiveSettlement_(settlement, settlementHeaders, settlementKey);
 
   const existingPdfId = invPdfStr_(settlement.values[settlementHeaders['PDF File ID'] - 1]);
   const existingPdfUrl = invPdfStr_(settlement.values[settlementHeaders['PDF URL'] - 1]);
@@ -1160,6 +1201,39 @@ function invPdfGetLogoBlob_() {
 /*************************************************
  * DATA READ
  *************************************************/
+
+/*
+ * Settlement status is owned by Customer.gs. Defer to its helper so the list of
+ * real-invoice statuses lives in exactly one place, and fall back to the same
+ * three only if that file is somehow unavailable.
+ */
+function invPdfIsEffectiveSettlementStatus_(status) {
+  if (typeof custIsEffectiveSettlementStatus_ === 'function') {
+    return custIsEffectiveSettlementStatus_(status);
+  }
+
+  const s = invPdfStr_(status).toUpperCase();
+  return s === 'ISSUED' || s === 'PARTIALLY_PAID' || s === 'PAID';
+}
+
+
+function invPdfRequireEffectiveSettlement_(settlement, headers, settlementKey) {
+  if (!headers['Status']) {
+    return;
+  }
+
+  const status =
+    invPdfStr_(settlement.values[headers['Status'] - 1]).toUpperCase() ||
+    'ISSUED';
+
+  if (!invPdfIsEffectiveSettlementStatus_(status)) {
+    throw new Error(
+      'Settlement ' + settlementKey + ' is ' + status +
+      ' and is not an issued invoice. No PDF was generated.'
+    );
+  }
+}
+
 
 function invPdfFindSettlement_(sheet, headers, settlementKey) {
   const lastRow = sheet.getLastRow();

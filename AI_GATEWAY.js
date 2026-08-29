@@ -568,9 +568,8 @@ function payAiRunSafeAction_(args) {
   }
 
   if (action === 'preview_invoice') {
-    payAiRequireFunction_('previewCustomerInvoiceFromControl');
-    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
-    const preview = previewCustomerInvoiceFromControl();
+    payAiRequireFunction_('previewCustomerInvoice');
+    const preview = previewCustomerInvoice(payAiInvoiceParamsFromArgs_(args));
     return payAiSummarizePreview_(preview);
   }
 
@@ -589,22 +588,13 @@ function payAiRunSafeAction_(args) {
   throw new Error('Unsupported safe action: ' + action);
 }
 
-function payAiSetInvoiceControl_(customerKey, fromDate, toDate, asOfDate) {
-  const ss = payAiActivateSpreadsheet_();
-  const sh = ss.getSheetByName('Invoice Control');
-  if (!sh) throw new Error('Missing Invoice Control sheet.');
-
-  const from = payAiParseDateInput_(fromDate);
-  const to = payAiParseDateInput_(toDate);
-  const asOf = asOfDate ? payAiParseDateInput_(asOfDate) : new Date();
-  if (!from || !to) throw new Error('from_date and to_date are required (YYYY-MM-DD or DD/MM/YYYY).');
-
-  sh.getRange('B3').setValue('INVOICE PREVIEW');
-  sh.getRange('B4').setValue(String(customerKey || '').trim().toUpperCase());
-  sh.getRange('B5').setValue(from).setNumberFormat('dd/MM/yyyy');
-  sh.getRange('B6').setValue(to).setNumberFormat('dd/MM/yyyy');
-  sh.getRange('B7').setValue(asOf).setNumberFormat('dd/MM/yyyy');
-  SpreadsheetApp.flush();
+function payAiInvoiceParamsFromArgs_(args) {
+  return {
+    customer_key: String(args.customer_key || '').trim().toUpperCase(),
+    from_date: String(args.from_date || '').trim(),
+    to_date: String(args.to_date || '').trim(),
+    as_of_date: String(args.as_of_date || '').trim()
+  };
 }
 
 function payAiSummarizePreview_(p) {
@@ -652,9 +642,8 @@ function payAiRequestProtectedAction_(ctx, args) {
   payAiActivateSpreadsheet_();
 
   if (action === 'create_invoice') {
-    payAiRequireFunction_('previewCustomerInvoiceFromControl');
-    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
-    previewInfo = payAiSummarizePreview_(previewCustomerInvoiceFromControl());
+    payAiRequireFunction_('previewCustomerInvoice');
+    previewInfo = payAiSummarizePreview_(previewCustomerInvoice(payAiInvoiceParamsFromArgs_(args)));
   } else if (action === 'set_customer_payout_fee') {
     const current = payAiGetCustomerRow_(args.customer_key);
     previewInfo = {
@@ -718,15 +707,20 @@ function payAiExecutePendingAction_(chatId, rawPin) {
     return { ok: false, error: 'Wrong action PIN. Attempts remaining: ' + (PAYMENT_AI_CFG.MAX_PIN_ATTEMPTS - pending.attempts) };
   }
 
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
+  const execute = function() {
     const result = payAiPerformProtectedAction_(pending.action, pending.args);
     props.deleteProperty(key);
     return { ok: true, action: pending.action, result: payAiJsonSafe_(result) };
-  } finally {
-    lock.releaseLock();
+  };
+
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_('payAiExecutePendingAction', execute);
   }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return execute(); }
+  finally { lock.releaseLock(); }
 }
 
 function payAiCancelPendingAction_(chatId) {
@@ -738,12 +732,12 @@ function payAiPerformProtectedAction_(action, args) {
   payAiActivateSpreadsheet_();
 
   if (action === 'create_invoice') {
-    payAiRequireFunction_('previewCustomerInvoiceFromControl');
-    payAiRequireFunction_('createCustomerInvoiceFromControl');
-    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
-    const preview = previewCustomerInvoiceFromControl();
+    payAiRequireFunction_('previewCustomerInvoice');
+    payAiRequireFunction_('createCustomerInvoice');
+    const params = payAiInvoiceParamsFromArgs_(args);
+    const preview = previewCustomerInvoice(params);
     const previewSummary = payAiSummarizePreview_(preview);
-    const created = createCustomerInvoiceFromControl();
+    const created = createCustomerInvoice(params);
     return { preview: previewSummary, created: payAiJsonSafe_(created) };
   }
 
@@ -802,6 +796,8 @@ function payAiRequireFunction_(name) {
   const available = {
     syncFlow: typeof syncFlow === 'function',
     syncCustomers: typeof syncCustomers === 'function',
+    previewCustomerInvoice: typeof previewCustomerInvoice === 'function',
+    createCustomerInvoice: typeof createCustomerInvoice === 'function',
     previewCustomerInvoiceFromControl: typeof previewCustomerInvoiceFromControl === 'function',
     validateCustomerSystem: typeof validateCustomerSystem === 'function',
     createCustomerInvoiceFromControl: typeof createCustomerInvoiceFromControl === 'function'

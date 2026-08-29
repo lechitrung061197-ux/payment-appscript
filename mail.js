@@ -68,15 +68,24 @@ const GG_CFG = Object.freeze({
   /**********************************************************
    * GMAIL SEARCH
    *
-   * Hiện dùng full search + dedupe.
-   * An toàn nhất cho giai đoạn này.
+   * Quét theo cửa sổ gần đây, không quét lại toàn bộ lịch sử.
+   * An toàn vì ggUpsertRawDirect_ đã idempotent theo Unique Key
+   * / Source ID, nên đọc chồng lấn không tạo dòng trùng.
+   *
+   * Chạy 2 lần/ngày thì 7 ngày là dư biên rất nhiều: mail Grey
+   * về muộn, Gmail lỗi, hay trigger nghỉ vài ngày đều được bù.
+   *
+   * Cần dựng lại từ đầu thì gọi syncGreyGmailRawFull().
    **********************************************************/
 
   BATCH_SIZE:
     100,
 
   MAX_THREADS:
-    3000
+    3000,
+
+  LOOKBACK_DAYS:
+    7
 
 });
 
@@ -111,6 +120,76 @@ const GG_RAW_HEADERS = Object.freeze([
  ************************************************************/
 
 function syncGreyGmailRaw() {
+  return ggRunSync_(
+    'syncGreyGmailRaw',
+    GG_CFG.LOOKBACK_DAYS
+  );
+}
+
+
+/*
+ * Quét lại toàn bộ lịch sử mail Grey. Chỉ dùng khi cần dựng lại,
+ * không đặt vào trigger: thời gian chạy tăng mãi theo số mail.
+ */
+function syncGreyGmailRawFull() {
+  return ggRunSync_(
+    'syncGreyGmailRawFull',
+    0
+  );
+}
+
+
+function ggRunSync_(
+  label,
+  lookbackDays
+) {
+
+  const run =
+    function () {
+      return syncGreyGmailRawCore_(
+        lookbackDays
+      );
+    };
+
+
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(
+      label,
+      run
+    );
+  }
+
+  const lock =
+    LockService.getScriptLock();
+
+  lock.waitLock(
+    30000
+  );
+
+  try {
+
+    return run();
+
+  } finally {
+
+    lock.releaseLock();
+
+  }
+
+}
+
+
+function syncGreyGmailRawCore_(
+  lookbackDays
+) {
+
+  lookbackDays =
+    (
+      lookbackDays === undefined ||
+      lookbackDays === null
+    )
+      ? GG_CFG.LOOKBACK_DAYS
+      : Number(lookbackDays);
 
   /**********************************************************
    * VALIDATE CONFIG
@@ -309,11 +388,15 @@ function syncGreyGmailRaw() {
   try {
 
     /********************************************************
-     * LOAD TRANSACTION
+     * LOAD TRANSACTION INDEX
+     *
+     * Do NOT load -> clear -> rewrite the whole Transaction sheet.
+     * Multiple external Gmail collector projects can write to the same
+     * central workbook, and ScriptLock does not cross Apps Script projects.
      ********************************************************/
 
     const state =
-      ggLoadTransactionState_(
+      ggLoadTransactionIndex_(
         txSheet,
         txHeaders
       );
@@ -353,9 +436,19 @@ function syncGreyGmailRaw() {
      * SEARCH GREY MAIL IN CENTRAL GMAIL
      ********************************************************/
 
+    /*
+     * lookbackDays = 0 nghĩa là quét toàn bộ (dựng lại thủ công).
+     */
     const query =
       'from:' +
-      GG_CFG.SENDER;
+      GG_CFG.SENDER +
+      (
+        lookbackDays > 0
+          ? ' newer_than:' +
+            lookbackDays +
+            'd'
+          : ''
+      );
 
 
     Logger.log(
@@ -697,7 +790,8 @@ function syncGreyGmailRaw() {
                ************************************************/
 
               const result =
-                ggUpsertRaw_(
+                ggUpsertRawDirect_(
+                  txSheet,
                   state,
                   txHeaders,
                   record
@@ -747,17 +841,6 @@ function syncGreyGmailRaw() {
       }
 
     }
-
-
-    /********************************************************
-     * WRITE TRANSACTION
-     ********************************************************/
-
-    ggWriteTransactionState_(
-      txSheet,
-      txHeaders,
-      state
-    );
 
 
     /********************************************************
@@ -2443,6 +2526,384 @@ function ggUpsertRaw_(
 
 
   return result;
+
+}
+
+
+/************************************************************
+ * LOAD TRANSACTION INDEX ONLY
+ *
+ * Used by external Grey collectors. Keeps row numbers so each Gmail event can
+ * update only its own row, or append a new row, without rewriting Transaction.
+ ************************************************************/
+
+function ggLoadTransactionIndex_(
+  sheet,
+  headers
+) {
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  const lastColumn =
+    sheet.getLastColumn();
+
+
+  const state = {
+
+    keyMap:
+      {},
+
+    sourceMap:
+      {},
+
+    columnCount:
+      lastColumn
+
+  };
+
+
+  if (
+    lastRow <
+      GG_CFG.DATA_START_ROW ||
+    lastColumn < 1
+  ) {
+
+    return state;
+
+  }
+
+
+  const rows =
+    sheet
+      .getRange(
+        GG_CFG.DATA_START_ROW,
+        1,
+        lastRow -
+          GG_CFG.DATA_START_ROW +
+          1,
+        lastColumn
+      )
+      .getValues();
+
+
+  rows.forEach(
+    (row, index) => {
+
+      const rowNumber =
+        GG_CFG.DATA_START_ROW +
+        index;
+
+
+      const uniqueKey =
+        ggString_(
+          row[
+            headers[
+              'Unique Key'
+            ]
+          ]
+        );
+
+
+      if (uniqueKey) {
+
+        state.keyMap[
+          uniqueKey
+        ] = {
+
+          rowNumber:
+            rowNumber,
+
+          row:
+            row
+
+        };
+
+      }
+
+
+      const source =
+        ggString_(
+          row[
+            headers[
+              'Source'
+            ]
+          ]
+        )
+          .toUpperCase();
+
+
+      const sourceId =
+        ggString_(
+          row[
+            headers[
+              'Source ID'
+            ]
+          ]
+        );
+
+
+      if (
+        source ===
+          'GREY_GMAIL' &&
+        sourceId
+      ) {
+
+        state.sourceMap[
+          source +
+          '|' +
+          sourceId
+        ] = {
+
+          rowNumber:
+            rowNumber,
+
+          row:
+            row
+
+        };
+
+      }
+
+    }
+  );
+
+
+  return state;
+
+}
+
+
+/************************************************************
+ * UPSERT ONE RAW GREY EVENT DIRECTLY
+ *
+ * Collector-owned fields only. No sorting, no clearing, no full-sheet rewrite.
+ ************************************************************/
+
+function ggUpsertRawDirect_(
+  sheet,
+  state,
+  headers,
+  record
+) {
+
+  const uniqueKey =
+    record[
+      'Unique Key'
+    ];
+
+
+  const sourceKey =
+    'GREY_GMAIL|' +
+    record[
+      'Source ID'
+    ];
+
+
+  if (!uniqueKey) {
+
+    throw new Error(
+      'Grey Gmail row thiếu Unique Key.'
+    );
+
+  }
+
+
+  let existing =
+    state.keyMap[
+      uniqueKey
+    ] ||
+    state.sourceMap[
+      sourceKey
+    ] ||
+    null;
+
+
+  const result =
+    existing
+      ? 'UPDATED'
+      : 'NEW';
+
+
+  const row =
+    existing
+      ? existing.row.slice()
+      : new Array(
+          state.columnCount
+        )
+          .fill('');
+
+
+  Object.keys(
+    record
+  )
+    .forEach(
+      header => {
+
+        if (
+          !Object.prototype
+            .hasOwnProperty.call(
+              headers,
+              header
+            )
+        ) {
+
+          return;
+
+        }
+
+
+        row[
+          headers[
+            header
+          ]
+        ] =
+          record[
+            header
+          ];
+
+      }
+    );
+
+
+  if (existing) {
+
+    sheet
+      .getRange(
+        existing.rowNumber,
+        1,
+        1,
+        state.columnCount
+      )
+      .setValues(
+        [
+          row
+        ]
+      );
+
+  } else {
+
+    sheet.appendRow(
+      row
+    );
+
+    existing = {
+
+      rowNumber:
+        ggFindTransactionRowNumberByUnique_(
+          sheet,
+          headers,
+          uniqueKey
+        ) ||
+        sheet.getLastRow(),
+
+      row:
+        row
+
+    };
+
+  }
+
+
+  state.keyMap[
+    uniqueKey
+  ] =
+    existing;
+
+
+  state.sourceMap[
+    sourceKey
+  ] =
+    existing;
+
+
+  existing.row =
+    row;
+
+
+  return result;
+
+}
+
+
+function ggFindTransactionRowNumberByUnique_(
+  sheet,
+  headers,
+  uniqueKey
+) {
+
+  if (
+    !Object.prototype
+      .hasOwnProperty.call(
+        headers,
+        'Unique Key'
+      )
+  ) {
+
+    return 0;
+
+  }
+
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  if (
+    lastRow <
+    GG_CFG.DATA_START_ROW
+  ) {
+
+    return 0;
+
+  }
+
+
+  const col =
+    headers[
+      'Unique Key'
+    ] + 1;
+
+
+  const values =
+    sheet
+      .getRange(
+        GG_CFG.DATA_START_ROW,
+        col,
+        lastRow -
+          GG_CFG.DATA_START_ROW +
+          1,
+        1
+      )
+      .getValues();
+
+
+  for (
+    let i =
+      values.length -
+      1;
+    i >= 0;
+    i--
+  ) {
+
+    if (
+      ggString_(
+        values[
+          i
+        ][0]
+      ) ===
+      uniqueKey
+    ) {
+
+      return GG_CFG.DATA_START_ROW + i;
+
+    }
+
+  }
+
+
+  return 0;
 
 }
 

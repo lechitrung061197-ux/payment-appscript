@@ -56,11 +56,28 @@ const CUST_CFG = Object.freeze({
   DATA_START_ROW: 3,
   BUSINESS_TIMEZONE: 'America/New_York',
   EPSILON: 0.005,
+  /* Apps Script kills an execution at 6 minutes; anything older is dead. */
+  STALE_CREATING_MINUTES: 15,
   PREVIEW_PROP: 'CUSTOMER_INVOICE_PREVIEW_V5_CONVERSION_TRANSFER_LATE_REFUND'
 });
 
+/*********************** LOCK ************************/
+function custWithMutationLock_(label, fn) {
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(label, fn);
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 /*********************** PUBLIC ************************/
-function syncCustomers() { return syncCustomers_(); }
+function syncCustomers() { return custWithMutationLock_('syncCustomers', syncCustomers_); }
 function runCustomerControl() {
   const ss = SpreadsheetApp.getActive();
   const sh = custRequireSheet_(ss, CUST_CFG.CONTROL_SHEET);
@@ -225,11 +242,28 @@ function syncCustomers_() {
   custAssertSingleCurrencyPerCustomer_(ledgerRecords);
 
   /*
+   * A settlement still CREATING after the Apps Script execution limit is a dead
+   * execution whose catch block never ran. Fail it BEFORE anything reads
+   * settlement state, so the rest of this sync sees an honest status.
+   */
+  custFailStaleCreatingSettlements_(ss, now);
+
+  /* Runs right after the sweep so settlements just failed above are covered. */
+  custCancelOrphanDraftPayouts_(ss, now);
+
+  /*
+   * Must run after the sweep too: a FAILED settlement is not invoiced history
+   * and must not block a prefix from moving.
+   */
+  custAssertNoReassignedPrefixes_(ss, ledgerRecords);
+
+  /*
    * Settlement Items are read BEFORE rebuilding allocations so an already
    * invoiced sale can keep its historical allocation even if a later PayPal
    * refund reduces the current sale Net Amount.
    */
   const lateRefundState = custBuildLateRefundState_(ss, ledgerRecords);
+  const settlementStatusByKey = custBuildSettlementStatusMap_(ss);
 
   const txRows = custReadTransactionRows_(shTx, hTx);
   const oldAlloc = custReadExistingAllocationState_(shAlloc, hAlloc);
@@ -239,6 +273,7 @@ function syncCustomers_() {
     txRows,
     oldAlloc,
     lateRefundState,
+    settlementStatusByKey,
     now
   );
 
@@ -251,12 +286,20 @@ function syncCustomers_() {
 
   SpreadsheetApp.flush();
   const refundCarry = custRound2_(Object.keys(lateRefundState).reduce((sum,k)=>sum+custNum_(lateRefundState[k].outstanding),0));
+  /*
+   * Real money from a real customer whose prefix is not in the Customers sheet.
+   * It correctly still consumes FIFO pool capacity, so nobody else's numbers
+   * are inflated -- but without this it stays completely invisible.
+   */
+  const orphans = custSummarizeUnattributedSales_(ledgerBuild.allSourceRecords);
   SpreadsheetApp.getActive().toast(
     'CUSTOMER V2.2 OK · ' + ledgerRecords.length + ' ledger · ' + allocations.length + ' alloc' +
-    (refundCarry > CUST_CFG.EPSILON ? ' · refund carry ' + refundCarry.toFixed(2) : ''),
+    (refundCarry > CUST_CFG.EPSILON ? ' · refund carry ' + refundCarry.toFixed(2) : '') +
+    (orphans.count ? ' · ' + orphans.count + ' UNATTRIBUTED ' + orphans.total.toFixed(2) : ''),
     'Customer V2.2', 6
   );
-  return {customers: customerState.customers.length, ledgerRows: ledgerRecords.length, allocations: allocations.length, lateRefundOutstanding: refundCarry};
+  return {customers: customerState.customers.length, ledgerRows: ledgerRecords.length, allocations: allocations.length, lateRefundOutstanding: refundCarry,
+    unattributedSales: orphans.count, unattributedAmount: orphans.total};
 }
 
 /*********************** CUSTOMER MASTER ************************/
@@ -468,13 +511,83 @@ function custReadExistingAllocationState_(sheet,h){
  * appeared after invoicing. LATE_REFUND_ADJUSTMENT Settlement Items are the
  * immutable consumption history for that delta.
  */
+/*
+ * Sales whose prefix resolves to no customer. custBuildCustomerLedger_ drops
+ * them from the ledger but keeps them in allSourceRecords, which is what makes
+ * them consume FIFO capacity correctly; this only counts them so the silence
+ * ends.
+ */
+function custSummarizeUnattributedSales_(allSourceRecords){
+  const rows=(allSourceRecords||[]).filter(r=>!custCanonicalKey_(r.customerKey)&&custNum_(r.netAmount)>CUST_CFG.EPSILON);
+  return {
+    count:rows.length,
+    total:custRound2_(rows.reduce((sum,r)=>sum+custNum_(r.netAmount),0)),
+    rows:rows
+  };
+}
+
+/*
+ * A settled sale belongs to the customer named on the settlement, and a
+ * settlement can never be rewritten. So once a prefix has appeared on a real
+ * invoice, moving it to another customer cannot be reconciled: the allocation
+ * would follow the new owner while the invoice keeps the old one, and the two
+ * customers' summaries would silently split apart -- ledger totals landing on
+ * one and invoiced totals on the other.
+ *
+ * Reassignment is always a human action, so refusing it right away is both
+ * correct and actionable: undo the Prefixes cell, or plan a real migration.
+ * A prefix with no invoiced history moves freely.
+ */
+function custAssertNoReassignedPrefixes_(ss, ledgerRecords){
+  const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
+  const shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), hi=custHeaderMap_(shItems);
+  if(!hi['Customer Ledger Key']||!hi['Customer Key'])return;
+
+  const effective={};
+  custReadRowsObjects_(shSet,hs).forEach(s=>{
+    const key=custStr_(s['Settlement Key']);
+    if(key&&custIsEffectiveSettlementStatus_(s['Status']))effective[key]=true;
+  });
+
+  /* Historical owner per sale, taken from the immutable invoice detail. */
+  const ownerByLedger={};
+  custReadRowsObjects_(shItems,hi).forEach(it=>{
+    if(!effective[custStr_(it['Settlement Key'])])return;
+    const lk=custStr_(it['Customer Ledger Key']); if(!lk)return;
+    const owner=custCanonicalKey_(it['Customer Key']); if(!owner)return;
+    if(!ownerByLedger[lk])ownerByLedger[lk]={customerKey:owner,prefix:custCanonicalPrefix_(it['Invoice Prefix']),invoices:[]};
+    const inv=custStr_(it['Invoice Number']);
+    if(inv&&ownerByLedger[lk].invoices.indexOf(inv)===-1)ownerByLedger[lk].invoices.push(inv);
+  });
+
+  const conflicts={};
+  ledgerRecords.forEach(r=>{
+    const past=ownerByLedger[r.ledgerKey]; if(!past)return;
+    const nowKey=custCanonicalKey_(r.customerKey);
+    if(!nowKey||nowKey===past.customerKey)return;
+    const prefix=custCanonicalPrefix_(r.invoicePrefix)||past.prefix||'(no prefix)';
+    const k=prefix+'|'+past.customerKey+'|'+nowKey;
+    if(!conflicts[k])conflicts[k]={prefix,from:past.customerKey,to:nowKey,invoices:[]};
+    past.invoices.forEach(inv=>{if(conflicts[k].invoices.indexOf(inv)===-1)conflicts[k].invoices.push(inv);});
+  });
+
+  const keys=Object.keys(conflicts);
+  if(!keys.length)return;
+  const lines=keys.slice(0,5).map(k=>{
+    const c=conflicts[k];
+    return c.prefix+': '+c.from+' -> '+c.to+(c.invoices.length?' (invoiced in '+c.invoices.slice(0,4).join(', ')+')':'');
+  });
+  throw new Error('PREFIX REASSIGNED WITH INVOICED HISTORY · '+lines.join(' · ')+
+    (keys.length>5?' · +'+(keys.length-5)+' more':''));
+}
+
 function custBuildLateRefundState_(ss, ledgerRows){
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
   const shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), hi=custHeaderMap_(shItems);
   const sets=custReadRowsObjects_(shSet,hs), items=custReadRowsObjects_(shItems,hi);
   const active={};
   sets.forEach(s=>{
-    const key=custStr_(s['Settlement Key']); if(!key||custUpper_(s['Status'])==='CANCELLED')return;
+    const key=custStr_(s['Settlement Key']); if(!key||!custIsEffectiveSettlementStatus_(s['Status']))return;
     active[key]={issuedAt:custDate_(s['Issued At']||s['Created At'])};
   });
 
@@ -609,14 +722,26 @@ function custBuildEligibleLateRefundAdjustments_(ss,customer,ledgerByKey,lateSta
 }
 
 /*********************** PHASE 2: PAYPAL -> GREY ************************/
-function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, oldState, lateRefundState, now){
+function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, oldState, lateRefundState, settlementStatusByKey, now){
   const ledgerByTx={}; ledgerRecords.forEach(r=>ledgerByTx[custPaypalTxIndexKey_(r.paypalAccountKey,r.paypalTransactionId)]=r);
   const txByKey={}; txRows.forEach(t=>txByKey[t.transactionKey]=t);
+  const statusByKey=settlementStatusByKey||{};
+
+  /*
+   * An allocation is financially locked only while the settlement holding it is
+   * a real invoice. A CREATING settlement is an unfinished create and a FAILED
+   * one never happened, so neither may keep customer money reserved. Deriving
+   * the lock instead of storing it is what lets a killed create self-heal on
+   * the next sync without a resume path.
+   */
+  const isLockedByOld=function(o){
+    return !!(o&&custStr_(o.settlementKey)&&custIsEffectiveSettlementStatus_(statusByKey[custStr_(o.settlementKey)]));
+  };
 
   /* Historical invoiced allocations are a floor and can never shrink. */
   const lockedByLedger={};
   Object.keys(oldState).forEach(k=>{
-    const o=oldState[k]; if(!o.settlementKey||!o.customerLedgerKey)return;
+    const o=oldState[k]; if(!isLockedByOld(o)||!o.customerLedgerKey)return;
     lockedByLedger[o.customerLedgerKey]=custRound2_((lockedByLedger[o.customerLedgerKey]||0)+custNum_(o.allocatedAmount));
   });
 
@@ -667,14 +792,20 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
       const ledger=ledgerByTx[custPaypalTxIndexKey_(src.accountKey,src.transactionId)]||null;
       if(ledger){
         const key='CA|'+w.transactionKey+'|'+ledger.ledgerKey; const old=oldState[key]||null;
-        const locked=!!(old&&old.settlementKey);
+        const locked=isLockedByOld(old);
+        /* Pointed at a settlement that is no longer a real invoice: give the money back. */
+        const releasedFrom=(old&&custStr_(old.settlementKey)&&!locked)?custStr_(old.settlementKey):'';
         if(locked&&Math.abs(old.allocatedAmount-take)>0.01)throw new Error('LOCKED ALLOCATION CHANGED: '+key);
 
         const computedFee=match.available&&gross>CUST_CFG.EPSILON?custRound2_(receivingFeeTotal*take/gross):0;
         const computedAvailable=match.available?Math.max(0,custRound2_(take-computedFee)):0;
         const receiveFee=locked?custNum_(old.receivingFeeAllocated):computedFee;
         const available=locked?custNum_(old.availableAmount):computedAvailable;
-        const invoiced=old?Math.min(available,Math.max(0,custNum_(old.invoicedAmount))):0;
+        const invoiced=(old&&!releasedFrom)?Math.min(available,Math.max(0,custNum_(old.invoicedAmount))):0;
+
+        const notes=[];
+        if(locked&&lateRefundState[ledger.ledgerKey]&&lateRefundState[ledger.ledgerKey].totalLate>CUST_CFG.EPSILON)notes.push('LOCKED · LATE REFUND HANDLED BY ADJUSTMENT');
+        if(releasedFrom)notes.push('RELEASED FROM '+releasedFrom+' ('+(custUpper_(statusByKey[releasedFrom])||'MISSING')+')');
 
         out.push({
           allocationKey:key, allocationDate:w.transactionDate, customerKey:ledger.customerKey, customerLedgerKey:ledger.ledgerKey,
@@ -691,8 +822,8 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
           availableDate:locked?(old.availableDate||match.date):(match.available?match.date:null),
           allocationStatus:locked?(custUpper_(old.allocationStatus)||'AVAILABLE'):match.status,
           invoicedAmount:custRound2_(invoiced), remainingAvailable:custRound2_(Math.max(0,available-invoiced)),
-          settlementKey:old?old.settlementKey:'', sourceUniqueKey:w.uniqueKey, lastSync:now,
-          note:locked&&lateRefundState[ledger.ledgerKey]&&lateRefundState[ledger.ledgerKey].totalLate>CUST_CFG.EPSILON?'LOCKED · LATE REFUND HANDLED BY ADJUSTMENT':''
+          settlementKey:(old&&!releasedFrom)?old.settlementKey:'', sourceUniqueKey:w.uniqueKey, lastSync:now,
+          note:notes.join(' | ')
         });
         generated[key]=true;
       }
@@ -700,7 +831,8 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
       if(item.remaining<=CUST_CFG.EPSILON)pool._cursor=idx+1;
     }
   });
-  Object.keys(oldState).forEach(k=>{if(oldState[k].settlementKey&&!generated[k])throw new Error('LOCKED ALLOCATION DISAPPEARED: '+k);});
+  /* Only a real invoice may forbid an allocation from disappearing. */
+  Object.keys(oldState).forEach(k=>{if(isLockedByOld(oldState[k])&&!generated[k])throw new Error('LOCKED ALLOCATION DISAPPEARED: '+k);});
   out.sort(custSortDateDesc_('paypalWithdrawalDate','allocationKey'));
   return out;
 }
@@ -722,21 +854,21 @@ function custDescribeReceivingMatch_(w,tx){
    * Current proven Grey route remains explicitly accepted:
    *   PAYPAL_WITHDRAWAL ARRIVED -> GREY / GREY_FUNDING
    */
-  const isProvenGreyMatch = !!(
-    w.reconcileStatus==='ARRIVED' &&
-    tx &&
-    tx.provider==='GREY' &&
-    tx.type==='GREY_FUNDING'
-  );
-
-  const isGenericReceivingMatch = !!(
+  /*
+   * Provider-agnostic on purpose: any reconciled non-PayPal receiving
+   * transaction counts, which covers the proven Grey route
+   * (PAYPAL_WITHDRAWAL ARRIVED -> GREY / GREY_FUNDING) without naming it.
+   * A separate GREY branch used to sit here; it was a strict subset of this
+   * condition and could never be the deciding one.
+   */
+  const isReceivingMatch = !!(
     w.reconcileStatus==='ARRIVED' &&
     tx &&
     tx.provider &&
     tx.provider!=='PAYPAL'
   );
 
-  if(isProvenGreyMatch || isGenericReceivingMatch){
+  if(isReceivingMatch){
     return {
       available:true,
       status:'AVAILABLE',
@@ -769,6 +901,21 @@ function custGetReceivingTransactionFee_(tx){
   const f=Math.abs(custNum_(tx.feeAmount));
   if(f>CUST_CFG.EPSILON)return custRound2_(f);
   return custRound2_(Math.max(0,Math.abs(custNum_(tx.grossAmount))-Math.abs(custNum_(tx.netAmount))));
+}
+
+function custIsEffectiveSettlementStatus_(status){
+  const s=custUpper_(status);
+  return s==='ISSUED'||s==='PARTIALLY_PAID'||s==='PAID';
+}
+
+function custBuildSettlementStatusMap_(ss){
+  const sh=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), h=custHeaderMap_(sh);
+  const out={};
+  custReadRowsObjects_(sh,h).forEach(r=>{
+    const key=custStr_(r['Settlement Key']);
+    if(key)out[key]=custUpper_(r['Status']);
+  });
+  return out;
 }
 /*********************** FINAL LEDGER V2 ************************/
 function custFinalizeFullLedger_(ledger, allocations, transfers){
@@ -820,6 +967,61 @@ function custWriteCustomerAllocations_(sheet,h,records){
   custFormatCols_(sheet,h,rows.length,['Allocation Date','PayPal Withdrawal Date','Available Date','Last Sync'],['Allocated Amount','Receiving Fee Allocated','Available Amount','Invoiced Amount','Remaining Available']);
 }
 /*********************** SETTLEMENT PAYMENT SYNC ************************/
+/*
+ * A CREATING settlement means an invoice create started and never finished.
+ * If it was killed by the execution limit its catch block never ran, so nothing
+ * marked it FAILED. Allocation locking is derived from settlement status, so
+ * the money is already released either way; this only keeps the sheet and the
+ * audit trail honest.
+ */
+function custFailStaleCreatingSettlements_(ss, now){
+  const sh=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), h=custHeaderMap_(sh);
+  if(!h['Status'])return 0;
+  const cutoff=custTime_(now)-CUST_CFG.STALE_CREATING_MINUTES*60*1000;
+  let failed=0;
+  custReadRowsObjects_(sh,h).forEach(s=>{
+    if(custUpper_(s['Status'])!=='CREATING')return;
+    const started=custDate_(s['Last Sync']||s['Created At']);
+    /* No usable timestamp means we cannot prove it is still running. */
+    if(started&&custTime_(started)>cutoff)return;
+    custSetCellByHeader_(sh,h,s._row,'Status','FAILED');
+    custSetCellByHeader_(sh,h,s._row,'Last Sync',now);
+    custSetCellByHeader_(sh,h,s._row,'Note',custAppendNote_(s['Note'],'CREATE ABANDONED: still CREATING after '+CUST_CFG.STALE_CREATING_MINUTES+' min'));
+    failed++;
+  });
+  return failed;
+}
+
+/*
+ * A DRAFT payout is only as real as the settlement that created it. When a
+ * create is killed by the execution limit its catch block never runs, so the
+ * payout is left behind looking like an ordinary pending payment -- and Flow
+ * moves real treasury money the moment someone sets it to PAID. Payout validity
+ * is derived from settlement status here for the same reason allocation locking
+ * is: nothing that only a catch block can undo is safe.
+ *
+ * Cancel, never delete: Flow.js owns the payout transaction and cleans it up on
+ * the next syncFlow() via its own CANCELLED branch.
+ */
+function custCancelOrphanDraftPayouts_(ss, now){
+  const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET);
+  custEnsureHeaders_(shPay,['Customer Key','Settlement Key']);
+  const hp=custHeaderMap_(shPay);
+  if(!hp['Settlement Key']||!hp['Status'])return 0;
+  const statusByKey=custBuildSettlementStatusMap_(ss);
+  let cancelled=0;
+  custReadRowsObjects_(shPay,hp).forEach(p=>{
+    /* A payout with no settlement is somebody's manual entry: never touch it. */
+    const sk=custStr_(p['Settlement Key']); if(!sk)return;
+    if(custUpper_(p['Status'])!=='DRAFT')return;
+    if(custIsEffectiveSettlementStatus_(statusByKey[sk]))return;
+    custSetCellByHeader_(shPay,hp,p._row,'Status','CANCELLED');
+    custSetCellByHeader_(shPay,hp,p._row,'Note',custAppendNote_(p['Note'],'CANCELLED: settlement '+sk+' is '+(custUpper_(statusByKey[sk])||'MISSING')+', not an issued invoice'));
+    cancelled++;
+  });
+  return cancelled;
+}
+
 function custSyncSettlementPayments_(ss, now){
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET);
   custEnsureHeaders_(shPay,['Customer Key','Settlement Key']);
@@ -827,14 +1029,29 @@ function custSyncSettlementPayments_(ss, now){
   const settlements=custReadRowsObjects_(shSet,hs), payouts=custReadRowsObjects_(shPay,hp);
   const paidBySet={};
   payouts.forEach(p=>{if(custUpper_(p['Status'])!=='PAID'||!custStr_(p['Settlement Key']))return; const k=custStr_(p['Settlement Key']); paidBySet[k]=(paidBySet[k]||0)+custNum_(p['Amount']);});
+  /*
+   * Only settlements whose payment state actually moved are written. This runs
+   * on every sync, so writing unconditionally made the cost grow with every
+   * invoice ever issued -- an invoice paid off months ago was still costing
+   * five cell writes per run.
+   *
+   * Consequence worth knowing: Settlement 'Last Sync' now means "last time this
+   * settlement's payment state changed", not "last time a sync ran".
+   */
+  let changed=0;
   settlements.forEach(s=>{
-    const key=custStr_(s['Settlement Key']); if(!key||custUpper_(s['Status'])==='CANCELLED')return;
+    const key=custStr_(s['Settlement Key']); if(!key||!custIsEffectiveSettlementStatus_(s['Status']))return;
     const due=custNum_(s['Amount Due']); const paid=custRound2_(Math.min(due,paidBySet[key]||0)); const bal=custRound2_(Math.max(0,due-paid));
     let status=custUpper_(s['Status'])||'ISSUED'; if(paid>CUST_CFG.EPSILON)status=bal<=CUST_CFG.EPSILON?'PAID':'PARTIALLY_PAID';
+    const needsPaidAt=status==='PAID'&&!s['Paid At'];
+    if(custAmountSame_(s['Amount Paid'],paid)&&custAmountSame_(s['Outstanding Payable'],bal)&&
+       custUpper_(s['Status'])===status&&!needsPaidAt)return;
     custSetCellByHeader_(shSet,hs,s._row,'Amount Paid',paid);custSetCellByHeader_(shSet,hs,s._row,'Outstanding Payable',bal);
     custSetCellByHeader_(shSet,hs,s._row,'Status',status);custSetCellByHeader_(shSet,hs,s._row,'Last Sync',now);
-    if(status==='PAID'&&!s['Paid At'])custSetCellByHeader_(shSet,hs,s._row,'Paid At',now);
+    if(needsPaidAt)custSetCellByHeader_(shSet,hs,s._row,'Paid At',now);
+    changed++;
   });
+  return changed;
 }
 
 /*********************** CUSTOMER SUMMARY ************************/
@@ -842,6 +1059,8 @@ function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundSt
   const sh=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET), h=custHeaderMap_(sh);
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet), sets=custReadRowsObjects_(shSet,hs);
   const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), hp=custHeaderMap_(shPay), payouts=custReadRowsObjects_(shPay,hp);
+  /* One read for the whole sheet, so the unchanged-check below stays cheap. */
+  const currentByRow={}; custReadRowsObjects_(sh,h).forEach(r=>currentByRow[r._row]=r);
   const byCustLedger={}, byCustAlloc={}, refundCarryByCustomer={};
   ledger.forEach(r=>(byCustLedger[r.customerKey]||(byCustLedger[r.customerKey]=[])).push(r));
   allocations.forEach(a=>(byCustAlloc[a.customerKey]||(byCustAlloc[a.customerKey]=[])).push(a));
@@ -866,9 +1085,21 @@ function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundSt
     const outstanding=custRound2_(Math.max(0,available-invoiced-refundCarry));
     const pending=custRound2_(Math.max(0,paypalTotal-matched));
     let lastSettlement=null,lastPayout=null;
-    sets.filter(s=>custCanonicalKey_(s['Customer Key'])===c.customerKey&&custUpper_(s['Status'])!=='CANCELLED').forEach(s=>{const d=custDate_(s['Issued At']||s['Created At']);if(d&&(!lastSettlement||d>lastSettlement))lastSettlement=d;});
+    sets.filter(s=>custCanonicalKey_(s['Customer Key'])===c.customerKey&&custIsEffectiveSettlementStatus_(s['Status'])).forEach(s=>{const d=custDate_(s['Issued At']||s['Created At']);if(d&&(!lastSettlement||d>lastSettlement))lastSettlement=d;});
     payouts.filter(p=>custCanonicalKey_(p['Customer Key'])===c.customerKey&&custUpper_(p['Status'])==='PAID').forEach(p=>{const d=custDate_(p['Paid At']||p['Payout Date']);if(d&&(!lastPayout||d>lastPayout))lastPayout=d;});
-    [['PayPal Total',paypalTotal],['Matched Amount',matched],['Available Amount',available],['Invoiced Amount',invoiced],['Outstanding Amount',outstanding],['Pending in PayPal',pending],['Last Settlement',lastSettlement||''],['Last Payout',lastPayout||''],['Last Sync',now],['Sync Status','OK · '+ll.length+' ledger · '+aa.length+' alloc'+(refundCarry>CUST_CFG.EPSILON?' · refund carry '+refundCarry.toFixed(2):'')]]
+    /*
+     * Skip customers whose numbers did not move. 'Last Sync' is excluded from
+     * the comparison -- it always differs, so including it would defeat the
+     * check and keep rewriting every customer on every run.
+     */
+    const syncStatus='OK · '+ll.length+' ledger · '+aa.length+' alloc'+(refundCarry>CUST_CFG.EPSILON?' · refund carry '+refundCarry.toFixed(2):'');
+    const cur=currentByRow[c.rowNumber]||{};
+    if(custAmountSame_(cur['PayPal Total'],paypalTotal)&&custAmountSame_(cur['Matched Amount'],matched)&&
+       custAmountSame_(cur['Available Amount'],available)&&custAmountSame_(cur['Invoiced Amount'],invoiced)&&
+       custAmountSame_(cur['Outstanding Amount'],outstanding)&&custAmountSame_(cur['Pending in PayPal'],pending)&&
+       custStr_(cur['Sync Status'])===syncStatus)return;
+
+    [['PayPal Total',paypalTotal],['Matched Amount',matched],['Available Amount',available],['Invoiced Amount',invoiced],['Outstanding Amount',outstanding],['Pending in PayPal',pending],['Last Settlement',lastSettlement||''],['Last Payout',lastPayout||''],['Last Sync',now],['Sync Status',syncStatus]]
       .forEach(([k,v])=>custSetCellByHeader_(sh,h,c.rowNumber,k,v));
   });
 }
@@ -936,6 +1167,13 @@ function custCalculateDownstreamPricing_(baseAmount,rule){
 
 /*********************** CONTROL / STATEMENT ************************/
 function previewCustomerStatementFromControl(){
+  return custWithMutationLock_(
+    'previewCustomerStatementFromControl',
+    previewCustomerStatementFromControlCore_
+  );
+}
+
+function previewCustomerStatementFromControlCore_(){
   const ss=SpreadsheetApp.getActive(); syncCustomers_();
   const params=custReadControlParams_(ss), customer=custGetCustomerByKey_(ss,params.customerKey);
   custFillControlCustomerConfig_(ss,customer); custClearControlPreview_(ss);
@@ -958,12 +1196,28 @@ function previewCustomerStatementFromControl(){
 
 /*********************** INVOICE PREVIEW ************************/
 function previewCustomerInvoiceFromControl(){
+  return custWithMutationLock_(
+    'previewCustomerInvoiceFromControl',
+    previewCustomerInvoiceFromControlCore_
+  );
+}
+
+function previewCustomerInvoiceFromControlCore_(){
   const ss=SpreadsheetApp.getActive(); syncCustomers_(); const preview=custBuildInvoicePreview_(ss,true); custRenderInvoicePreview_(ss,preview);
   PropertiesService.getDocumentProperties().setProperty(CUST_CFG.PREVIEW_PROP, JSON.stringify({fingerprint:preview.fingerprint,customerKey:preview.customer.customerKey,from:preview.params.fromKey,to:preview.params.toKey,asOf:preview.params.asOfKey}));
   return preview;
 }
-function custBuildInvoicePreview_(ss, requireEligible){
-  const params=custReadControlParams_(ss), customer=custGetCustomerByKey_(ss,params.customerKey);
+
+function previewCustomerInvoice(params){
+  return custWithMutationLock_('previewCustomerInvoice', function(){
+    const ss=SpreadsheetApp.getActive();
+    syncCustomers_();
+    return custBuildInvoicePreview_(ss,true,custNormalizeInvoiceParams_(ss,params));
+  });
+}
+
+function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
+  const params=explicitParams||custReadControlParams_(ss), customer=custGetCustomerByKey_(ss,params.customerKey);
   if(customer.status==='DISABLED')throw new Error('Customer is DISABLED.');
   if(!customer.defaultPayoutProvider||!customer.defaultPayoutAccountKey)throw new Error('Customer Default Payout Provider / Default Payout Account Key is required.');
 
@@ -978,7 +1232,15 @@ function custBuildInvoicePreview_(ss, requireEligible){
     const l=ledgerByKey[custStr_(a['Customer Ledger Key'])]; if(!l)return false;
     const k=custBusinessDateKey_(custDate_(l['Transaction Date'])); return !!k&&k<=params.toKey;
   });
-  if(requireEligible&&!selected.length)throw new Error('No eligible uninvoiced AVAILABLE funds through '+params.toDisplay+'.');
+  /*
+   * "No eligible funds" reads like the money vanished, when the usual cause is
+   * that it is already locked into an invoice for this very period. Say so.
+   */
+  if(requireEligible&&!selected.length){
+    const covered=custFindEffectiveSettlementForPeriod_(ss,customer.customerKey,params.toKey);
+    throw new Error('No eligible uninvoiced AVAILABLE funds through '+params.toDisplay+'.'+
+      (covered?' Invoice '+covered+' already covers this period.':''));
+  }
 
   const providers=[...new Set(selected.map(a=>custUpper_(a['Receiving Provider'])).filter(Boolean))];
   if(providers.length>1)throw new Error('Mixed receiving providers in one invoice are not enabled yet: '+providers.join(', '));
@@ -1135,21 +1397,107 @@ function custRenderInvoicePreview_(ss,p){
 
 /*********************** CREATE INVOICE ************************/
 function createCustomerInvoiceFromControl(){
-  const ss=SpreadsheetApp.getActive(); syncCustomers_(); const p=custBuildInvoicePreview_(ss,true);
+  return custWithMutationLock_(
+    'createCustomerInvoiceFromControl',
+    createCustomerInvoiceFromControlCore_
+  );
+}
+
+function createCustomerInvoiceFromControlCore_(){
+  const ss=SpreadsheetApp.getActive(); syncCustomers_();
   const savedRaw=PropertiesService.getDocumentProperties().getProperty(CUST_CFG.PREVIEW_PROP); if(!savedRaw)throw new Error('Run INVOICE PREVIEW first.');
-  const saved=JSON.parse(savedRaw); if(saved.fingerprint!==p.fingerprint)throw new Error('Source data changed. Run INVOICE PREVIEW again.');
+  const saved=JSON.parse(savedRaw);
+  /*
+   * No resume path. A failed create rolls back, and a create killed mid-flight
+   * leaves a non-effective settlement whose allocations are released by the
+   * next sync. Either way the money is visible again, so plain
+   * preview -> create is the recovery path for both UI and AI.
+   */
+  let p;
+  try{
+    p=custBuildInvoicePreview_(ss,true);
+  }catch(err){
+    /*
+     * A create killed during its final refresh leaves a correct invoice behind
+     * with the preview still saved, so pressing CREATE again reports the money
+     * as gone. A fingerprint match proves this exact preview already became
+     * that exact invoice; report it instead of alarming the user. This reads
+     * only -- it never promotes a status or creates a payout.
+     */
+    const already=custFindAlreadyCreatedInvoice_(ss,saved.fingerprint);
+    if(already)return already;
+    throw err;
+  }
+  if(saved.fingerprint!==p.fingerprint)throw new Error('Source data changed. Run INVOICE PREVIEW again.');
+  return custCreateCustomerInvoicePrepared_(ss,p,true);
+}
+
+function custFindAlreadyCreatedInvoice_(ss,fingerprint){
+  if(!fingerprint)return null;
+  const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
+  const settlement=custFindSettlementByFingerprint_(shSet,hs,fingerprint);
+  /* CREATING or FAILED is a genuine problem: let the original error through. */
+  if(!settlement||!custIsEffectiveSettlementStatus_(settlement['Status']))return null;
+
+  const settlementKey=custStr_(settlement['Settlement Key']);
+  const invoiceNumber=custStr_(settlement['Invoice Number']);
+  const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET);
+  custEnsureHeaders_(shPay,['Customer Key','Settlement Key']);
+  const payoutKey=custFindPayoutKeyBySettlement_(shPay,custHeaderMap_(shPay),settlementKey);
+
+  PropertiesService.getDocumentProperties().deleteProperty(CUST_CFG.PREVIEW_PROP);
+  try{custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET).getRange('E22').setValue('ALREADY CREATED · '+invoiceNumber);}catch(_){}
+  try{SpreadsheetApp.getActive().toast(invoiceNumber+' was already created from this preview.','Customer Invoice V2.3',7);}catch(_){}
+  return {settlementKey,invoiceNumber,payoutKey,transactionKey:'',existing:true};
+}
+
+function createCustomerInvoice(params){
+  return custWithMutationLock_('createCustomerInvoice', function(){
+    const ss=SpreadsheetApp.getActive();
+    syncCustomers_();
+    const p=custBuildInvoicePreview_(ss,true,custNormalizeInvoiceParams_(ss,params));
+    return custCreateCustomerInvoicePrepared_(ss,p,false);
+  });
+}
+
+function custCreateCustomerInvoicePrepared_(ss,p,writeControlStatus){
   const now=new Date();
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), shAlloc=custRequireSheet_(ss,CUST_CFG.ALLOCATION_SHEET), shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), shTx=custRequireSheet_(ss,CUST_CFG.TRANSACTION_SHEET);
   custEnsureHeaders_(shPay,['Customer Key','Settlement Key']);
+  custEnsureHeaders_(shSet,['Preview Fingerprint']);
   const hs=custHeaderMap_(shSet), hi=custHeaderMap_(shItems), ha=custHeaderMap_(shAlloc), hp=custHeaderMap_(shPay), htx=custHeaderMap_(shTx);
-  const settlementKey=custNextKey_(shSet,hs,'Settlement Key','SET-',6), invoiceNumber=custNextKey_(shSet,hs,'Invoice Number','INV-',6);
+  const existingSettlement=custFindSettlementByFingerprint_(shSet,hs,p.fingerprint);
+  const existingStatus=existingSettlement?custUpper_(existingSettlement['Status']):'';
+  if(existingSettlement&&custIsEffectiveSettlementStatus_(existingStatus)){
+    return {settlementKey:custStr_(existingSettlement['Settlement Key']),invoiceNumber:custStr_(existingSettlement['Invoice Number']),payoutKey:custFindPayoutKeyBySettlement_(shPay,hp,custStr_(existingSettlement['Settlement Key'])),transactionKey:custStr_(existingSettlement['Transaction Key']||''),existing:true};
+  }
+  const settlementKey=existingSettlement?custStr_(existingSettlement['Settlement Key']):custNextKey_(shSet,hs,'Settlement Key','SET-',6);
+  const invoiceNumber=existingSettlement?custStr_(existingSettlement['Invoice Number']):custNextKey_(shSet,hs,'Invoice Number','INV-',6);
 
   const notes=[];
+  /*
+   * Reusing a settlement row overwrites its Note, so carry the failure history
+   * across: a retry of a failed create is exactly when that history matters.
+   */
+  custStr_(existingSettlement&&existingSettlement['Note']).split('|')
+    .map(x=>x.trim()).filter(x=>/^CREATE (FAILED|ABANDONED)/.test(x))
+    .forEach(x=>notes.push(x));
   if(p.carryForwardAmount>CUST_CFG.EPSILON)notes.push('Includes prior eligible carry-forward: '+p.carryForwardAmount.toFixed(2)+' '+p.sourceCurrency);
   if(p.lateRefundApplied>CUST_CFG.EPSILON)notes.push('Late refund adjustment applied: '+p.lateRefundApplied.toFixed(2)+' '+p.sourceCurrency);
   if(p.lateRefundCarryForward>CUST_CFG.EPSILON)notes.push('Late refund balance carried forward: '+p.lateRefundCarryForward.toFixed(2)+' '+p.sourceCurrency);
 
-  custAppendObjectRow_(shSet,hs,{
+  let payoutKey='', txKey='';
+  /*
+   * Rollback state. Best effort only: an execution killed by the Apps Script
+   * time limit never reaches the catch block. The real safety net is that
+   * allocation locking is derived from settlement status, so a settlement left
+   * at CREATING releases its money on the next sync regardless.
+   */
+  const allocSnapshots=[];
+  let payoutStaged=false;
+
+  try{
+  const settlementObj={
     'Settlement Key':settlementKey,'Invoice Number':invoiceNumber,'Customer Key':p.customer.customerKey,'Customer Name':p.customer.customerName,
     'Period From':p.params.fromDateValue,'Period To':p.params.toDateValue,'Gross Sales':p.grossSales,'Refunds':p.refunds,'PayPal Fees':p.paypalFees,'Receiving Fees':p.receivingFees,
     'Available Amount':p.availableAmount,
@@ -1159,38 +1507,166 @@ function createCustomerInvoiceFromControl(){
     'Payout Fee %':p.payoutFeeRate,'Payout Fee Amount':p.payoutFeeAmount,'Amount Due':p.amountDue,'Amount Paid':0,'Outstanding Payable':p.amountDue,'Currency':p.sourceCurrency,
     'PayPal Total Snapshot':p.paypalTotalSnapshot,'Matched Snapshot':p.matchedSnapshot,'Available Snapshot':p.availableSnapshot,'Invoiced Snapshot':p.invoicedSnapshot,'Outstanding Snapshot':p.outstandingSnapshot,
     'Fee Rule Key':p.feeRule.ruleKey,'Payout Provider':p.customer.defaultPayoutProvider,'Payout Account Key':p.customer.defaultPayoutAccountKey,'Payout Currency':p.payoutCurrency,
-    'Status':'ISSUED','Created At':now,'Issued At':now,'Paid At':'','Last Sync':now,'PDF File ID':'','PDF URL':'','PDF Generated At':'','Note':notes.join(' | ')
-  });
+    'Status':'CREATING','Created At':existingSettlement?(existingSettlement['Created At']||now):now,'Issued At':'','Paid At':'','Last Sync':now,'PDF File ID':existingSettlement?(existingSettlement['PDF File ID']||''):'','PDF URL':existingSettlement?(existingSettlement['PDF URL']||''):'','PDF Generated At':existingSettlement?(existingSettlement['PDF Generated At']||''):'','Preview Fingerprint':p.fingerprint,'Note':notes.join(' | ')
+  };
+  if(existingSettlement)custWriteObjectToRow_(shSet,hs,existingSettlement._row,settlementObj);else custAppendObjectRow_(shSet,hs,settlementObj);
 
-  p.items.forEach((it,idx)=>custAppendObjectRow_(shItems,hi,{
+  custClearSettlementItems_(shItems,hi,settlementKey);
+
+  custAppendObjectRows_(shItems,hi,p.items.map((it,idx)=>({
     'Settlement Item Key':settlementKey+'|SI|'+String(idx+1).padStart(4,'0'),'Settlement Key':settlementKey,'Invoice Number':invoiceNumber,'Customer Key':p.customer.customerKey,'Line Type':it.lineType||'SALE',
     'Transaction Date':it.transactionDate,'PayPal Account Key':it.paypalAccountKey,'PayPal Transaction ID':it.paypalTransactionId,'Reference ID':it.referenceId,'Invoice ID':it.invoiceId,'Invoice Prefix':it.invoicePrefix,'Item':it.item,'Buyer Name':it.buyerName,
     'Gross Amount':it.grossAmount,'PayPal Fee':it.paypalFee,'Refund Amount':it.refundAmount,'PayPal Net Amount':it.paypalNetAmount,'Receiving Fee Allocated':it.receivingFeeAllocated,'Available Amount':it.availableAmount,'Amount Included':it.amountIncluded,'Currency':it.currency,
     'Customer Ledger Key':it.ledgerKey,'Customer Allocation Key':(it.allocationKeys||[]).join(', '),'Source Unique Key':it.sourceUniqueKey,'Created At':now,'Note':it.note||''
-  }));
+  })));
 
   /* Positive AVAILABLE allocations are consumed even when refund makes Amount Due = 0. */
   const allocRows=custReadRowsObjects_(shAlloc,ha), rowByKey={}; allocRows.forEach(r=>rowByKey[custStr_(r['Allocation Key'])]=r);
+  const allocPatch=[];
   p.allocations.forEach(a=>{
     const key=custStr_(a['Allocation Key']), r=rowByKey[key]; if(!r)throw new Error('Allocation row disappeared: '+key);
     const available=custNum_(r['Available Amount']), already=custNum_(r['Invoiced Amount']), remaining=custNum_(r['Remaining Available']);
     const newInvoiced=custRound2_(Math.min(available,already+remaining));
-    custSetCellByHeader_(shAlloc,ha,r._row,'Invoiced Amount',newInvoiced);custSetCellByHeader_(shAlloc,ha,r._row,'Remaining Available',0);custSetCellByHeader_(shAlloc,ha,r._row,'Settlement Key',settlementKey);
+    /* Snapshot before the first write so a failure can hand the money back. */
+    allocSnapshots.push({row:r._row,invoicedAmount:already,remainingAvailable:remaining,settlementKey:custStr_(r['Settlement Key'])});
+    allocPatch.push({row:r._row,'Invoiced Amount':newInvoiced,'Remaining Available':0,'Settlement Key':settlementKey});
   });
+  /* Three column writes instead of three per allocation. */
+  custPatchColumns_(shAlloc,ha,allocPatch,['Invoiced Amount','Remaining Available','Settlement Key']);
 
-  let payoutKey='', txKey='';
   if(p.amountDue>CUST_CFG.EPSILON){
-    payoutKey=custNextKey_(shPay,hp,'Payout Key','PO-',6); txKey='POTX|'+payoutKey;
-    custWritePayoutDraftRow_(ss,shPay,hp,{'Payout Key':payoutKey,'Payout Date':'','Provider':p.customer.defaultPayoutProvider,'Account Key':p.customer.defaultPayoutAccountKey,'Payee':p.customer.customerName,'Category':'CUSTOMER_PAYOUT','Amount':p.amountDue,'Fee':0,'Total Deducted':p.amountDue,'Currency':p.payoutCurrency,'Reference':invoiceNumber,'Status':'DRAFT','Validation':'DRAFT','Transaction Key':txKey,'Created At':now,'Paid At':'','Note':'Auto-created from '+invoiceNumber,'Customer Key':p.customer.customerKey,'Settlement Key':settlementKey});
+    const existingPayout=custFindPayoutBySettlement_(shPay,hp,settlementKey);
+    payoutKey=existingPayout?custStr_(existingPayout['Payout Key']):custNextKey_(shPay,hp,'Payout Key','PO-',6); txKey='POTX|'+payoutKey; payoutStaged=true;
+    const payoutObj={'Payout Key':payoutKey,'Payout Date':'','Provider':p.customer.defaultPayoutProvider,'Account Key':p.customer.defaultPayoutAccountKey,'Payee':p.customer.customerName,'Category':'CUSTOMER_PAYOUT','Amount':p.amountDue,'Fee':0,'Total Deducted':p.amountDue,'Currency':p.payoutCurrency,'Reference':invoiceNumber,'Status':'DRAFT','Validation':'DRAFT','Transaction Key':txKey,'Created At':existingPayout?(existingPayout['Created At']||now):now,'Paid At':'','Note':'Auto-created from '+invoiceNumber,'Customer Key':p.customer.customerKey,'Settlement Key':settlementKey};
+    if(existingPayout){custWriteObjectToRow_(shPay,hp,existingPayout._row,payoutObj);custEnsurePayoutRowValidations_(ss,shPay,hp,existingPayout._row,p.customer.defaultPayoutProvider);}else custWritePayoutDraftRow_(ss,shPay,hp,payoutObj);
     custUpsertDraftPayoutTransaction_(shTx,htx,{transactionKey:txKey,provider:p.customer.defaultPayoutProvider,accountKey:p.customer.defaultPayoutAccountKey,amount:p.amountDue,currency:p.payoutCurrency,reference:invoiceNumber,payoutKey,now});
   }
 
+  const issuedRow=custFindSettlementByKey_(shSet,hs,settlementKey);
+  if(issuedRow){
+    custSetCellByHeader_(shSet,hs,issuedRow._row,'Status','ISSUED');
+    custSetCellByHeader_(shSet,hs,issuedRow._row,'Issued At',now);
+    custSetCellByHeader_(shSet,hs,issuedRow._row,'Last Sync',now);
+  }
+  }catch(err){
+    const reason=(err&&err.message?err.message:String(err));
+    const failedAt=new Date();
+    const rollbackIssues=[];
+
+    /*
+     * Undo in reverse order of damage: give the money back first, then drop the
+     * invoice detail, then void the payout. Every step is guarded so one broken
+     * step cannot hide the original error.
+     */
+    /*
+     * Batched on purpose: a rollback runs while something is already going
+     * wrong, possibly close to the execution limit. Three column writes finish
+     * where three-per-allocation might not.
+     */
+    try{
+      custPatchColumns_(shAlloc,ha,allocSnapshots.map(s=>({
+        row:s.row,
+        'Invoiced Amount':s.invoicedAmount,
+        'Remaining Available':s.remainingAvailable,
+        'Settlement Key':s.settlementKey
+      })),['Invoiced Amount','Remaining Available','Settlement Key']);
+    }catch(e){rollbackIssues.push('allocations ('+allocSnapshots.length+' rows)');}
+
+    try{custClearSettlementItems_(shItems,hi,settlementKey);}catch(e){rollbackIssues.push('settlement items');}
+
+    /*
+     * Cancel, never delete. Flow.js owns the payout transaction and already has
+     * a CANCELLED branch that cleans it up on the next syncFlow().
+     */
+    if(payoutStaged&&payoutKey){
+      try{
+        const stagedPayout=custFindPayoutBySettlement_(shPay,hp,settlementKey);
+        if(stagedPayout){
+          custSetCellByHeader_(shPay,hp,stagedPayout._row,'Status','CANCELLED');
+          custSetCellByHeader_(shPay,hp,stagedPayout._row,'Note',custAppendNote_(stagedPayout['Note'],'CANCELLED BY FAILED CREATE '+invoiceNumber));
+        }
+      }catch(e){rollbackIssues.push('payout '+payoutKey);}
+    }
+
+    try{
+      const failedRow=custFindSettlementByKey_(shSet,hs,settlementKey);
+      if(failedRow){
+        custSetCellByHeader_(shSet,hs,failedRow._row,'Status','FAILED');
+        custSetCellByHeader_(shSet,hs,failedRow._row,'Last Sync',failedAt);
+        custSetCellByHeader_(shSet,hs,failedRow._row,'Note',custAppendNote_(notes.join(' | '),'CREATE FAILED: '+reason+(rollbackIssues.length?' | ROLLBACK INCOMPLETE: '+rollbackIssues.join(', '):' | ROLLED BACK')));
+      }
+    }catch(e){/* Never let bookkeeping mask the original failure. */}
+
+    throw err;
+  }
+
+  /*
+   * The invoice is ISSUED from here on. Everything below is refresh and
+   * reporting, so it must sit outside the try: a failing sync must not roll
+   * back an invoice that was created correctly.
+   */
   PropertiesService.getDocumentProperties().deleteProperty(CUST_CFG.PREVIEW_PROP); syncCustomers_();
   const statusText=payoutKey?('CREATED · '+invoiceNumber+' · '+payoutKey):('CREATED · '+invoiceNumber+' · NO PAYOUT · REFUND CARRY '+p.lateRefundCarryForward.toFixed(2));
-  custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET).getRange('E22').setValue(statusText);
-  SpreadsheetApp.getActive().toast(payoutKey?(invoiceNumber+' created · '+payoutKey+' DRAFT'):(invoiceNumber+' created · Amount Due 0 · no payout'),'Customer Invoice V2.3',7);
+  if(writeControlStatus)custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET).getRange('E22').setValue(statusText);
+  try{SpreadsheetApp.getActive().toast(payoutKey?(invoiceNumber+' created · '+payoutKey+' DRAFT'):(invoiceNumber+' created · Amount Due 0 · no payout'),'Customer Invoice V2.3',7);}catch(_){}
   return {settlementKey,invoiceNumber,payoutKey,transactionKey:txKey,lateRefundApplied:p.lateRefundApplied,lateRefundCarryForward:p.lateRefundCarryForward};
 }
+
+/* Returns the Invoice Number of a real invoice already covering this period. */
+function custFindEffectiveSettlementForPeriod_(ss,customerKey,toKey){
+  try{
+    const sh=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), h=custHeaderMap_(sh);
+    if(!h['Period To']||!h['Customer Key'])return '';
+    const hit=custReadRowsObjects_(sh,h).find(s=>
+      custCanonicalKey_(s['Customer Key'])===custCanonicalKey_(customerKey)&&
+      custIsEffectiveSettlementStatus_(s['Status'])&&
+      custBusinessDateKey_(custDate_(s['Period To']))===toKey
+    );
+    return hit?custStr_(hit['Invoice Number']):'';
+  }catch(e){
+    /* A hint must never be the reason an error is lost. */
+    return '';
+  }
+}
+
+function custFindSettlementByFingerprint_(sheet,h,fingerprint){
+  if(!h['Preview Fingerprint'])return null;
+  const fp=custStr_(fingerprint);
+  if(!fp)return null;
+  return custReadRowsObjects_(sheet,h).find(r=>custStr_(r['Preview Fingerprint'])===fp)||null;
+}
+
+function custFindSettlementByKey_(sheet,h,key){
+  const k=custStr_(key);
+  if(!k)return null;
+  return custReadRowsObjects_(sheet,h).find(r=>custStr_(r['Settlement Key'])===k)||null;
+}
+
+function custFindPayoutBySettlement_(sheet,h,settlementKey){
+  if(!h['Settlement Key'])return null;
+  const k=custStr_(settlementKey);
+  if(!k)return null;
+  return custReadRowsObjects_(sheet,h).find(r=>custStr_(r['Settlement Key'])===k)||null;
+}
+
+function custFindPayoutKeyBySettlement_(sheet,h,settlementKey){
+  const row=custFindPayoutBySettlement_(sheet,h,settlementKey);
+  return row?custStr_(row['Payout Key']):'';
+}
+
+function custWriteObjectToRow_(sheet,h,rowNumber,obj){
+  Object.keys(obj).forEach(k=>custSetCellByHeader_(sheet,h,rowNumber,k,obj[k]));
+}
+
+function custClearSettlementItems_(sheet,h,settlementKey){
+  const k=custStr_(settlementKey);
+  if(!k||!h['Settlement Key'])return;
+  custReadRowsObjects_(sheet,h).forEach(r=>{
+    if(custStr_(r['Settlement Key'])!==k)return;
+    sheet.getRange(r._row,1,1,sheet.getLastColumn()).clearContent();
+  });
+}
+
 function custUpsertDraftPayoutTransaction_(sheet,h,x){
   const rows=custReadRowsObjects_(sheet,h); let row=rows.find(r=>custStr_(r['Transaction Key'])===x.transactionKey||custStr_(r['Unique Key'])==='PAYOUT|'+x.payoutKey);
   const obj={'Transaction Key':x.transactionKey,'Transaction Date':x.now,'Provider':x.provider,'Account Key':x.accountKey,'Label':'','Type':x.provider==='PINGPONG'?'PINGPONG_PAYOUT':'USDT_PAYOUT','Direction':'OUT','Gross Amount':x.amount,'Net Amount':x.amount,'Fee Amount':0,'Currency':x.currency,'Reference':x.reference,'Counterparty Provider':'CUSTOMER','Counterparty Account Key':'','Reconcile Status':'DRAFT','Matched Transaction Key':'','Source':'PAYOUTS','Source ID':x.payoutKey,'Sync Time':x.now,'Unique Key':'PAYOUT|'+x.payoutKey};
@@ -1388,6 +1864,37 @@ function custReadControlParams_(ss){
   if(!asOfInfo){sh.getRange('B7').setValue(new Date());asOfInfo=custReadControlDateCell_(sh.getRange('B7'));}
   return {customerKey:key,fromKey:fromInfo.key,toKey:toInfo.key,asOfKey:asOfInfo.key,fromDisplay:fromInfo.display,toDisplay:toInfo.display,asOfDisplay:asOfInfo.display,fromDateValue:fromInfo.value,toDateValue:toInfo.value,asOfDateValue:asOfInfo.value};
 }
+function custNormalizeInvoiceParams_(ss,args){
+  args=args||{};
+  const key=custCanonicalKey_(args.customerKey||args.customer_key);
+  if(!key)throw new Error('customer_key is required.');
+  const fromInfo=custParseInvoiceParamDate_(args.fromKey||args.from_date||args.from);
+  const toInfo=custParseInvoiceParamDate_(args.toKey||args.to_date||args.to);
+  const asOfInfo=custParseInvoiceParamDate_(args.asOfKey||args.as_of_date||args.asOf||new Date());
+  if(!fromInfo||!toInfo)throw new Error('from_date and to_date are required.');
+  if(fromInfo.key>toInfo.key)throw new Error('from_date cannot be after to_date.');
+  return {customerKey:key,fromKey:fromInfo.key,toKey:toInfo.key,asOfKey:asOfInfo.key,fromDisplay:fromInfo.display,toDisplay:toInfo.display,asOfDisplay:asOfInfo.display,fromDateValue:fromInfo.value,toDateValue:toInfo.value,asOfDateValue:asOfInfo.value};
+}
+function custParseInvoiceParamDate_(value){
+  if(value instanceof Date&&!isNaN(value.getTime())){
+    return {key:Utilities.formatDate(value,CUST_CFG.BUSINESS_TIMEZONE,'yyyy-MM-dd'),display:Utilities.formatDate(value,CUST_CFG.BUSINESS_TIMEZONE,'dd/MM/yyyy'),value:value};
+  }
+  const s=custStr_(value);
+  if(!s)return null;
+  let m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if(m){
+    const yyyy=m[1],mm=String(parseInt(m[2],10)).padStart(2,'0'),dd=String(parseInt(m[3],10)).padStart(2,'0');
+    return {key:yyyy+'-'+mm+'-'+dd,display:dd+'/'+mm+'/'+yyyy,value:new Date(Number(yyyy),Number(mm)-1,Number(dd),12,0,0,0)};
+  }
+  m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if(m){
+    const dd=String(parseInt(m[1],10)).padStart(2,'0'),mm=String(parseInt(m[2],10)).padStart(2,'0'),yyyy=m[3];
+    return {key:yyyy+'-'+mm+'-'+dd,display:dd+'/'+mm+'/'+yyyy,value:new Date(Number(yyyy),Number(mm)-1,Number(dd),12,0,0,0)};
+  }
+  const d=custDate_(s);
+  if(!d)return null;
+  return {key:Utilities.formatDate(d,CUST_CFG.BUSINESS_TIMEZONE,'yyyy-MM-dd'),display:Utilities.formatDate(d,CUST_CFG.BUSINESS_TIMEZONE,'dd/MM/yyyy'),value:d};
+}
 function custGetCustomerByKey_(ss,key){ const sh=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET),h=custHeaderMap_(sh),state=custReadCustomers_(sh,h),c=state.customersByKey[custCanonicalKey_(key)]; if(!c)throw new Error('Customer not found: '+key); return c; }
 function custFillControlCustomerConfig_(ss,c){const sh=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);sh.getRange('B9').setValue(c.customerName);sh.getRange('B10').setValue(c.payoutFeeRate).setNumberFormat('0.00%');sh.getRange('B11').setValue(c.defaultPayoutProvider);sh.getRange('B12').setValue(c.defaultPayoutAccountKey);}
 function custClearControlOutput_(ss){const sh=custRequireSheet_(ss,CUST_CFG.CONTROL_SHEET);sh.getRange('B9:B19').clearContent();custClearControlPreview_(ss);}
@@ -1412,6 +1919,178 @@ function handleCustomerEdit_(e){
 }
 function custRefreshInvoiceControlCustomerDropdown_(){ const ss=SpreadsheetApp.getActive(),sh=ss.getSheetByName(CUST_CFG.CUSTOMERS_SHEET),ctl=ss.getSheetByName(CUST_CFG.CONTROL_SHEET); if(!sh||!ctl)return; const h=custHeaderMap_(sh),keys=custReadRowsObjects_(sh,h).filter(r=>custUpper_(r['Status'])!=='DISABLED'&&custStr_(r['Customer Key'])).map(r=>custCanonicalKey_(r['Customer Key'])); const cell=ctl.getRange('B4'); if(!keys.length){cell.clearDataValidations();return;} cell.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(keys,true).setAllowInvalid(false).build()); }
 
+/*
+ * Report-only. custDescribeReceivingMatch_() deliberately trusts Flow's
+ * reconciliation and asks only for ARRIVED + a non-PayPal matched transaction.
+ * Enforcing the checks below inside that function would flip currently
+ * AVAILABLE allocations to non-available, shrinking customer Available Amount
+ * and making invoiceable money vanish. Surface the mismatches here first,
+ * compare against real data, and only then decide what to enforce.
+ */
+function custReportReceivingMatchWarnings_(allocs,txs,issues){
+  const txByKey={}; txs.forEach(t=>txByKey[t.transactionKey]=t);
+  allocs.forEach(a=>{
+    if(custUpper_(a['Allocation Status'])!=='AVAILABLE')return;
+    const key=custStr_(a['Allocation Key']);
+    const rxKey=custStr_(a['Receiving Transaction Key']);
+    if(!rxKey){issues.push('RECEIVING MATCH MISSING KEY '+key);return;}
+    const rx=txByKey[rxKey];
+    if(!rx){issues.push('RECEIVING TX NOT FOUND '+key+' -> '+rxKey);return;}
+
+    const allocCurrency=custUpper_(a['Currency']), rxCurrency=custUpper_(rx.currency);
+    if(allocCurrency&&rxCurrency&&allocCurrency!==rxCurrency){
+      issues.push('RECEIVING CURRENCY MISMATCH '+key+' '+allocCurrency+' vs '+rxCurrency);
+    }
+    const allocProvider=custUpper_(a['Receiving Provider']), rxProvider=custUpper_(rx.provider);
+    if(allocProvider&&rxProvider&&allocProvider!==rxProvider){
+      issues.push('RECEIVING PROVIDER MISMATCH '+key+' '+allocProvider+' vs '+rxProvider);
+    }
+    const allocAccount=custCanonicalKey_(a['Receiving Account Key']), rxAccount=custCanonicalKey_(rx.accountKey);
+    if(allocAccount&&rxAccount&&allocAccount!==rxAccount){
+      issues.push('RECEIVING ACCOUNT MISMATCH '+key+' '+allocAccount+' vs '+rxAccount);
+    }
+  });
+}
+
+/*
+ * A PAID payout pointing at a settlement that is not a real invoice means real
+ * treasury money left for something that was never issued.
+ */
+function custReportOrphanPaidPayouts_(ss,issues){
+  const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), hp=custHeaderMap_(shPay);
+  if(!hp['Settlement Key'])return;
+  const statusByKey=custBuildSettlementStatusMap_(ss);
+  custReadRowsObjects_(shPay,hp).forEach(p=>{
+    const sk=custStr_(p['Settlement Key']); if(!sk)return;
+    const payoutStatus=custUpper_(p['Status']);
+    if(payoutStatus!=='PAID'&&payoutStatus!=='DRAFT')return;
+    if(custIsEffectiveSettlementStatus_(statusByKey[sk]))return;
+    issues.push('PAYOUT '+payoutStatus+' ON NON-ISSUED SETTLEMENT '+custStr_(p['Payout Key'])+' -> '+sk+' ('+(custUpper_(statusByKey[sk])||'MISSING')+')');
+  });
+}
+
+/*
+ * Rebuilds the ledger from source to find sales belonging to no customer.
+ * Costly, but this is a manual check and the whole point is to hand back enough
+ * detail to fix the Customers sheet.
+ */
+function custReportUnattributedSales_(ss,issues){
+  const shCustomers=custRequireSheet_(ss,CUST_CFG.CUSTOMERS_SHEET), hc=custHeaderMap_(shCustomers);
+  const shPaypal=custRequireSheet_(ss,CUST_CFG.PAYPAL_SHEET), hp=custHeaderMap_(shPaypal);
+  const customerState=custReadCustomers_(shCustomers,hc);
+  const build=custBuildCustomerLedger_(custReadPaypalRows_(shPaypal,hp,customerState),customerState,{},new Date());
+  const orphans=custSummarizeUnattributedSales_(build.allSourceRecords);
+  if(!orphans.count)return orphans;
+
+  orphans.rows.slice(0,10).forEach(r=>{
+    issues.push('UNATTRIBUTED SALE '+r.accountKey+'|'+r.transactionId+
+      ' · invoice '+(custStr_(r.invoiceId)||'(none)')+
+      ' · prefix '+(custCanonicalPrefix_(r.invoicePrefix)||'(none)')+
+      ' · '+custNum_(r.netAmount).toFixed(2)+' '+custUpper_(r.currency));
+  });
+  issues.push('UNATTRIBUTED TOTAL: '+orphans.count+' sales · '+orphans.total.toFixed(2));
+  return orphans;
+}
+
+/*
+ * Cross-sheet conservation. Everything below is an identity that must hold if
+ * the money math is intact; each is derived from the code that writes the
+ * numbers, not assumed. Reports the measured drift either way so the system's
+ * real error is a number somebody can read.
+ */
+function custReportConservation_(ss,allocs,txs,issues){
+  const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
+  const shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), hi=custHeaderMap_(shItems);
+  const out={worstDrift:0,worstDriftPpm:0,maxSettlementDrift:0,maxWithdrawalFeeDrift:0,totalFeeDrift:0,settlementsChecked:0,withdrawalsChecked:0};
+
+  const itemsBySettlement={};
+  custReadRowsObjects_(shItems,hi).forEach(it=>{
+    const sk=custStr_(it['Settlement Key']); if(!sk)return;
+    (itemsBySettlement[sk]||(itemsBySettlement[sk]=[])).push(it);
+  });
+  const invoicedBySettlement={};
+  allocs.forEach(a=>{
+    const sk=custStr_(a['Settlement Key']); if(!sk)return;
+    invoicedBySettlement[sk]=custRound2_((invoicedBySettlement[sk]||0)+custNum_(a['Invoiced Amount']));
+  });
+
+  /* Drift is tracked unrounded: the residual being measured is sub-cent. */
+  const track=function(drift,base){
+    const d=Math.abs(drift);
+    if(d>out.worstDrift){out.worstDrift=d;out.worstDriftPpm=base>CUST_CFG.EPSILON?(d/base)*1e6:0;}
+  };
+
+  custReadRowsObjects_(shSet,hs).forEach(s=>{
+    const key=custStr_(s['Settlement Key']);
+    if(!key||!custIsEffectiveSettlementStatus_(s['Status']))return;
+    out.settlementsChecked++;
+    const items=itemsBySettlement[key]||[];
+    const available=custNum_(s['Available Amount']);
+    const saleTotal=custRound2_(items.filter(it=>custUpper_(it['Line Type']||'SALE')==='SALE').reduce((sum,it)=>sum+custNum_(it['Amount Included']),0));
+    const allTotal=custRound2_(items.reduce((sum,it)=>sum+custNum_(it['Amount Included']),0));
+    const pricingSide=custRound2_(custNum_(s['Net Before Payout Fee'])+custNum_(s['Downstream Cost']));
+
+    /* A. SALE lines are exactly the allocations consumed by this invoice. */
+    const driftA=custRound2_(saleTotal-available);
+    /* B. Everything included, minus late-refund lines, is what pricing was applied to. */
+    const driftB=custRound2_(allTotal-pricingSide);
+    /* C. The allocations locked to this settlement must add up to the same. */
+    const driftC=custRound2_(custNum_(invoicedBySettlement[key]||0)-available);
+
+    [['ITEM SALE TOTAL',driftA],['ITEM TOTAL vs PRICING',driftB],['ALLOCATION INVOICED',driftC]].forEach(([label,d])=>{
+      out.maxSettlementDrift=Math.max(out.maxSettlementDrift,Math.abs(d));
+      track(d,available);
+      if(Math.abs(d)>0.02)issues.push('CONSERVATION '+label+' '+key+' drift '+d.toFixed(2));
+    });
+  });
+
+  /*
+   * D. Receiving fee is split across allocations pro rata by take/gross, so the
+   * expected share is the actual fee scaled by how much of the withdrawal was
+   * allocated to customers. The gap is pure rounding residual -- this is the
+   * measurement that answers "how big is the error".
+   */
+  const txByKey={}; txs.forEach(t=>txByKey[t.transactionKey]=t);
+  const byWithdrawal={};
+  allocs.forEach(a=>{
+    if(custUpper_(a['Allocation Status'])!=='AVAILABLE')return;
+    const wk=custStr_(a['PayPal Withdrawal Transaction Key']); if(!wk)return;
+    const b=byWithdrawal[wk]||(byWithdrawal[wk]={allocated:0,fee:0,count:0});
+    b.allocated+=custNum_(a['Allocated Amount']); b.fee+=custNum_(a['Receiving Fee Allocated']); b.count++;
+  });
+
+  Object.keys(byWithdrawal).forEach(wk=>{
+    const w=txByKey[wk]; if(!w)return;
+    const rx=w.matchedTransactionKey?txByKey[w.matchedTransactionKey]:null; if(!rx)return;
+    const gross=Math.abs(custRound2_(w.grossAmount)); if(gross<=CUST_CFG.EPSILON)return;
+    const b=byWithdrawal[wk];
+    const allocated=custRound2_(b.allocated);
+    /*
+     * Expected stays unrounded on purpose. The sheet holds fees already rounded
+     * to cents, so the gap against the exact pro-rata share IS the rounding
+     * residual -- rounding the comparison would erase what we came to measure.
+     */
+    const expected=custGetReceivingTransactionFee_(rx)*allocated/gross;
+    const drift=custRound2_(b.fee)-expected;
+    out.withdrawalsChecked++;
+    out.totalFeeDrift+=drift;
+    out.maxWithdrawalFeeDrift=Math.max(out.maxWithdrawalFeeDrift,Math.abs(drift));
+    track(drift,allocated);
+    /* Theoretical rounding bound: half a cent per allocation, plus slack. */
+    const tolerance=b.count*0.005+0.01;
+    if(Math.abs(drift)>tolerance){
+      issues.push('CONSERVATION RECEIVING FEE '+wk+' drift '+drift.toFixed(4)+' > tolerance '+tolerance.toFixed(4));
+    }
+  });
+
+  out.worstDrift=custRound4_(out.worstDrift);
+  out.worstDriftPpm=custRound4_(out.worstDriftPpm);
+  out.maxSettlementDrift=custRound4_(out.maxSettlementDrift);
+  out.maxWithdrawalFeeDrift=custRound4_(out.maxWithdrawalFeeDrift);
+  out.totalFeeDrift=custRound4_(out.totalFeeDrift);
+  return out;
+}
+
 /*********************** VALIDATION ************************/
 function validateCustomerSystem(){
   const ss=SpreadsheetApp.getActive(); syncCustomers_();
@@ -1432,9 +2111,23 @@ function validateCustomerSystem(){
     const allocated=custRound2_(sums[w.transactionKey]||0),gross=Math.abs(custRound2_(w.grossAmount));if(allocated-gross>0.02)issues.push('OVER ALLOCATED '+w.transactionKey+' '+allocated+' > '+gross);
   });
   Object.keys(late).forEach(k=>{if(late[k].overConsumed>0.02)issues.push('LATE REFUND OVER-CONSUMED '+k+' '+late[k].overConsumed);});
+
+  custReportReceivingMatchWarnings_(allocs,txs,issues);
+  custReportOrphanPaidPayouts_(ss,issues);
+  custReportUnattributedSales_(ss,issues);
+  const conservation=custReportConservation_(ss,allocs,txs,issues);
+
   const carry=custRound2_(Object.keys(late).reduce((sum,k)=>sum+custNum_(late[k].outstanding),0));
-  const msg=issues.length?('ISSUES '+issues.length+': '+issues.slice(0,4).join(' | ')):('OK · V2.2 allocation valid'+(carry>CUST_CFG.EPSILON?' · refund carry '+carry.toFixed(2):''));
-  SpreadsheetApp.getActive().toast(msg,'Customer Validation',8); return {ok:!issues.length,issues,lateRefundOutstanding:carry};
+  /*
+   * Drift is printed even when it is inside tolerance. The point is to know the
+   * real number and watch whether it grows or leans one way, not just to see a
+   * pass mark.
+   */
+  const driftText=' · drift '+conservation.worstDrift.toFixed(4)+
+    (conservation.worstDriftPpm?' ('+conservation.worstDriftPpm.toFixed(1)+' ppm)':'');
+  const msg=issues.length?('ISSUES '+issues.length+': '+issues.slice(0,4).join(' | ')):('OK · V2.2 allocation valid'+(carry>CUST_CFG.EPSILON?' · refund carry '+carry.toFixed(2):'')+driftText);
+  SpreadsheetApp.getActive().toast(msg,'Customer Validation',8);
+  return {ok:!issues.length,issues,lateRefundOutstanding:carry,conservation};
 }
 
 /*********************** GENERIC ************************/
@@ -1445,10 +2138,53 @@ function custEnsureHeaders_(sheet,names){let h=custHeaderMap_(sheet),last=sheet.
 function custClearData_(sheet){const last=sheet.getLastRow();if(last>=CUST_CFG.DATA_START_ROW)sheet.getRange(CUST_CFG.DATA_START_ROW,1,last-CUST_CFG.DATA_START_ROW+1,sheet.getLastColumn()).clearContent();}
 function custPut_(row,h,k,v){if(h[k])row[h[k]-1]=(v===undefined||v===null)?'':v;}
 function custSetCellByHeader_(sheet,h,row,k,v){if(h[k])sheet.getRange(row,h[k]).setValue(v===undefined||v===null?'':v);}
+/* Cent-level equality, for deciding whether a stored money cell needs rewriting. */
+function custAmountSame_(a,b){return Math.abs(custNum_(a)-custNum_(b))<0.005;}
 function custAppendObjectRow_(sheet,h,obj){const lc=sheet.getLastColumn(),row=new Array(lc).fill('');Object.keys(obj).forEach(k=>custPut_(row,h,k,obj[k]));sheet.getRange(sheet.getLastRow()+1,1,1,lc).setValues([row]);}
+/*
+ * Writes scattered rows as one range per column instead of one call per cell.
+ * Untouched rows inside the span are written back with the value just read, so
+ * the span write is a no-op for them.
+ *
+ * patches: [{row:<sheet row>, '<header>':value, ...}]
+ */
+function custPatchColumns_(sheet,h,patches,headers){
+  if(!patches||!patches.length)return 0;
+  let min=Infinity,max=-Infinity;
+  patches.forEach(p=>{min=Math.min(min,p.row);max=Math.max(max,p.row);});
+  const count=max-min+1;
+  const byRow={}; patches.forEach(p=>byRow[p.row]=p);
+  let written=0;
+  headers.forEach(header=>{
+    const col=h[header]; if(!col)return;
+    const range=sheet.getRange(min,col,count,1);
+    const vals=range.getValues();
+    let touched=false;
+    for(let i=0;i<count;i++){
+      const p=byRow[min+i];
+      if(p&&Object.prototype.hasOwnProperty.call(p,header)){
+        const v=p[header];
+        vals[i][0]=(v===undefined||v===null)?'':v;
+        touched=true;
+      }
+    }
+    if(touched){range.setValues(vals);written++;}
+  });
+  return written;
+}
+
+/* One setValues for the whole block: appending row by row costs 3 API calls each. */
+function custAppendObjectRows_(sheet,h,objs){
+  if(!objs||!objs.length)return 0;
+  const lc=sheet.getLastColumn();
+  const rows=objs.map(obj=>{const row=new Array(lc).fill('');Object.keys(obj).forEach(k=>custPut_(row,h,k,obj[k]));return row;});
+  sheet.getRange(sheet.getLastRow()+1,1,rows.length,lc).setValues(rows);
+  return rows.length;
+}
 function custReadRowsObjects_(sheet,h){const last=sheet.getLastRow();if(last<CUST_CFG.DATA_START_ROW)return[];const inv={};Object.keys(h).forEach(k=>inv[h[k]-1]=k);return sheet.getRange(CUST_CFG.DATA_START_ROW,1,last-CUST_CFG.DATA_START_ROW+1,sheet.getLastColumn()).getValues().map((r,i)=>{const o={_row:CUST_CFG.DATA_START_ROW+i};r.forEach((v,j)=>{if(inv[j])o[inv[j]]=v;});return o;});}
 function custFormatCols_(sheet,h,n,dateCols,numCols){dateCols.forEach(k=>{if(h[k])sheet.getRange(CUST_CFG.DATA_START_ROW,h[k],n,1).setNumberFormat('dd/MM/yyyy HH:mm:ss');});numCols.forEach(k=>{if(h[k])sheet.getRange(CUST_CFG.DATA_START_ROW,h[k],n,1).setNumberFormat('0.00');});}
 function custStr_(v){return(v===null||v===undefined)?'':String(v).trim();}
+function custAppendNote_(existing,addition){const a=custStr_(existing),b=custStr_(addition);if(!b)return a;return a?(a+' | '+b):b;}
 function custUpper_(v){return custStr_(v).toUpperCase();}
 function custCanonicalKey_(v){return custUpper_(v);}
 function custCanonicalPrefix_(v){return custUpper_(v).replace(/\s+/g,'');}
@@ -1461,6 +2197,8 @@ function custBool_(v){if(v===true)return true;if(v===false)return false;const s=
 function custConfigDateKey_(ss,v){if(!v)return '';const d=custDate_(v);if(!d)return '';const tz=ss.getSpreadsheetTimeZone()||Session.getScriptTimeZone()||'GMT';return Utilities.formatDate(d,tz,'yyyy-MM-dd');}
 function custDefaultPayoutCurrency_(provider,sourceCurrency){return custUpper_(provider)==='USDT'?'USDT':(custUpper_(sourceCurrency)||'USD');}
 function custRound2_(v){return Math.round((custNum_(v)+Number.EPSILON)*100)/100;}
+/* Only for reporting drift, which is deliberately finer than one cent. */
+function custRound4_(v){return Math.round(custNum_(v)*10000)/10000;}
 function custDate_(v){if(v instanceof Date)return isNaN(v.getTime())?null:v;if(!v)return null;const d=new Date(v);return isNaN(d.getTime())?null:d;}
 function custDateOnly_(v){const d=custDate_(v);if(!d)return null;return new Date(d.getFullYear(),d.getMonth(),d.getDate());}
 function custEndOfDay_(d){return new Date(d.getFullYear(),d.getMonth(),d.getDate(),23,59,59,999);}

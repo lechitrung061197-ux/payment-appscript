@@ -34,6 +34,21 @@ const PP_CFG = Object.freeze({
  ************************************************************/
 
 function syncPayPalAllAccounts() {
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(
+      'syncPayPalAllAccounts',
+      syncPayPalAllAccountsCore_
+    );
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return syncPayPalAllAccountsCore_(); }
+  finally { lock.releaseLock(); }
+}
+
+
+function syncPayPalAllAccountsCore_() {
   const ss = ppGetSpreadsheet_();
 
   const accountSheet = ss.getSheetByName(PP_CFG.ACCOUNT_SHEET);
@@ -91,6 +106,23 @@ function syncPayPalAllAccounts() {
  ************************************************************/
 
 function syncPayPalOneAccount(accountKey) {
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(
+      'syncPayPalOneAccount',
+      function() {
+        return syncPayPalOneAccountCore_(accountKey);
+      }
+    );
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return syncPayPalOneAccountCore_(accountKey); }
+  finally { lock.releaseLock(); }
+}
+
+
+function syncPayPalOneAccountCore_(accountKey) {
   const ss = ppGetSpreadsheet_();
 
   const accountSheet = ss.getSheetByName(PP_CFG.ACCOUNT_SHEET);
