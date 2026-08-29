@@ -483,6 +483,22 @@ function custReadExistingAllocationState_(sheet,h){
   sheet.getRange(CUST_CFG.DATA_START_ROW,1,last-CUST_CFG.DATA_START_ROW+1,sheet.getLastColumn()).getValues().forEach(r=>{
     const k=custStr_(r[h['Allocation Key']-1]); if(!k)return;
     out[k]={
+      allocationKey:k,
+      /*
+       * Locked rows are re-emitted verbatim by the allocation rebuild, so every
+       * column it will write has to survive this read -- not just the money.
+       */
+      allocationDate:custDate_(r[h['Allocation Date']-1]),
+      customerKey:custCanonicalKey_(r[h['Customer Key']-1]),
+      paypalAccountKey:custCanonicalKey_(r[h['PayPal Account Key']-1]),
+      paypalSourceTransactionId:custStr_(r[h['PayPal Source Transaction ID']-1]),
+      paypalWithdrawalTransactionKey:custStr_(r[h['PayPal Withdrawal Transaction Key']-1]),
+      paypalWithdrawalTransactionId:custStr_(r[h['PayPal Withdrawal Transaction ID']-1]),
+      paypalWithdrawalDate:custDate_(r[h['PayPal Withdrawal Date']-1]),
+      paypalWithdrawalStatus:custStr_(r[h['PayPal Withdrawal Status']-1]),
+      currency:custUpper_(r[h['Currency']-1]),
+      sourceUniqueKey:custStr_(r[h['Source Unique Key']-1]),
+      note:custStr_(r[h['Note']-1]),
       customerLedgerKey:custStr_(r[h['Customer Ledger Key']-1]),
       allocatedAmount:custNum_(r[h['Allocated Amount']-1]),
       receivingProvider:custStr_(r[h['Receiving Provider']-1]),
@@ -745,17 +761,21 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
     lockedByLedger[o.customerLedgerKey]=custRound2_((lockedByLedger[o.customerLedgerKey]||0)+custNum_(o.allocatedAmount));
   });
 
-  const pools={};
+  /*
+   * Sức chứa của từng nguồn. Cái sàn theo locked là bắt buộc: late refund làm
+   * teo net của một sale SAU KHI nó đã được invoice, nên locked lớn hơn net
+   * hiện tại là hợp lệ chứ không phải trạng thái bất khả.
+   */
+  const sourceByLedgerKey={}; const poolSources={};
   allSourceRecords.forEach(src=>{
     const ledgerKey='CL|'+src.accountKey+'|'+src.transactionId;
     const late=lateRefundState[ledgerKey]||null;
     let sourceForAllocation=custNum_(src.sourceAvailable);
 
     /*
-     * If this sale was already invoiced, a later refund is NOT allowed to
-     * rewrite the historical PayPal withdrawal allocation. Restore only the
-     * late-refund delta to the FIFO source pool. The same delta is charged as
-     * LATE_REFUND_ADJUSTMENT on a later invoice instead.
+     * Sale đã invoice thì một refund muộn KHÔNG được viết lại phần đã phân bổ
+     * cho withdrawal lịch sử. Chỉ hoàn phần chênh lệch về pool; phần đó được
+     * tính thành LATE_REFUND_ADJUSTMENT ở hoá đơn sau.
      */
     if(late&&late.totalLate>CUST_CFG.EPSILON){
       const preLateNet=Math.max(0,custRound2_(custNum_(src.grossAmount)-custNum_(src.paypalFee)-custNum_(late.baselineRefund)));
@@ -765,46 +785,137 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
     sourceForAllocation=custRound2_(sourceForAllocation);
     if(sourceForAllocation<=CUST_CFG.EPSILON)return;
 
+    const rec={src,ledgerKey,remaining:sourceForAllocation,capacity:sourceForAllocation};
+    sourceByLedgerKey[ledgerKey]=rec;
     const k=custMoneyPoolKey_(src.accountKey,src.currency);
-    (pools[k]||(pools[k]=[])).push({src,ledgerKey,remaining:sourceForAllocation});
+    (poolSources[k]||(poolSources[k]=[])).push(rec);
   });
-  Object.keys(pools).forEach(k=>{pools[k].sort((a,b)=>custTime_(a.src.transactionDate)-custTime_(b.src.transactionDate));pools[k]._cursor=0;});
 
   const withdrawals=txRows.filter(t=>
     t.provider==='PAYPAL'&&t.type==='PAYPAL_WITHDRAWAL'&&t.direction==='OUT'&&
     Math.abs(t.grossAmount)>CUST_CFG.EPSILON&&t.reconcileStatus!=='RETURNED'
   ).sort((a,b)=>custTime_(a.transactionDate)-custTime_(b.transactionDate));
 
-  const out=[]; const generated={};
+  const withdrawalByKey={};
   withdrawals.forEach(w=>{
-    const pool=pools[custMoneyPoolKey_(w.accountKey,w.currency)]; if(!pool||!w.transactionDate)return;
-    const gross=Math.abs(custRound2_(w.grossAmount)); let rem=gross;
     const receivingTx=w.matchedTransactionKey?txByKey[w.matchedTransactionKey]:null;
     const match=custDescribeReceivingMatch_(w,receivingTx);
-    const receivingFeeTotal=match.available?custGetReceivingTransactionFee_(receivingTx):0;
+    const gross=Math.abs(custRound2_(w.grossAmount));
+    withdrawalByKey[w.transactionKey]={
+      w,gross,remaining:gross,match,
+      feeTotal:match.available?custGetReceivingTransactionFee_(receivingTx):0
+    };
+  });
 
-    while(rem>CUST_CFG.EPSILON){
-      const idx=pool._cursor||0; if(idx>=pool.length)break;
-      const item=pool[idx], src=item.src;
-      if(!src.transactionDate||src.transactionDate.getTime()>w.transactionDate.getTime())break;
-      if(item.remaining<=CUST_CFG.EPSILON){pool._cursor=idx+1;continue;}
-      const take=custRound2_(Math.min(item.remaining,rem)); if(take<=CUST_CFG.EPSILON)break;
+  const out=[]; const generated={}; const lockedPairs={};
+
+  /*********** PHASE A — giữ chỗ cho lịch sử đã khoá ***********
+   *
+   * Hoá đơn đã phát hành là bất biến, nên allocation của nó được phát ra
+   * NGUYÊN VĂN từ dòng cũ chứ không suy ra lại từ vòng phân bổ. Việc trừ trước
+   * sức chứa của nguồn và của withdrawal là thứ cho phép đổi chính sách phân bổ
+   * mà không xê dịch một đồng nào của lịch sử.
+   */
+  Object.keys(oldState).sort().forEach(key=>{
+    const old=oldState[key];
+    if(!isLockedByOld(old))return;
+
+    const ledgerKey=custStr_(old.customerLedgerKey);
+    const wKey=custStr_(old.paypalWithdrawalTransactionKey);
+    const srcRec=sourceByLedgerKey[ledgerKey];
+    const wRec=withdrawalByKey[wKey];
+
+    /* Không tự gán lại lịch sử: thiếu nguồn hoặc thiếu withdrawal là lỗi kiểm toán. */
+    if(!ledgerKey||!srcRec)throw new Error('LOCKED ALLOCATION SOURCE MISSING: '+key+' -> '+(ledgerKey||'(no ledger key)'));
+    if(!wKey||!wRec)throw new Error('LOCKED ALLOCATION WITHDRAWAL MISSING: '+key+' -> '+(wKey||'(no withdrawal key)'));
+
+    const amt=custRound2_(custNum_(old.allocatedAmount));
+    srcRec.remaining=custRound2_(srcRec.remaining-amt);
+    wRec.remaining=custRound2_(wRec.remaining-amt);
+    if(srcRec.remaining<-0.01)throw new Error('LOCKED ALLOCATION EXCEEDS SOURCE: '+key+' vượt '+Math.abs(srcRec.remaining).toFixed(2));
+    if(wRec.remaining<-0.01)throw new Error('LOCKED ALLOCATION EXCEEDS WITHDRAWAL: '+key+' vượt '+Math.abs(wRec.remaining).toFixed(2));
+    srcRec.remaining=Math.max(0,srcRec.remaining);
+    wRec.remaining=Math.max(0,wRec.remaining);
+
+    const ledger=ledgerByTx[custPaypalTxIndexKey_(srcRec.src.accountKey,srcRec.src.transactionId)]||null;
+    const notes=[];
+    if(lateRefundState[ledgerKey]&&lateRefundState[ledgerKey].totalLate>CUST_CFG.EPSILON)notes.push('LOCKED · LATE REFUND HANDLED BY ADJUSTMENT');
+
+    const available=custNum_(old.availableAmount);
+    const invoiced=Math.min(available,Math.max(0,custNum_(old.invoicedAmount)));
+
+    out.push({
+      allocationKey:key, allocationDate:old.allocationDate||wRec.w.transactionDate,
+      customerKey:old.customerKey||(ledger?ledger.customerKey:''), customerLedgerKey:ledgerKey,
+      paypalAccountKey:old.paypalAccountKey||wRec.w.accountKey,
+      paypalSourceTransactionId:old.paypalSourceTransactionId||srcRec.src.transactionId,
+      paypalWithdrawalTransactionKey:wKey,
+      paypalWithdrawalTransactionId:old.paypalWithdrawalTransactionId||wRec.w.sourceId||wRec.w.reference||wKey,
+      paypalWithdrawalDate:old.paypalWithdrawalDate||wRec.w.transactionDate,
+      paypalWithdrawalStatus:old.paypalWithdrawalStatus||wRec.w.reconcileStatus,
+      allocatedAmount:amt, currency:old.currency||wRec.w.currency,
+      receivingProvider:old.receivingProvider, receivingAccountKey:old.receivingAccountKey,
+      receivingTransactionKey:old.receivingTransactionKey, receivingReference:old.receivingReference,
+      receivingFeeAllocated:custRound2_(custNum_(old.receivingFeeAllocated)),
+      availableAmount:custRound2_(available), availableDate:old.availableDate,
+      allocationStatus:custUpper_(old.allocationStatus)||'AVAILABLE',
+      invoicedAmount:custRound2_(invoiced), remainingAvailable:custRound2_(Math.max(0,available-invoiced)),
+      settlementKey:custStr_(old.settlementKey), sourceUniqueKey:old.sourceUniqueKey||wRec.w.uniqueKey,
+      lastSync:now, note:notes.join(' | ')
+    });
+    generated[key]=true;
+    lockedPairs[wKey+'|'+ledgerKey]=true;
+  });
+
+  /*********** PHASE B — chỉ phân bổ phần còn lại, MỚI NHẤT TRƯỚC ***********
+   *
+   * Nghiệp vụ thật là "rút đúng phần vừa nhận", nên nguồn mới nhất đủ điều kiện
+   * phải được tiêu trước. Phần dư cũ nằm lại PayPal cho tới lần rút sau.
+   *
+   * Không dùng con trỏ chạy một chiều như bản FIFO cũ: một sale mới hơn
+   * withdrawal này lại đủ điều kiện cho withdrawal sau, nên phải quét lại tập
+   * đủ điều kiện cho từng withdrawal.
+   */
+  withdrawals.forEach(w=>{
+    const wRec=withdrawalByKey[w.transactionKey];
+    if(!wRec||!w.transactionDate||wRec.remaining<=CUST_CFG.EPSILON)return;
+    const pool=poolSources[custMoneyPoolKey_(w.accountKey,w.currency)]; if(!pool)return;
+    const gross=wRec.gross, match=wRec.match, receivingFeeTotal=wRec.feeTotal;
+
+    const eligible=pool.filter(item=>
+      item.remaining>CUST_CFG.EPSILON&&
+      item.src.transactionDate&&
+      item.src.transactionDate.getTime()<=w.transactionDate.getTime()
+    );
+    /* Tie-break theo Ledger Key để hai lần sync cho kết quả trùng khít. */
+    eligible.sort((a,b)=>
+      custTime_(b.src.transactionDate)-custTime_(a.src.transactionDate)||
+      a.ledgerKey.localeCompare(b.ledgerKey)
+    );
+
+    for(let i=0;i<eligible.length&&wRec.remaining>CUST_CFG.EPSILON;i++){
+      const item=eligible[i], src=item.src;
+      /*
+       * Cặp (withdrawal, nguồn) này đã có một allocation bị khoá. Phân bổ thêm
+       * sẽ trùng Allocation Key, mà gộp vào thì lại sửa số của lịch sử — nên bỏ
+       * qua, phần dư của nguồn để dành cho withdrawal khác.
+       */
+      if(lockedPairs[w.transactionKey+'|'+item.ledgerKey])continue;
+
+      const take=custRound2_(Math.min(item.remaining,wRec.remaining));
+      if(take<=CUST_CFG.EPSILON)continue;
+
       const ledger=ledgerByTx[custPaypalTxIndexKey_(src.accountKey,src.transactionId)]||null;
       if(ledger){
         const key='CA|'+w.transactionKey+'|'+ledger.ledgerKey; const old=oldState[key]||null;
-        const locked=isLockedByOld(old);
-        /* Pointed at a settlement that is no longer a real invoice: give the money back. */
-        const releasedFrom=(old&&custStr_(old.settlementKey)&&!locked)?custStr_(old.settlementKey):'';
-        if(locked&&Math.abs(old.allocatedAmount-take)>0.01)throw new Error('LOCKED ALLOCATION CHANGED: '+key);
+        /* Trỏ vào settlement không còn là hoá đơn thật: trả tiền lại. */
+        const releasedFrom=(old&&custStr_(old.settlementKey))?custStr_(old.settlementKey):'';
 
         const computedFee=match.available&&gross>CUST_CFG.EPSILON?custRound2_(receivingFeeTotal*take/gross):0;
-        const computedAvailable=match.available?Math.max(0,custRound2_(take-computedFee)):0;
-        const receiveFee=locked?custNum_(old.receivingFeeAllocated):computedFee;
-        const available=locked?custNum_(old.availableAmount):computedAvailable;
+        const available=match.available?Math.max(0,custRound2_(take-computedFee)):0;
         const invoiced=(old&&!releasedFrom)?Math.min(available,Math.max(0,custNum_(old.invoicedAmount))):0;
 
         const notes=[];
-        if(locked&&lateRefundState[ledger.ledgerKey]&&lateRefundState[ledger.ledgerKey].totalLate>CUST_CFG.EPSILON)notes.push('LOCKED · LATE REFUND HANDLED BY ADJUSTMENT');
         if(releasedFrom)notes.push('RELEASED FROM '+releasedFrom+' ('+(custUpper_(statusByKey[releasedFrom])||'MISSING')+')');
 
         out.push({
@@ -813,25 +924,29 @@ function custBuildCustomerAllocations_(allSourceRecords, ledgerRecords, txRows, 
           paypalWithdrawalTransactionKey:w.transactionKey,
           paypalWithdrawalTransactionId:w.sourceId||w.reference||w.transactionKey,
           paypalWithdrawalDate:w.transactionDate, paypalWithdrawalStatus:w.reconcileStatus,
-          allocatedAmount:locked?custNum_(old.allocatedAmount):take, currency:w.currency,
-          receivingProvider:locked?(old.receivingProvider||match.provider):match.provider,
-          receivingAccountKey:locked?(old.receivingAccountKey||match.accountKey):match.accountKey,
-          receivingTransactionKey:locked?(old.receivingTransactionKey||match.transactionKey):match.transactionKey,
-          receivingReference:locked?(old.receivingReference||match.reference):match.reference,
-          receivingFeeAllocated:custRound2_(receiveFee), availableAmount:custRound2_(available),
-          availableDate:locked?(old.availableDate||match.date):(match.available?match.date:null),
-          allocationStatus:locked?(custUpper_(old.allocationStatus)||'AVAILABLE'):match.status,
+          allocatedAmount:take, currency:w.currency,
+          receivingProvider:match.provider, receivingAccountKey:match.accountKey,
+          receivingTransactionKey:match.transactionKey, receivingReference:match.reference,
+          receivingFeeAllocated:custRound2_(computedFee), availableAmount:custRound2_(available),
+          availableDate:match.available?match.date:null,
+          allocationStatus:match.status,
           invoicedAmount:custRound2_(invoiced), remainingAvailable:custRound2_(Math.max(0,available-invoiced)),
-          settlementKey:(old&&!releasedFrom)?old.settlementKey:'', sourceUniqueKey:w.uniqueKey, lastSync:now,
+          settlementKey:'', sourceUniqueKey:w.uniqueKey, lastSync:now,
           note:notes.join(' | ')
         });
         generated[key]=true;
       }
-      item.remaining=custRound2_(item.remaining-take); rem=custRound2_(rem-take);
-      if(item.remaining<=CUST_CFG.EPSILON)pool._cursor=idx+1;
+
+      /*
+       * Nguồn không tra được customer vẫn tiêu hạn mức nhưng không sinh dòng
+       * allocation. Nhờ vậy tiền vô chủ không thổi phồng phần của khách khác.
+       */
+      item.remaining=custRound2_(item.remaining-take);
+      wRec.remaining=custRound2_(wRec.remaining-take);
     }
   });
-  /* Only a real invoice may forbid an allocation from disappearing. */
+
+  /* Chỉ hoá đơn thật mới được cấm một allocation biến mất. */
   Object.keys(oldState).forEach(k=>{if(isLockedByOld(oldState[k])&&!generated[k])throw new Error('LOCKED ALLOCATION DISAPPEARED: '+k);});
   out.sort(custSortDateDesc_('paypalWithdrawalDate','allocationKey'));
   return out;
@@ -1231,7 +1346,14 @@ function custBuildInvoicePreview_(ss, requireEligible, explicitParams){
     if(custUpper_(a['Allocation Status'])!=='AVAILABLE')return false;
     if(custNum_(a['Remaining Available'])<=CUST_CFG.EPSILON)return false;
     const l=ledgerByKey[custStr_(a['Customer Ledger Key'])]; if(!l)return false;
-    const k=custBusinessDateKey_(custDate_(l['Transaction Date'])); return !!k&&k<=params.toKey;
+    const k=custBusinessDateKey_(custDate_(l['Transaction Date'])); if(!k||k>params.toKey)return false;
+    /*
+     * Tiền chỉ được xuất hoá đơn sau khi đã thật sự về tới provider nhận. Thiếu
+     * phép này thì một khoản rút ngày 27 nhưng Grey mới nhận ngày 28 vẫn lọt
+     * vào hoá đơn chốt tới ngày 27.
+     */
+    const av=custBusinessDateKey_(custDate_(a['Available Date']));
+    return !!av&&av<=params.asOfKey;
   });
   /*
    * "No eligible funds" reads like the money vanished, when the usual cause is
@@ -2211,6 +2333,59 @@ function repairAllocationSettlementLinks(){
   });
 }
 
+/*
+ * Bất biến của phân bổ. Đổi chính sách từ FIFO sang mới-nhất-trước làm việc
+ * phân bổ phức tạp hơn, nên những trạng thái kế toán bất khả phải nói ra được
+ * chứ không im lặng.
+ */
+function custReportAllocationIntegrity_(ss,allocs,txs,issues){
+  const txByKey={}; txs.forEach(t=>txByKey[t.transactionKey]=t);
+  const shL=custRequireSheet_(ss,CUST_CFG.LEDGER_SHEET), hL=custHeaderMap_(shL);
+  const ledgerByKey={}; custReadRowsObjects_(shL,hL).forEach(l=>ledgerByKey[custStr_(l['Ledger Key'])]=l);
+
+  const seen={}, perWithdrawal={}, perSource={};
+  allocs.forEach(a=>{
+    const key=custStr_(a['Allocation Key']);
+    if(seen[key]){issues.push('TRÙNG ALLOCATION KEY '+key);return;}
+    seen[key]=true;
+
+    const amount=custNum_(a['Allocated Amount']);
+    const wk=custStr_(a['PayPal Withdrawal Transaction Key']);
+    const lk=custStr_(a['Customer Ledger Key']);
+    perWithdrawal[wk]=custRound2_((perWithdrawal[wk]||0)+amount);
+    perSource[lk]=custRound2_((perSource[lk]||0)+amount);
+
+    const w=txByKey[wk]; if(!w)return;
+    if(custCanonicalKey_(a['PayPal Account Key'])!==custCanonicalKey_(w.accountKey)){
+      issues.push('ALLOCATION VẮT QUA PAYPAL ACCOUNT '+key+' · '+a['PayPal Account Key']+' vs '+w.accountKey);
+    }
+    if(custUpper_(a['Currency'])&&custUpper_(w.currency)&&custUpper_(a['Currency'])!==custUpper_(w.currency)){
+      issues.push('ALLOCATION VẮT QUA CURRENCY '+key+' · '+a['Currency']+' vs '+w.currency);
+    }
+    const l=ledgerByKey[lk];
+    const sd=l?custDate_(l['Transaction Date']):null;
+    if(sd&&w.transactionDate&&sd.getTime()>w.transactionDate.getTime()){
+      issues.push('SALE SAU NGÀY RÚT '+key);
+    }
+  });
+
+  Object.keys(perWithdrawal).forEach(wk=>{
+    const w=txByKey[wk]; if(!w)return;
+    const gross=Math.abs(custRound2_(w.grossAmount));
+    if(perWithdrawal[wk]-gross>0.02){
+      issues.push('PHÂN BỔ VƯỢT WITHDRAWAL '+wk+' · '+perWithdrawal[wk].toFixed(2)+' > '+gross.toFixed(2));
+    }
+  });
+
+  Object.keys(perSource).forEach(lk=>{
+    const l=ledgerByKey[lk]; if(!l)return;
+    const capacity=custRound2_(custNum_(l['Allocated Amount'])+custNum_(l['Remaining Amount']));
+    if(perSource[lk]-capacity>0.02){
+      issues.push('PHÂN BỔ VƯỢT NGUỒN '+lk+' · '+perSource[lk].toFixed(2)+' > '+capacity.toFixed(2));
+    }
+  });
+}
+
 /*********************** VALIDATION ************************/
 function validateCustomerSystem(){
   const ss=SpreadsheetApp.getActive(); syncCustomers_();
@@ -2236,6 +2411,17 @@ function validateCustomerSystem(){
   custReportOrphanPaidPayouts_(ss,issues);
   custReportUnattributedSales_(ss,issues);
   custReportBrokenSettlementLinks_(ss,issues);
+  custReportAllocationIntegrity_(ss,allocs,txs,issues);
+  /*
+   * AVAILABLE mà thiếu Available Date sẽ bị điều kiện As-Of loại khỏi mọi hoá
+   * đơn. Đó là bất thường dữ liệu, phải nhìn thấy chứ không được nuốt im lặng.
+   */
+  allocs.forEach(a=>{
+    if(custUpper_(a['Allocation Status'])!=='AVAILABLE')return;
+    if(custNum_(a['Remaining Available'])<=CUST_CFG.EPSILON)return;
+    if(custDate_(a['Available Date']))return;
+    issues.push('AVAILABLE THIẾU AVAILABLE DATE '+custStr_(a['Allocation Key'])+' · sẽ không bao giờ vào được hoá đơn');
+  });
   const conservation=custReportConservation_(ss,allocs,txs,issues);
 
   const carry=custRound2_(Object.keys(late).reduce((sum,k)=>sum+custNum_(late[k].outstanding),0));
