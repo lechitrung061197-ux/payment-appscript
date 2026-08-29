@@ -601,6 +601,12 @@ function payAiSummarizePreview_(p) {
   if (!p) return { action: 'preview_invoice', message: 'Preview completed.', preview: null };
   return {
     action: 'preview_invoice',
+    /*
+     * Dấu vân tay của chính bộ số dưới đây. Nó đi kèm ra tới Telegram và được
+     * cất vào pending action, để lúc gõ PIN còn có thứ mà đối chiếu: cái được
+     * tạo phải đúng là cái người ta đã nhìn.
+     */
+    fingerprint: p.fingerprint,
     customer_key: p.customer && p.customer.customerKey,
     customer_name: p.customer && p.customer.customerName,
     period_from: p.params && p.params.fromKey,
@@ -660,6 +666,16 @@ function payAiRequestProtectedAction_(ctx, args) {
     action: action,
     args: args,
     preview: previewInfo,
+    /*
+     * PIN xác nhận Ý ĐỊNH, không xác nhận SỐ TIỀN: giữa lúc xem preview và lúc
+     * gõ PIN có thể trôi qua vài phút, mà createCustomerInvoice() gọi
+     * syncCustomers_() trước khi dựng lại preview — và trigger giờ đồng bộ hai
+     * lần mỗi ngày. Dữ liệu PayPal mới rơi vào khoảng đó là hoá đơn được tạo
+     * khác với hoá đơn đã được duyệt, im lặng.
+     *
+     * Cất vân tay lúc duyệt để lúc thực thi có thể từ chối thay vì tạo bừa.
+     */
+    fingerprint: previewInfo && previewInfo.fingerprint ? String(previewInfo.fingerprint) : '',
     createdAt: Date.now(),
     expiresAt: Date.now() + PAYMENT_AI_CFG.PENDING_ACTION_TTL_MS,
     attempts: 0
@@ -708,7 +724,19 @@ function payAiExecutePendingAction_(chatId, rawPin) {
   }
 
   const execute = function() {
-    const result = payAiPerformProtectedAction_(pending.action, pending.args);
+    let result;
+    try {
+      result = payAiPerformProtectedAction_(pending.action, pending.args, pending.fingerprint);
+    } catch (err) {
+      /*
+       * Hỏng thì bỏ luôn pending, kể cả lỗi tạm như hết giờ chờ lock. Sau một
+       * lần tạo hoá đơn thất bại, không ai biết chắc nó đã đi tới đâu, nên bắt
+       * xem lại số rồi duyệt lại là đúng — dùng lại chữ ký duyệt cũ cho lần thử
+       * sau là biến PIN thành tấm séc khống.
+       */
+      props.deleteProperty(key);
+      throw err;
+    }
     props.deleteProperty(key);
     return { ok: true, action: pending.action, result: payAiJsonSafe_(result) };
   };
@@ -728,7 +756,7 @@ function payAiCancelPendingAction_(chatId) {
   return { ok: true, message: 'Pending protected action cancelled.' };
 }
 
-function payAiPerformProtectedAction_(action, args) {
+function payAiPerformProtectedAction_(action, args, approvedFingerprint) {
   payAiActivateSpreadsheet_();
 
   if (action === 'create_invoice') {
@@ -737,6 +765,18 @@ function payAiPerformProtectedAction_(action, args) {
     const params = payAiInvoiceParamsFromArgs_(args);
     const preview = previewCustomerInvoice(params);
     const previewSummary = payAiSummarizePreview_(preview);
+
+    /*
+     * Chữ ký của bộ số đã được duyệt bằng PIN. createCustomerInvoice() dựng
+     * preview của riêng nó sau khi sync rồi so với chữ ký này; lệch thì nó ném
+     * lỗi thay vì tạo một hoá đơn khác với hoá đơn đã duyệt.
+     *
+     * Chỉ gắn khi thật sự có chữ ký. Đường gọi cũ không có thì hành vi giữ
+     * nguyên như trước — nhưng đường Telegram thì luôn có.
+     */
+    const expected = String(approvedFingerprint || '').trim();
+    if (expected) params.expected_fingerprint = expected;
+
     const created = createCustomerInvoice(params);
     return { preview: previewSummary, created: payAiJsonSafe_(created) };
   }

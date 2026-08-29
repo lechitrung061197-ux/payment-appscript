@@ -1792,9 +1792,11 @@ function createCustomerInvoice(params){
     syncCustomers_();
     const p=custBuildInvoicePreview_(ss,true,custNormalizeInvoiceParams_(ss,params));
     /*
-     * Optional, but every caller that showed a preview to a human must send it:
-     * what gets created has to be exactly what they looked at. Left optional so
-     * AI_GATEWAY's PIN-protected path keeps working unchanged.
+     * Optional in signature only: every caller that showed a preview to a human
+     * must send it, because what gets created has to be exactly what they
+     * looked at. Both real callers now do — the invoice dialog and AI_GATEWAY's
+     * PIN path. Vẫn để optional cho lệnh gọi tay trong editor, nhưng thêm một
+     * đường gọi mới mà không gửi vân tay là mở lại đúng cái lỗ này.
      */
     const expected=custStr_(params&&(params.expectedFingerprint||params.expected_fingerprint));
     if(expected&&expected!==p.fingerprint){

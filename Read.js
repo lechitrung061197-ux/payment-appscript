@@ -9,7 +9,7 @@ PAYMENT ALL — COMPACT AI MAP
 
 CORE MODULES
 - PayPal.gs: collect PayPal data -> Paypal; refresh PayPal balances in Account.
-- GreyGmail.gs: collect Grey emails -> Transaction.
+- Grey collector: runs in SEPARATE per-Gmail Apps Script projects, not in this project. It writes Grey rows into Transaction and coordinates through the '_Sync Lock' sheet. Nothing here can start it.
 - Flow.gs: treasury/reconciliation brain. Creates/updates withdrawal transactions, matches PayPal withdrawal to receiving provider, handles treasury movement and summaries.
 - CustomerV2.3.gs: customer accounting brain. Builds Customer Ledger + Customer Allocation, customer summary, invoice preview/create, Settlements, Settlement Items, DRAFT Payout, late refunds.
 - InvoicePdf.gs: presentation only. Reads Settlements + Settlement Items; writes PDF metadata only.
@@ -17,6 +17,23 @@ CORE MODULES
 MOST IMPORTANT RULE
 Customer ownership stops when PayPal withdrawal is MATCHED/ARRIVED at a real receiving provider.
 After that, Grey->USDT, provider->provider, pooled/partial treasury movement belongs to Transaction + Flow and does NOT decide invoice eligibility.
+
+WHO OWNS WHICH WITHDRAWAL (allocation policy)
+Allocation is NEWEST-ELIGIBLE-FIRST, not FIFO. A withdrawal is filled from the customer's newest eligible sales first; ties break on ledger key. Never explain ownership as "oldest sale goes out first" — that was the old behaviour and it produced wrong answers.
+Allocations belonging to an EFFECTIVE settlement are LOCKED and reproduced verbatim on every rebuild; the allocation policy only ever redistributes money that is not yet invoiced. So an old invoice never moves when policy or new data changes.
+A RETURNED withdrawal keeps its locked allocation rows so old invoices stay immutable, but it does NOT reserve source capacity: that money came back to PayPal and goes out again in a later withdrawal. The already-invoiced part is clawed back through WITHDRAWAL_REVERSAL_ADJUSTMENT, never by rewriting history.
+
+EFFECTIVE SETTLEMENT STATUS
+Effective = ISSUED, PARTIALLY_PAID, PAID. These consume money and lock allocations.
+Not effective = CREATING (a create that never finished), FAILED, CANCELLED. These must never hold customer money; the next sync releases it.
+Never report an invoice as real unless its status is effective.
+
+ALLOCATION STATUS MEANINGS
+- AVAILABLE: matched at the receiving provider, invoiceable.
+- IN_TRANSIT: withdrawal left PayPal, not yet seen at the receiving provider.
+- OVERDUE: IN_TRANSIT for too long. Money is still expected but late; someone should look.
+- UNMATCHED: no receiving destination is configured for that PayPal account.
+- UNSUPPORTED_PROVIDER: the Account row names a Linked Provider that reconcile cannot match (only GREY is supported today). This money will NEVER arrive on its own. It is a configuration bug, not a delay. Say so plainly instead of describing it as in transit.
 
 SHEET MAP
 - Account: provider accounts, balances, statuses. Never expose Client ID/Client Secret.
@@ -53,7 +70,9 @@ KEY MONEY MEANINGS
 
 INVOICE RULES
 - Use America/New_York for customer business dates.
-- Eligible money: selected customer + AVAILABLE + Remaining Available>0 + original sale date <= To Date.
+- Eligible money: selected customer + AVAILABLE + Remaining Available>0 + original sale date <= To Date + Available Date <= As-Of Date.
+- As-Of Date is a SECOND, separate cutoff and it is about arrival, not about the sale. It answers "what had actually landed at the receiving provider by this date". Money whose sale falls inside the period but which only arrived after As-Of is NOT eligible. Defaults to today when the caller omits it. Re-running an old period with today's As-Of therefore gives a bigger number than the same period billed back then, and that is correct, not a bug.
+- An AVAILABLE row with no Available Date can never pass that test, so it silently falls out of every invoice. validateCustomerSystem() reports it. Treat it as a data fault, not as "nothing to bill".
 - From Date is NOT a hard lower bound: older uninvoiced available money may enter as carry-forward.
 - Created/issued Settlements and Settlement Items are historical snapshots; never rewrite old invoice money from current live data.
 - One invoice currently must not mix receiving providers or source currencies.
