@@ -2328,6 +2328,50 @@ function custReportOrphanPaidPayouts_(ss,issues){
 }
 
 /*
+ * Dòng Settlement chụp ảnh Payout Provider / Payout Account Key lúc phát hành,
+ * còn tiền thì đi theo dòng Payouts và Flow ghi đè Account Key của transaction
+ * mỗi lần sync. Đổi tay account trên Payouts là hợp lệ — đó chính là cách sửa
+ * khi định chi từ ví này mà chi nhầm ví kia — nhưng không có gì kéo ảnh chụp
+ * kia đi theo, nên hoá đơn sẽ mãi mãi khai sai chỗ tiền đã rời đi.
+ *
+ * Không chặn, chỉ nêu ra. Số tiền vẫn đúng; sai là hồ sơ, và hồ sơ sai thì chỉ
+ * lộ ra lúc có người đi đối chiếu ví — thường là muộn nhất.
+ */
+function custReportPayoutDestinationDrift_(ss,issues){
+  const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet);
+  if(!hs['Payout Account Key']&&!hs['Payout Provider'])return;
+  const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), hp=custHeaderMap_(shPay);
+  if(!hp['Settlement Key'])return;
+
+  const setByKey={};
+  custReadRowsObjects_(shSet,hs).forEach(s=>{const k=custStr_(s['Settlement Key']);if(k)setByKey[k]=s;});
+
+  custReadRowsObjects_(shPay,hp).forEach(p=>{
+    const sk=custStr_(p['Settlement Key']); if(!sk)return;
+    /* Link gãy và settlement chưa thành hoá đơn thật đều đã có report riêng. */
+    const s=setByKey[sk]; if(!s)return;
+    if(!custIsEffectiveSettlementStatus_(s['Status']))return;
+    /* CANCELLED thì không đồng nào rời đi, lệch ở đó không nói lên gì. */
+    const status=custUpper_(p['Status']); if(status==='CANCELLED')return;
+
+    const drift=[];
+    /*
+     * Ô trống nghĩa là chưa từng chụp ảnh (dòng cũ hơn cột này), không phải
+     * lệch. Suy ra lệch từ một ô trống là tạo báo động giả.
+     */
+    const wantProv=custUpper_(s['Payout Provider']), gotProv=custUpper_(p['Provider']);
+    if(wantProv&&gotProv&&wantProv!==gotProv)drift.push('provider '+wantProv+' → '+gotProv);
+    const wantAcct=custCanonicalKey_(s['Payout Account Key']), gotAcct=custCanonicalKey_(p['Account Key']);
+    if(wantAcct&&gotAcct&&wantAcct!==gotAcct)drift.push('account '+wantAcct+' → '+gotAcct);
+    if(!drift.length)return;
+
+    issues.push('PAYOUT LỆCH ĐÍCH SO VỚI HOÁ ĐƠN '+custStr_(p['Payout Key'])+' ('+status+' '+
+      custNum_(p['Amount']).toFixed(2)+') · '+custStr_(s['Invoice Number'])+' ghi '+drift.join(', ')+
+      ' · tiền đúng số nhưng hoá đơn khai sai chỗ đã chi');
+  });
+}
+
+/*
  * Rebuilds the ledger from source to find sales belonging to no customer.
  * Costly, but this is a manual check and the whole point is to hand back enough
  * detail to fix the Customers sheet.
@@ -2643,6 +2687,7 @@ function validateCustomerSystem(){
 
   custReportReceivingMatchWarnings_(allocs,txs,issues);
   custReportOrphanPaidPayouts_(ss,issues);
+  custReportPayoutDestinationDrift_(ss,issues);
   custReportUnattributedSales_(ss,issues);
   custReportBrokenSettlementLinks_(ss,issues);
   /*
