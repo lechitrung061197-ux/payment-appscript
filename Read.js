@@ -39,7 +39,7 @@ SHEET MAP
 - Account: provider accounts, balances, statuses. Never expose Client ID/Client Secret.
 - Paypal: PayPal source transactions/events; Invoice Prefix identifies customer.
 - Transaction: real money movement + Reconcile Status + Matched Transaction Key.
-- Grey / USDT: provider account summaries.
+- Grey / USDT: provider account summaries. USDT!A1 holds the system-wide USDT total: money from the PayPal pipeline, plus manual inbound, minus what was paid out. It is NOT a real wallet balance and nothing in the system reads it — the wallet has no feed, so only movements the system recorded are counted.
 - Customers: customer config + PayPal Total, Matched, Available, Invoiced, Outstanding, Pending in PayPal, Advance Outstanding, Refund Owed. The last two are what the customer owes back; both are derived every sync.
 - Customer Ledger: PayPal sale ownership and actual PayPal fee/refund impact.
 - Customer Allocation: customer share of PayPal withdrawals and receiving match. AVAILABLE rows are invoiceable.
@@ -47,6 +47,7 @@ SHEET MAP
 - Settlements: immutable invoice summary/snapshots.
 - Settlement Items: immutable invoice detail/audit rows.
 - Payouts: payout obligation/state. Invoice creates DRAFT, not PAID.
+- Manual In: money that arrived in a treasury wallet from outside the PayPal pipeline, typed in by the owner. Inbound only; outgoing money is always a Payouts row. Status CONFIRMED counts, CANCELLED does not. Optional sheet — absent means the feature is unused, not broken.
 - Invoice Control: preview/create UI.
 - Dictionary: field meanings. Read only when a term/header is unclear.
 
