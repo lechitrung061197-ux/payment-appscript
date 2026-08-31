@@ -41,12 +41,21 @@
  *    Chỉ append dòng mới hoặc vá ô đã có.
  *
  * ==========================================================
- * HẠN CHẾ CẦN BIẾT
+ * CHẠY CÙNG LÚC VỚI syncFlow
  * ==========================================================
- * Advisory lock bên dưới chỉ ngăn các collector tranh nhau.
- * syncFlow() bên Payment All hiện vẫn ghi đè cả sheet
- * Transaction và KHÔNG tham gia lock này. Vì vậy vẫn nên xếp
- * lịch trigger lệch hẳn khỏi giờ chạy syncFlow.
+ * syncFlow() CÓ tham gia advisory lock bên dưới: cùng sheet
+ * '_Sync Lock', cùng ô A2/B2, cùng cách ghi token rồi đọc lại
+ * để xác nhận. Nên hai bên loại trừ nhau đúng như mong muốn.
+ *
+ * Ngoài ra syncFlow còn một lưới nữa: trước khi ghi nó kiểm
+ * lại số dòng sheet Transaction, thấy dài ra so với lúc đọc
+ * thì bỏ hẳn lượt thay vì ghi đè mất dòng collector vừa thêm.
+ *
+ * Nhưng syncFlow vẫn ghi đè TOÀN BỘ vùng dữ liệu Transaction,
+ * nên đụng nhau tuy an toàn mà vẫn tốn: một bên phải chờ tới
+ * 90 giây rồi có thể bỏ lượt. Vẫn nên xếp lịch trigger lệch
+ * hẳn khỏi giờ chạy syncFlow — vì thông lượng, không phải vì
+ * an toàn.
  ************************************************************/
 
 
@@ -525,8 +534,13 @@ function ggUpsertRow_(sheet, headers, index, ctx) {
  * nên khoá phải nằm trong chính spreadsheet dùng chung.
  *
  * Ghi token rồi đọc lại để xác nhận mình thắng. Vẫn còn một
- * khe hở rất nhỏ, nhưng đủ để các collector không giẫm nhau.
- * syncFlow() KHÔNG tham gia lock này.
+ * khe hở rất nhỏ, nhưng đủ để các bên không giẫm nhau.
+ *
+ * syncFlow() bên Payment All dùng CÙNG giao thức này trên
+ * cùng sheet và cùng ô, nên collector và Flow loại trừ nhau.
+ * Đổi tên sheet, đổi ô, hay đổi cách ghi token ở một bên là
+ * phá vỡ điều đó trong im lặng — hai bên sẽ tưởng mình đang
+ * giữ khoá trong khi bên kia vẫn chạy.
  ************************************************************/
 
 function ggAcquireLock_(ss) {
