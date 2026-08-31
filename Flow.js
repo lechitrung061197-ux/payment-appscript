@@ -5864,6 +5864,22 @@ function flowUpdateUsdtSummary_(
   const rows =
     flowReadRows_(sheet);
 
+  /*
+   * Tổng toàn hệ thống, cộng qua mọi ví.
+   *
+   * Con số theo từng ví trả lời "đường ống đã giao về ví nào", và nó sai ngay
+   * khi tiền bị xáo giữa các ví — việc hệ thống không có cách nào nhìn thấy.
+   * Tổng thì miễn nhiễm, vì nó không nhìn vào ví nào cả.
+   *
+   * Và nó KHÔNG phải số dư ví thật. Nó là "đường ống PayPal giao về bao nhiêu,
+   * đã chi ra bao nhiêu, còn lại bao nhiêu" — cả hai vế đều suy từ nguồn có
+   * thật, nên đúng tuyệt đối miễn là mọi khoản chi đều có dòng Payouts. Muốn
+   * biết ví thật có bao nhiêu thì mở ví; hệ thống không dùng số đó để quyết
+   * định bất cứ điều gì.
+   */
+  let poolReceived = 0;
+  let poolWithdrawn = 0;
+
 
   rows.forEach(
     row => {
@@ -6032,6 +6048,10 @@ function flowUpdateUsdtSummary_(
         lastActivity ||
         '';
 
+
+      poolReceived += totalReceived;
+      poolWithdrawn += totalWithdrawn;
+
     }
   );
 
@@ -6040,6 +6060,47 @@ function flowUpdateUsdtSummary_(
     sheet,
     rows
   );
+
+
+  flowWriteUsdtPoolTotal_(
+    sheet,
+    poolReceived,
+    poolWithdrawn
+  );
+
+}
+
+
+/*
+ * Hàng 1 là hàng ghi chú theo quy ước của workbook: header ở hàng 2, dữ liệu từ
+ * hàng 3. flowWriteRows_ chỉ đụng từ DATA_START_ROW trở xuống, nên hàng 1 là
+ * chỗ duy nhất ghi được mà không bao giờ bị vòng ghi dữ liệu xoá mất.
+ */
+function flowWriteUsdtPoolTotal_(
+  sheet,
+  received,
+  withdrawn
+) {
+
+  const remaining =
+    flowRoundMoney_(
+      received -
+      withdrawn
+    );
+
+
+  sheet
+    .getRange(1, 1)
+    .setValue(
+      'TỔNG USDT TRONG HỆ THỐNG · ' +
+      'đường ống giao về ' +
+      flowRoundMoney_(received).toFixed(2) +
+      ' · đã chi ' +
+      flowRoundMoney_(withdrawn).toFixed(2) +
+      ' · CÒN LẠI ' +
+      remaining.toFixed(2) +
+      '   (không phải số dư ví thật — chỉ tính phần đi qua hệ thống)'
+    );
 
 }
 
