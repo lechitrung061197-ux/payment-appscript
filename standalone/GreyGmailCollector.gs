@@ -565,32 +565,31 @@ function ggForwardHeaderBlock_(bodyText) {
 
   if (anchor === -1) return '';
 
-  const from = Math.max(0, anchor - (marker !== -1 ? 0 : 200));
-  const rest = text.substring(from, from + 2000);
+  /*
+   * CỬA SỔ CỐ ĐỊNH, KHÔNG DỰA VÀO DÒNG TRỐNG.
+   *
+   * Đã thử hai luật dựa vào dòng trống và cả hai đều hỏng trên body thật:
+   *
+   *   - "cắt tại dòng trống đầu tiên" → Gmail chèn một dòng trống ngay dưới
+   *     dòng dấu hiệu, khối trả về đúng một dòng, không địa chỉ nào;
+   *   - "cắt tại dòng trống đầu tiên sau khi gặp @" → giữa mỗi dòng header
+   *     cũng có dòng trống, nên khối dừng ngay sau dòng "Từ:", chưa tới "To:".
+   *
+   * Cách Gmail xuống dòng không đáng để dựa vào. Nhưng có một điều luôn đúng:
+   * khối header trích dẫn NGẮN và nằm ngay đầu mail. Nên lấy một cửa sổ cố
+   * định là đủ, và đủ hẹp để không chạm tới địa chỉ nào trong thân mail —
+   * support@grey.co ở footer cách đây rất xa, và nó cũng không phải địa chỉ
+   * của account nào.
+   */
+  const before = marker !== -1 ? 0 : 250;
+  const from = Math.max(0, anchor - before);
 
   /*
-   * Cắt tại dòng trống đầu tiên SAU KHI đã gặp một địa chỉ email.
-   *
-   * Bản trước cắt tại dòng trống đầu tiên, chấm hết — và chạy thật thì hỏng:
-   * Gmail chèn một dòng trống ngay dưới dòng dấu hiệu, nên khối trả về đúng
-   * một dòng "---------- Forwarded message ---------" không có địa chỉ nào,
-   * và mọi mail forward đều bị loại.
-   *
-   * Luật mới nói thẳng thứ đang cần: khối header trích dẫn kéo dài tới hết
-   * các dòng địa chỉ. Không phụ thuộc vào việc Gmail chèn mấy dòng trống ở
-   * đâu, cũng không phụ thuộc vào nhãn hay ngôn ngữ.
+   * 400 ký tự là dư cho khối header kể cả khi mỗi dòng cách nhau một dòng
+   * trống — đo trên mail thật thì nó dài khoảng 180. Rộng hơn nữa chỉ tăng
+   * nguy cơ chạm vào địa chỉ nằm trong thân mail.
    */
-  const at = rest.indexOf('@');
-  const searchFrom = at === -1 ? 0 : at;
-
-  const blank = rest.substring(searchFrom).search(/\n[ \t]*\n/);
-
-  /* Vẫn chặn trên: không có dòng trống nào thì cũng đừng nuốt cả thân mail. */
-  const end = blank !== -1
-    ? searchFrom + blank
-    : Math.min(rest.length, 800);
-
-  return rest.substring(0, end);
+  return text.substring(from, from + before + 400);
 }
 
 
