@@ -90,20 +90,6 @@ const GG_CFG = Object.freeze({
   // mail forward nào.
   READ_FORWARDED: true,
 
-  // Lượt quét forward nên soi MỌI mail trong hộp, hay chỉ những mail Gmail tìm
-  // thấy có chứa địa chỉ Grey?
-  //
-  // true  — hộp thư chuyên dụng, chỉ dùng để nhận forward Grey. Không phụ
-  //         thuộc vào cách Gmail tách từ trong 'hello@grey.co' — thứ không có
-  //         gì bảo đảm và có thể bỏ sót trong im lặng. Quét hết thì mail nào
-  //         cũng được soi, và vì hộp chỉ có mail Grey nên cũng chẳng tốn thêm.
-  //
-  // false — hộp thư dùng chung với việc khác. Thu hẹp bằng truy vấn nội dung
-  //         để khỏi kéo về thân của từng mail cá nhân.
-  //
-  // Dù chọn gì, quyết định cuối vẫn là khối trích dẫn có chứa địa chỉ Grey hay
-  // không. Cờ này chỉ đổi phạm vi kéo mail, không nới lỏng phép kiểm.
-  FORWARD_SCAN_ALL: false,
 
   // Chỉ quét mail trong ngần này ngày. Chạy hằng ngày thì 7 là dư biên:
   // mail về muộn, Gmail lỗi, hay trigger nghỉ vài ngày đều bù được.
@@ -382,16 +368,19 @@ function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, ma
     ggCollectPass_({
       label: 'forwarded',
       /*
-       * Luôn loại mail Grey gửi thẳng — lượt 1 đã lo rồi.
+       * Chỉ loại mail Grey gửi thẳng — lượt 1 đã lo rồi. Ngoài ra không thu
+       * hẹp gì thêm.
        *
-       * Phần còn lại tuỳ FORWARD_SCAN_ALL: quét sạch hộp, hay thu hẹp bằng
-       * truy vấn nội dung. Thân mail Grey thật chỉ chứa support@grey.co, nên
-       * hello@grey.co xuất hiện trong nội dung là dấu hiệu của một mail
-       * forward — nhưng nó dựa vào cách Gmail đánh chỉ mục địa chỉ email, thứ
-       * có thể bỏ sót mà không báo gì.
+       * Từng có chế độ tìm 'hello@grey.co' trong nội dung cho gọn. Bỏ, vì nó
+       * dựa vào cách Gmail đánh chỉ mục địa chỉ email: chạy thật thì truy vấn
+       * đó trả về vài mail không liên quan và KHÔNG trả về mail forward nào.
+       * Một tuỳ chọn mà một giá trị của nó âm thầm làm mất dữ liệu thì không
+       * phải tuỳ chọn.
+       *
+       * Hộp thư quá lớn để quét hết thì tắt READ_FORWARDED, đừng thu hẹp bằng
+       * một truy vấn không đáng tin.
        */
-      query: (GG_CFG.FORWARD_SCAN_ALL ? '' : '"' + GG_CFG.SENDER + '" ') +
-        '-from:' + GG_CFG.SENDER + since,
+      query: '-from:' + GG_CFG.SENDER + since,
       isGrey: function (message, bodyText) {
         return ggForwardHeaderBlock_(bodyText)
           .toLowerCase().indexOf(GG_CFG.SENDER) !== -1;
@@ -431,7 +420,19 @@ function ggCollectPass_(pass, txSheet, txHeaders, index, greyAccounts, fallback,
 
         tally.matched++;
 
-        if (!pass.isGrey(message, bodyText)) { tally.notGrey++; return; }
+        if (!pass.isGrey(message, bodyText)) {
+          tally.notGrey++;
+          /*
+           * Cửa này im lặng là chỗ khó chẩn đoán nhất: mail bị loại mà không
+           * biết vì nó thật sự không liên quan, hay vì phần cắt khối hỏng.
+           */
+          if (pass.label === 'forwarded' && tally.notGrey <= 3) {
+            Logger.log('  loại [forwarded]: "' + ggTruncate_(rawSubject, 60) +
+              '" · khối cắt ra ' +
+              JSON.stringify(ggTruncate_(ggForwardHeaderBlock_(bodyText).replace(/\s+/g, ' '), 160)));
+          }
+          return;
+        }
 
         seen[messageId] = true;
         stats.scanned++;
