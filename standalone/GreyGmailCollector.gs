@@ -280,7 +280,16 @@ function ggRun_(lookbackDays) {
       ' · no reference ' + stats.noReference +
       ' · unmapped ' + stats.unmapped +
       ' · ambiguous ' + stats.ambiguous +
-      ' · forwarded ' + stats.forwarded);
+      ' · forwarded ' + stats.forwarded +
+      ' · ignored ' + stats.ignored);
+    Object.keys(stats.perPass).forEach(function (label) {
+      const t = stats.perPass[label];
+      Logger.log('  lượt ' + label + ': Gmail trả ' + t.matched +
+        ' · không phải Grey ' + t.notGrey +
+        ' · xét ' + t.scanned +
+        ' · bỏ qua ' + t.ignored +
+        ' · nhận ' + t.kept);
+    });
     Object.keys(stats.perAccount).forEach(function (key) {
       const p = stats.perAccount[key];
       Logger.log('  ' + key + ': ' + p.created + ' new · ' + p.updated + ' upd · ' + p.unchanged + ' same');
@@ -326,7 +335,10 @@ function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, ma
   const stats = {
     scanned: 0, transactionMails: 0, ignored: 0,
     created: 0, updated: 0, unchanged: 0, noReference: 0,
-    unmapped: 0, ambiguous: 0, forwarded: 0, perAccount: {}
+    unmapped: 0, ambiguous: 0, forwarded: 0, perAccount: {},
+    /* Tách theo lượt, nếu không thì một lượt về tay trắng nhìn y hệt lượt kia
+       làm hết việc — và không có cách nào biết lượt nào hỏng. */
+    perPass: {}
   };
 
   /*
@@ -414,15 +426,31 @@ function ggCollectPass_(pass, txSheet, txHeaders, index, greyAccounts, fallback,
           (message.getPlainBody() || '') + '\n' + ggHtmlToText_(message.getBody() || '')
         );
 
-        if (!pass.isGrey(message, bodyText)) return;
+        const tally = stats.perPass[pass.label] ||
+          (stats.perPass[pass.label] = { matched: 0, notGrey: 0, scanned: 0, ignored: 0, kept: 0 });
+
+        tally.matched++;
+
+        if (!pass.isGrey(message, bodyText)) { tally.notGrey++; return; }
 
         seen[messageId] = true;
         stats.scanned++;
+        tally.scanned++;
 
         const subject = pass.cleanSubject(rawSubject);
 
-        if (!ggIsTransactionMail_(subject, bodyText)) { stats.ignored++; return; }
+        if (!ggIsTransactionMail_(subject, bodyText)) {
+          stats.ignored++;
+          tally.ignored++;
+          /* Vài mẫu đầu là đủ để thấy đang loại nhầm hay loại đúng. */
+          if (tally.ignored <= 3) {
+            Logger.log('  bỏ qua [' + pass.label + ']: không phải mail giao dịch — "' +
+              ggTruncate_(subject, 70) + '"');
+          }
+          return;
+        }
         stats.transactionMails++;
+        tally.kept++;
 
         /*
          * Account đến từ địa chỉ người nhận, không từ config. Nhiều khớp thì
