@@ -539,10 +539,29 @@ function ggForwardHeaderBlock_(bodyText) {
   if (anchor === -1) return '';
 
   const from = Math.max(0, anchor - (marker !== -1 ? 0 : 200));
-  const rest = text.substring(from);
+  const rest = text.substring(from, from + 2000);
 
-  const blank = rest.search(/\n[ \t]*\n/);
-  const end = blank !== -1 ? blank : Math.min(rest.length, 800);
+  /*
+   * Cắt tại dòng trống đầu tiên SAU KHI đã gặp một địa chỉ email.
+   *
+   * Bản trước cắt tại dòng trống đầu tiên, chấm hết — và chạy thật thì hỏng:
+   * Gmail chèn một dòng trống ngay dưới dòng dấu hiệu, nên khối trả về đúng
+   * một dòng "---------- Forwarded message ---------" không có địa chỉ nào,
+   * và mọi mail forward đều bị loại.
+   *
+   * Luật mới nói thẳng thứ đang cần: khối header trích dẫn kéo dài tới hết
+   * các dòng địa chỉ. Không phụ thuộc vào việc Gmail chèn mấy dòng trống ở
+   * đâu, cũng không phụ thuộc vào nhãn hay ngôn ngữ.
+   */
+  const at = rest.indexOf('@');
+  const searchFrom = at === -1 ? 0 : at;
+
+  const blank = rest.substring(searchFrom).search(/\n[ \t]*\n/);
+
+  /* Vẫn chặn trên: không có dòng trống nào thì cũng đừng nuốt cả thân mail. */
+  const end = blank !== -1
+    ? searchFrom + blank
+    : Math.min(rest.length, 800);
 
   return rest.substring(0, end);
 }
