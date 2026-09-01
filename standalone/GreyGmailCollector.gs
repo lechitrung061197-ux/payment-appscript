@@ -72,10 +72,16 @@ const GG_CFG = Object.freeze({
   // cột Email của sheet Grey. Nhờ vậy một file dùng chung được cho cả hộp thư
   // riêng của từng Grey account lẫn hộp thư trung tâm nhận forward.
   //
-  // Giá trị dưới đây CHỈ là phương án dự phòng, dùng khi không tra được
-  // account nào từ header. Hộp thư riêng thì điền; hộp thư trung tâm nên
-  // để trống, vì đoán bừa còn tệ hơn bỏ sót.
-  FALLBACK_ACCOUNT_KEY: 'GR001',
+  // Phương án dự phòng khi không tra được account nào từ địa chỉ người nhận.
+  //
+  // ĐỂ TRỐNG là mặc định, và gần như luôn là lựa chọn đúng. Điền vào nghĩa là
+  // "mail nào tra không ra thì cứ gán cho account này" — nó quy kết TIỀN, và
+  // gán sai còn tệ hơn bỏ sót vì bỏ sót thì thấy được, còn gán sai thì không.
+  //
+  // Chỉ điền khi chắc chắn hộp thư này chỉ nhận mail của đúng một Grey
+  // account. Hộp thư trung tâm nhận forward từ nhiều account thì TUYỆT ĐỐI
+  // để trống.
+  FALLBACK_ACCOUNT_KEY: '',
 
   SENDER: 'hello@grey.co',
 
@@ -253,7 +259,8 @@ function ggRun_(lookbackDays) {
         'RAW OK · ' + per.created + ' new · ' + per.updated + ' upd · ' +
         per.unchanged + ' same' +
         (stats.unmapped ? ' · ' + stats.unmapped + ' UNMAPPED' : '') +
-        (stats.ambiguous ? ' · ' + stats.ambiguous + ' AMBIGUOUS' : ''));
+        (stats.ambiguous ? ' · ' + stats.ambiguous + ' AMBIGUOUS' : '') +
+        (stats.fellBack ? ' · ' + stats.fellBack + ' FALLBACK' : ''));
     });
 
     SpreadsheetApp.flush();
@@ -267,7 +274,13 @@ function ggRun_(lookbackDays) {
       ' · unmapped ' + stats.unmapped +
       ' · ambiguous ' + stats.ambiguous +
       ' · forwarded ' + stats.forwarded +
-      ' · ignored ' + stats.ignored);
+      ' · ignored ' + stats.ignored +
+      (stats.fellBack ? ' · FALLBACK ' + stats.fellBack : ''));
+    if (stats.fellBack) {
+      Logger.log('CẢNH BÁO: ' + stats.fellBack + ' mail được gán cho ' +
+        GG_CFG.FALLBACK_ACCOUNT_KEY + ' bằng phỏng đoán. Kiểm cột Email của sheet Grey, ' +
+        'sửa Account Key của các dòng đó bằng tay, và cân nhắc để FALLBACK_ACCOUNT_KEY trống.');
+    }
     Object.keys(stats.perPass).forEach(function (label) {
       const t = stats.perPass[label];
       Logger.log('  lượt ' + label + ': Gmail trả ' + t.matched +
@@ -321,7 +334,7 @@ function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, ma
   const stats = {
     scanned: 0, transactionMails: 0, ignored: 0,
     created: 0, updated: 0, unchanged: 0, noReference: 0,
-    unmapped: 0, ambiguous: 0, forwarded: 0, perAccount: {},
+    unmapped: 0, ambiguous: 0, forwarded: 0, fellBack: 0, perAccount: {},
     /* Tách theo lượt, nếu không thì một lượt về tay trắng nhìn y hệt lượt kia
        làm hết việc — và không có cách nào biết lượt nào hỏng. */
     perPass: {}
@@ -475,6 +488,20 @@ function ggCollectPass_(pass, txSheet, txHeaders, index, greyAccounts, fallback,
               ggTruncate_(subject, 80) + '" · nguồn tra ' + ggTruncate_(resolved.debug, 200));
             return;
           }
+
+          /*
+           * Dùng fallback là QUY KẾT TIỀN BẰNG PHỎNG ĐOÁN. Trước đây chỗ này
+           * im lặng hoàn toàn — không đếm, không log — nên mail của một account
+           * bị gán sang account khác mà không ai biết. Và Account Key không nằm
+           * trong GG_UPDATABLE, nên dòng sai đó KHÔNG tự sửa ở lần chạy sau.
+           *
+           * Im lặng ở đây là kiểu hỏng tệ nhất trong cả file, nên nó phải kêu.
+           */
+          stats.fellBack++;
+          Logger.log('FALLBACK [' + pass.label + ']: tra không ra account, gán tạm cho ' +
+            fallback.accountKey + ' — subject "' + ggTruncate_(subject, 70) +
+            '" · nguồn tra ' + ggTruncate_(resolved.debug, 160));
+
           account = fallback;
         }
 
