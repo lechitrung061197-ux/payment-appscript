@@ -90,6 +90,21 @@ const GG_CFG = Object.freeze({
   // mail forward nào.
   READ_FORWARDED: true,
 
+  // Lượt quét forward nên soi MỌI mail trong hộp, hay chỉ những mail Gmail tìm
+  // thấy có chứa địa chỉ Grey?
+  //
+  // true  — hộp thư chuyên dụng, chỉ dùng để nhận forward Grey. Không phụ
+  //         thuộc vào cách Gmail tách từ trong 'hello@grey.co' — thứ không có
+  //         gì bảo đảm và có thể bỏ sót trong im lặng. Quét hết thì mail nào
+  //         cũng được soi, và vì hộp chỉ có mail Grey nên cũng chẳng tốn thêm.
+  //
+  // false — hộp thư dùng chung với việc khác. Thu hẹp bằng truy vấn nội dung
+  //         để khỏi kéo về thân của từng mail cá nhân.
+  //
+  // Dù chọn gì, quyết định cuối vẫn là khối trích dẫn có chứa địa chỉ Grey hay
+  // không. Cờ này chỉ đổi phạm vi kéo mail, không nới lỏng phép kiểm.
+  FORWARD_SCAN_ALL: false,
+
   // Chỉ quét mail trong ngần này ngày. Chạy hằng ngày thì 7 là dư biên:
   // mail về muộn, Gmail lỗi, hay trigger nghỉ vài ngày đều bù được.
   // Đặt 0 = quét toàn bộ (chỉ dùng cho lần nạp đầu tiên).
@@ -355,11 +370,16 @@ function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, ma
     ggCollectPass_({
       label: 'forwarded',
       /*
-       * Thân mail Grey thật chỉ chứa support@grey.co, không chứa hello@grey.co
-       * — địa chỉ đó chỉ xuất hiện trong khối trích dẫn của một mail forward.
-       * Nên đây là dấu hiệu đủ mạnh, mà vẫn không phải quét cả hộp thư.
+       * Luôn loại mail Grey gửi thẳng — lượt 1 đã lo rồi.
+       *
+       * Phần còn lại tuỳ FORWARD_SCAN_ALL: quét sạch hộp, hay thu hẹp bằng
+       * truy vấn nội dung. Thân mail Grey thật chỉ chứa support@grey.co, nên
+       * hello@grey.co xuất hiện trong nội dung là dấu hiệu của một mail
+       * forward — nhưng nó dựa vào cách Gmail đánh chỉ mục địa chỉ email, thứ
+       * có thể bỏ sót mà không báo gì.
        */
-      query: '"' + GG_CFG.SENDER + '" -from:' + GG_CFG.SENDER + since,
+      query: (GG_CFG.FORWARD_SCAN_ALL ? '' : '"' + GG_CFG.SENDER + '" ') +
+        '-from:' + GG_CFG.SENDER + since,
       isGrey: function (message, bodyText) {
         return ggForwardHeaderBlock_(bodyText)
           .toLowerCase().indexOf(GG_CFG.SENDER) !== -1;
