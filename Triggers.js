@@ -204,17 +204,23 @@ function trigBuildReport_(ss) {
       if (!key) return;
       if (custUpper_(c['Status']) === 'DISABLED') return;
 
-      lines.push(key + ' — chưa invoice ' + trigMoney_(c['Outstanding Amount']) +
+      /*
+       * Tên dễ theo dõi hơn CUS001. Lùi về khoá khi chưa đặt tên, vì một dòng
+       * không có nhãn nào thì tệ hơn hẳn một dòng mang khoá.
+       */
+      const who = custStr_(c['Customer Name']) || key;
+
+      lines.push(who + ' — chưa invoice ' + trigMoney_(c['Outstanding Amount']) +
         ' · đang về ' + trigMoney_(c['Pending in PayPal']));
 
       /* Hai khoản khách nợ lại: nêu riêng chứ đừng trộn vào dòng trên. */
       const advance = custNum_(c['Advance Outstanding']);
       if (advance > CUST_CFG.EPSILON) {
-        issues.push(key + ' còn nợ ứng ' + trigMoney_(advance));
+        issues.push(who + ' còn nợ ứng ' + trigMoney_(advance));
       }
       const owed = custNum_(c['Refund Owed']);
       if (owed > CUST_CFG.EPSILON) {
-        issues.push(key + ' nợ lại do refund muộn ' + trigMoney_(owed));
+        issues.push(who + ' nợ lại do refund muộn ' + trigMoney_(owed));
       }
     });
   }
