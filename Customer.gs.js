@@ -1450,6 +1450,12 @@ function custUpdateCustomerSummary_(ss, state, ledger, allocations, lateRefundSt
    * người ta không nhìn thấy là thứ người ta quên mất.
    */
   const h=custEnsureHeaders_(sh,['Advance Outstanding','Refund Owed']);
+  /*
+   * Cột mới thừa hưởng định dạng của vùng bên cạnh, và ở đây nó thừa hưởng
+   * kiểu NGÀY: số 0 hiện ra thành 30/12/1899, còn getValues() trả về Date.
+   * Ép định dạng số để cả người lẫn máy đọc ra cùng một thứ.
+   */
+  custFormatMoneyColumns_(sh,h,['Advance Outstanding','Refund Owed']);
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), hs=custHeaderMap_(shSet), sets=custReadRowsObjects_(shSet,hs);
   const advanceState=custBuildAdvanceOwedState_(ss);
   const shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), hp=custHeaderMap_(shPay), payouts=custReadRowsObjects_(shPay,hp);
@@ -1995,7 +2001,8 @@ function custCreateCustomerInvoicePrepared_(ss,p,writeControlStatus){
   const now=new Date();
   const shSet=custRequireSheet_(ss,CUST_CFG.SETTLEMENTS_SHEET), shItems=custRequireSheet_(ss,CUST_CFG.SETTLEMENT_ITEMS_SHEET), shAlloc=custRequireSheet_(ss,CUST_CFG.ALLOCATION_SHEET), shPay=custRequireSheet_(ss,CUST_CFG.PAYOUTS_SHEET), shTx=custRequireSheet_(ss,CUST_CFG.TRANSACTION_SHEET);
   custEnsureHeaders_(shPay,['Customer Key','Settlement Key']);
-  custEnsureHeaders_(shSet,['Preview Fingerprint','Advance Amount','Advance Recovered','Advance Outstanding After']);
+  const hsAdv=custEnsureHeaders_(shSet,['Preview Fingerprint','Advance Amount','Advance Recovered','Advance Outstanding After']);
+  custFormatMoneyColumns_(shSet,hsAdv,['Advance Amount','Advance Recovered','Advance Outstanding After']);
   const hs=custHeaderMap_(shSet), hi=custHeaderMap_(shItems), ha=custHeaderMap_(shAlloc), hp=custHeaderMap_(shPay), htx=custHeaderMap_(shTx);
   const existingSettlement=custFindSettlementByFingerprint_(shSet,hs,p.fingerprint);
   const existingStatus=existingSettlement?custUpper_(existingSettlement['Status']):'';
@@ -2988,6 +2995,22 @@ function validateCustomerSystem(){
 function custRequireSheet_(ss,name){const s=ss.getSheetByName(name);if(!s)throw new Error('Missing required sheet: '+name);return s;}
 function custHeaderMap_(sheet){if(!sheet||sheet.getLastColumn()<1)return{};const vals=sheet.getRange(CUST_CFG.HEADER_ROW,1,1,sheet.getLastColumn()).getDisplayValues()[0],m={};vals.forEach((v,i)=>{const k=String(v||'').trim();if(k)m[k]=i+1;});return m;}
 function custRequireHeaders_(name,h,required){const miss=required.filter(k=>!h[k]);if(miss.length)throw new Error(name+' missing headers: '+miss.join(', '));}
+/*
+ * Ép định dạng số cho vài cột tiền. Idempotent, gọi mỗi lần sync cũng không
+ * sao — vài lệnh setNumberFormat trên một dải, không đáng kể.
+ */
+function custFormatMoneyColumns_(sheet,h,headers){
+  const last=sheet.getLastRow();
+  if(last<CUST_CFG.DATA_START_ROW)return;
+  headers.forEach(name=>{
+    if(!h[name])return;
+    try{
+      sheet.getRange(CUST_CFG.DATA_START_ROW,h[name],last-CUST_CFG.DATA_START_ROW+1,1)
+        .setNumberFormat('0.00');
+    }catch(ignored){ /* định dạng hỏng không đáng làm hỏng lượt sync */ }
+  });
+}
+
 function custEnsureHeaders_(sheet,names){let h=custHeaderMap_(sheet),last=sheet.getLastColumn();names.forEach(name=>{if(!h[name]){last++;sheet.getRange(CUST_CFG.HEADER_ROW,last).setValue(name);h[name]=last;}});return h;}
 function custClearData_(sheet){const last=sheet.getLastRow();if(last>=CUST_CFG.DATA_START_ROW)sheet.getRange(CUST_CFG.DATA_START_ROW,1,last-CUST_CFG.DATA_START_ROW+1,sheet.getLastColumn()).clearContent();}
 function custPut_(row,h,k,v){if(h[k])row[h[k]-1]=(v===undefined||v===null)?'':v;}
@@ -3045,7 +3068,23 @@ function custCanonicalPrefix_(v){return custUpper_(v).replace(/\s+/g,'');}
 function custParsePrefixes_(v){const s=custStr_(v);return s?s.split(',').map(custCanonicalPrefix_).filter(Boolean):[];}
 function custPaypalTxIndexKey_(a,t){return custCanonicalKey_(a)+'|'+custStr_(t);}
 function custMoneyPoolKey_(a,c){return custCanonicalKey_(a)+'|'+custUpper_(c);}
-function custNum_(v){if(typeof v==='number'&&isFinite(v))return v;let s=custStr_(v);if(!s)return 0;s=s.replace(/[^\d,.\-]/g,'');if(s.indexOf(',')!==-1&&s.indexOf('.')!==-1){if(s.lastIndexOf(',')>s.lastIndexOf('.'))s=s.replace(/\./g,'').replace(',','.');else s=s.replace(/,/g,'');}else if(s.indexOf(',')!==-1){const p=s.split(',');s=(p.length===2&&p[1].length<=3)?p[0]+'.'+p[1]:s.replace(/,/g,'');}const n=Number(s);return isFinite(n)?n:0;}
+/*
+ * Date KHÔNG phải số tiền.
+ *
+ * Ô định dạng kiểu ngày mà chứa số 0 sẽ được getValues() trả về dưới dạng
+ * Date (30/12/1899 — mốc 0 của Sheets), và bóc chữ số ra khỏi chuỗi ngày cho
+ * ra rác cỡ 3.018.991.206.300.706. Đã xảy ra thật trên cột Advance
+ * Outstanding, và nó im lặng: số vẫn hiện ra như một con số.
+ *
+ * Trả 0 vì một ngày nằm trong ô tiền là lỗi dữ liệu, không phải giá trị.
+ */
+/*
+ * Không dùng instanceof: nó so theo constructor của từng realm, nên hỏng khi
+ * chạy trong sandbox test — và một phép kiểm mà test không xác minh được thì
+ * chẳng bảo vệ được gì. toString đúng ở mọi realm.
+ */
+function custIsDate_(v){return Object.prototype.toString.call(v)==='[object Date]';}
+function custNum_(v){if(typeof v==='number'&&isFinite(v))return v;if(custIsDate_(v))return 0;let s=custStr_(v);if(!s)return 0;s=s.replace(/[^\d,.\-]/g,'');if(s.indexOf(',')!==-1&&s.indexOf('.')!==-1){if(s.lastIndexOf(',')>s.lastIndexOf('.'))s=s.replace(/\./g,'').replace(',','.');else s=s.replace(/,/g,'');}else if(s.indexOf(',')!==-1){const p=s.split(',');s=(p.length===2&&p[1].length<=3)?p[0]+'.'+p[1]:s.replace(/,/g,'');}const n=Number(s);return isFinite(n)?n:0;}
 function custPercent_(v){if(typeof v==='number'&&isFinite(v))return v>=1?v/100:v;const s=custStr_(v);if(!s)return 0;const n=custNum_(s);return s.indexOf('%')!==-1?n/100:(n>=1?n/100:n);}
 function custBool_(v){if(v===true)return true;if(v===false)return false;const s=custUpper_(v);return ['TRUE','YES','Y','1','ENABLED','ACTIVE'].indexOf(s)!==-1;}
 function custConfigDateKey_(ss,v){if(!v)return '';const d=custDate_(v);if(!d)return '';const tz=ss.getSpreadsheetTimeZone()||Session.getScriptTimeZone()||'GMT';return Utilities.formatDate(d,tz,'yyyy-MM-dd');}

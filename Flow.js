@@ -7932,6 +7932,16 @@ function flowNumber_(
  * NULLABLE NUMBER
  ************************************************************/
 
+/*
+ * Không dùng instanceof: nó so theo constructor của từng realm, nên hỏng khi
+ * chạy trong sandbox test — và một phép kiểm mà test không xác minh được thì
+ * chẳng bảo vệ được gì. toString đúng ở mọi realm.
+ */
+function flowIsDate_(value) {
+  return Object.prototype.toString.call(value) === '[object Date]';
+}
+
+
 function flowNullableNumber_(
   value
 ) {
@@ -7945,6 +7955,16 @@ function flowNullableNumber_(
       ? null
       : value;
 
+  }
+
+
+  /*
+   * Ngày tháng không phải số tiền. Ô định dạng kiểu ngày chứa số 0 sẽ về đây
+   * dưới dạng Date, và bóc chữ số khỏi chuỗi ngày cho ra rác. null nghĩa là
+   * "không có giá trị", đúng hơn hẳn một con số bịa.
+   */
+  if (flowIsDate_(value)) {
+    return null;
   }
 
 

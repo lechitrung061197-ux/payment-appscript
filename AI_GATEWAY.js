@@ -1055,9 +1055,21 @@ function payAiJsonSafe_(v) {
   catch (_) { return String(v); }
 }
 
+/*
+ * Không dùng instanceof: nó so theo constructor của từng realm, nên hỏng khi
+ * chạy trong sandbox test — và một phép kiểm mà test không xác minh được thì
+ * chẳng bảo vệ được gì. toString đúng ở mọi realm.
+ */
+function payAiIsDate_(v) {
+  return Object.prototype.toString.call(v) === '[object Date]';
+}
+
+
 function payAiToNumber_(v) {
   if (typeof v === 'number' && isFinite(v)) return v;
   if (v === null || v === undefined || v === '') return null;
+  /* Ngày tháng không phải số — xem chú thích ở custNum_ bên Customer.gs. */
+  if (payAiIsDate_(v)) return null;
   let s = String(v).trim().replace(/[^\d,.-]/g, '');
   if (!s) return null;
   if (s.indexOf(',') !== -1 && s.indexOf('.') !== -1) {

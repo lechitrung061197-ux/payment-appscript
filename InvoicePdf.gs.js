@@ -1529,8 +1529,22 @@ function invPdfDate_(value) {
 }
 
 
+/*
+ * Không dùng instanceof: nó so theo constructor của từng realm, nên hỏng khi
+ * chạy trong sandbox test — và một phép kiểm mà test không xác minh được thì
+ * chẳng bảo vệ được gì. toString đúng ở mọi realm.
+ */
+function invPdfIsDate_(value) {
+  return Object.prototype.toString.call(value) === '[object Date]';
+}
+
+
 function invPdfNum_(value) {
   if (typeof value === 'number' && isFinite(value)) return value;
+
+  /* Xem chú thích ở custNum_: ngày tháng trong ô tiền phải thành 0, không
+     phải thành rác mười sáu chữ số. */
+  if (invPdfIsDate_(value)) return 0;
 
   let s = invPdfStr_(value);
   if (!s) return 0;
