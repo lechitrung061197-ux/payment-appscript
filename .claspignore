@@ -8,6 +8,11 @@ standalone/**
 # Sheet exports carry Client ID / Client Secret in the Account tab.
 **/*.xlsx
 
+# Tài liệu tham chiếu, đọc trong repo chứ không chạy trong Apps Script.
+# .md vốn đã không nằm trong scriptExtensions, đây là lớp chặn thứ hai.
+docs/**
+**/*.md
+
 .git/**
 .gitignore
 .claspignore
