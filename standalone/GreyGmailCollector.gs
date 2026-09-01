@@ -79,6 +79,17 @@ const GG_CFG = Object.freeze({
 
   SENDER: 'hello@grey.co',
 
+  // Đọc cả mail forward TAY (bấm nút Forward), không chỉ mail Grey gửi thẳng
+  // và mail chuyển tiếp tự động.
+  //
+  // Cần bật ở hộp thư trung tâm nhận mail cũ từ những hộp mình không có quyền
+  // chạy script: chuyển tiếp tự động chỉ áp dụng cho mail đến SAU khi bật, nên
+  // toàn bộ lịch sử phải forward tay.
+  //
+  // Hộp thư riêng của một Grey account thì tắt đi cho nhanh — ở đó không có
+  // mail forward nào.
+  READ_FORWARDED: true,
+
   // Chỉ quét mail trong ngần này ngày. Chạy hằng ngày thì 7 là dư biên:
   // mail về muộn, Gmail lỗi, hay trigger nghỉ vài ngày đều bù được.
   // Đặt 0 = quét toàn bộ (chỉ dùng cho lần nạp đầu tiên).
@@ -253,7 +264,8 @@ function ggRun_(lookbackDays) {
       ' · unchanged ' + stats.unchanged +
       ' · no reference ' + stats.noReference +
       ' · unmapped ' + stats.unmapped +
-      ' · ambiguous ' + stats.ambiguous);
+      ' · ambiguous ' + stats.ambiguous +
+      ' · forwarded ' + stats.forwarded);
     Object.keys(stats.perAccount).forEach(function (key) {
       const p = stats.perAccount[key];
       Logger.log('  ' + key + ': ' + p.created + ' new · ' + p.updated + ' upd · ' + p.unchanged + ' same');
@@ -294,57 +306,124 @@ function ggFallbackAccount_(greyAccounts) {
 
 function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, markSyncing) {
   const index = ggBuildIndex_(txSheet, txHeaders);
-
-  const query = 'from:' + GG_CFG.SENDER +
-    (lookbackDays > 0 ? ' newer_than:' + lookbackDays + 'd' : '');
-  Logger.log('Gmail query: ' + query);
+  const since = lookbackDays > 0 ? ' newer_than:' + lookbackDays + 'd' : '';
 
   const stats = {
     scanned: 0, transactionMails: 0, ignored: 0,
     created: 0, updated: 0, unchanged: 0, noReference: 0,
-    unmapped: 0, ambiguous: 0, perAccount: {}
+    unmapped: 0, ambiguous: 0, forwarded: 0, perAccount: {}
   };
+
+  /*
+   * Cùng một email không được xử lý hai lần dù lọt vào cả hai lượt. Hai truy
+   * vấn hiện đã loại trừ nhau, nhưng đây là thứ không nên phụ thuộc vào cú
+   * pháp tìm kiếm của Gmail.
+   */
+  const seen = {};
+
+  /*
+   * LƯỢT 1 — mail Grey gửi thẳng, hoặc chuyển tiếp TỰ ĐỘNG.
+   *
+   * Chuyển tiếp tự động gửi lại nguyên mail: From vẫn là Grey, To vẫn là địa
+   * chỉ account gốc, chỉ thêm Delivered-To/X-Forwarded-To. Nên nó đi đúng
+   * đường này, không cần gì đặc biệt.
+   */
+  ggCollectPass_({
+    label: 'direct',
+    query: 'from:' + GG_CFG.SENDER + since,
+    isGrey: function (message) {
+      return String(message.getFrom() || '').toLowerCase()
+        .indexOf(GG_CFG.SENDER) !== -1;
+    },
+    resolve: function (message) {
+      return ggResolveGreyAccount_(message, greyAccounts);
+    },
+    cleanSubject: function (subject) { return subject; }
+  }, txSheet, txHeaders, index, greyAccounts, fallback, markSyncing, stats, seen);
+
+  /*
+   * LƯỢT 2 — chuyển tiếp TAY.
+   *
+   * Bấm nút Forward tạo ra một mail mới: From thành người forward, và địa chỉ
+   * Grey gốc chỉ còn trong khối trích dẫn ở thân mail. Cả hai thứ lượt 1 dựa
+   * vào đều mất.
+   *
+   * Cần đường này cho mail cũ ở những hộp thư mình không có quyền chạy script
+   * — chuyển tiếp tự động chỉ áp dụng cho mail đến sau khi bật.
+   */
+  if (GG_CFG.READ_FORWARDED) {
+    ggCollectPass_({
+      label: 'forwarded',
+      /*
+       * Thân mail Grey thật chỉ chứa support@grey.co, không chứa hello@grey.co
+       * — địa chỉ đó chỉ xuất hiện trong khối trích dẫn của một mail forward.
+       * Nên đây là dấu hiệu đủ mạnh, mà vẫn không phải quét cả hộp thư.
+       */
+      query: '"' + GG_CFG.SENDER + '" -from:' + GG_CFG.SENDER + since,
+      isGrey: function (message, bodyText) {
+        return ggForwardHeaderBlock_(bodyText)
+          .toLowerCase().indexOf(GG_CFG.SENDER) !== -1;
+      },
+      resolve: function (message, bodyText) {
+        return ggResolveFromText_(ggForwardHeaderBlock_(bodyText), greyAccounts);
+      },
+      cleanSubject: ggStripForwardPrefix_,
+      countAs: 'forwarded'
+    }, txSheet, txHeaders, index, greyAccounts, fallback, markSyncing, stats, seen);
+  }
+
+  return stats;
+}
+
+
+function ggCollectPass_(pass, txSheet, txHeaders, index, greyAccounts, fallback, markSyncing, stats, seen) {
+  Logger.log('Gmail query [' + pass.label + ']: ' + pass.query);
 
   let start = 0;
   while (start < GG_CFG.MAX_THREADS) {
-    const threads = GmailApp.search(query, start, GG_CFG.BATCH_SIZE);
+    const threads = GmailApp.search(pass.query, start, GG_CFG.BATCH_SIZE);
     if (!threads.length) break;
 
     threads.forEach(function (thread) {
       thread.getMessages().forEach(function (message) {
-        const from = String(message.getFrom() || '').toLowerCase();
-        if (from.indexOf(GG_CFG.SENDER) === -1) return;
+        const messageId = String(message.getId());
+        if (seen[messageId]) return;
 
-        stats.scanned++;
-
-        const subject = String(message.getSubject() || '').trim();
+        const rawSubject = String(message.getSubject() || '').trim();
         const bodyText = ggNormalizeText_(
           (message.getPlainBody() || '') + '\n' + ggHtmlToText_(message.getBody() || '')
         );
+
+        if (!pass.isGrey(message, bodyText)) return;
+
+        seen[messageId] = true;
+        stats.scanned++;
+
+        const subject = pass.cleanSubject(rawSubject);
 
         if (!ggIsTransactionMail_(subject, bodyText)) { stats.ignored++; return; }
         stats.transactionMails++;
 
         /*
-         * Account đến từ header người nhận, không từ config. Nhiều khớp thì
+         * Account đến từ địa chỉ người nhận, không từ config. Nhiều khớp thì
          * bỏ qua chứ không đoán: đây là quy kết tiền theo account, gán sai
          * còn tệ hơn bỏ sót.
          */
-        const resolved = ggResolveGreyAccount_(message, greyAccounts);
+        const resolved = pass.resolve(message, bodyText);
         let account = resolved.account;
 
         if (resolved.status === 'AMBIGUOUS') {
           stats.ambiguous++;
-          Logger.log('AMBIGUOUS: khớp nhiều account ' + resolved.matches.join(', ') +
-            ' — subject "' + ggTruncate_(subject, 80) + '"');
+          Logger.log('AMBIGUOUS [' + pass.label + ']: khớp nhiều account ' +
+            resolved.matches.join(', ') + ' — subject "' + ggTruncate_(subject, 80) + '"');
           return;
         }
 
         if (!account) {
           if (!fallback) {
             stats.unmapped++;
-            Logger.log('UNMAPPED: không tra được account — subject "' +
-              ggTruncate_(subject, 80) + '" · header ' + ggTruncate_(resolved.debug, 200));
+            Logger.log('UNMAPPED [' + pass.label + ']: không tra được account — subject "' +
+              ggTruncate_(subject, 80) + '" · nguồn tra ' + ggTruncate_(resolved.debug, 200));
             return;
           }
           account = fallback;
@@ -353,8 +432,8 @@ function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, ma
         markSyncing(account);
 
         const raw = ggExtractRaw_(bodyText);
-        const messageId = String(message.getId());
         if (!raw.reference) stats.noReference++;
+        if (pass.countAs) stats[pass.countAs]++;
 
         const outcome = ggUpsertRow_(txSheet, txHeaders, index, {
           account: account,
@@ -374,8 +453,54 @@ function ggCollect_(txSheet, txHeaders, greyAccounts, fallback, lookbackDays, ma
     start += threads.length;
     if (threads.length < GG_CFG.BATCH_SIZE) break;
   }
+}
 
-  return stats;
+
+/*
+ * Khối trích dẫn đầu một mail forward tay, ví dụ:
+ *
+ *   ---------- Forwarded message ---------
+ *   Từ: Grey <hello@grey.co>
+ *   Date: ...
+ *   Subject: Wallet Funding Successful
+ *   To: <hangntb7@gmail.com>
+ *
+ * Cắt tại dòng trống đầu tiên. Giữ đúng kỷ luật của bản đọc header thật: chỉ
+ * dò địa chỉ trong khối này, KHÔNG dò cả thân mail — thân mail giao dịch Grey
+ * có chứa địa chỉ email và sẽ khớp nhầm.
+ *
+ * Không parse theo nhãn. Gmail dịch nhãn theo ngôn ngữ người forward — bản
+ * tiếng Việt ghi "Từ:" thay cho "From:" — nên chỉ hỏi "địa chỉ Grey nào xuất
+ * hiện ở đây", y như cách làm với header thật. Miễn nhiễm ngôn ngữ.
+ */
+function ggForwardHeaderBlock_(bodyText) {
+  const text = String(bodyText || '');
+
+  const marker = text.search(/-{3,}\s*forwarded message\s*-{3,}/i);
+
+  /*
+   * Không thấy dấu hiệu forward thì lùi về vùng quanh địa chỉ Grey. Vẫn là
+   * một cửa sổ hẹp chứ không phải cả thân mail, nên không mở đường cho khớp
+   * nhầm; chỉ là bớt cứng nhắc khi Gmail đổi cách hiển thị.
+   */
+  const anchor = marker !== -1
+    ? marker
+    : text.toLowerCase().indexOf(GG_CFG.SENDER);
+
+  if (anchor === -1) return '';
+
+  const from = Math.max(0, anchor - (marker !== -1 ? 0 : 200));
+  const rest = text.substring(from);
+
+  const blank = rest.search(/\n[ \t]*\n/);
+  const end = blank !== -1 ? blank : Math.min(rest.length, 800);
+
+  return rest.substring(0, end);
+}
+
+
+function ggStripForwardPrefix_(subject) {
+  return String(subject || '').replace(/^\s*(fwd?|vs|tr)\s*:\s*/i, '').trim();
 }
 
 
@@ -625,8 +750,14 @@ function ggExtractRaw_(bodyText) {
 
 
 function ggGreyKnownLabels_() {
+  /*
+   * Danh sách này là RANH GIỚI cắt giá trị, không phải danh sách trường cần
+   * lấy. Thiếu một nhãn ở đây là giá trị đứng trước nó bị nuốt sang — 'Sender'
+   * xuất hiện trong mail funding và từng thiếu, khiến 'Amount received' chỉ
+   * đúng nhờ may mắn có xuống dòng cắt hộ.
+   */
   return ['Transaction Type', 'Amount tendered', 'Amount received', 'Network',
-    'Phone number', 'Memo', 'Recipient', 'Channel', 'Reference', 'Date & Time'];
+    'Phone number', 'Memo', 'Sender', 'Recipient', 'Channel', 'Reference', 'Date & Time'];
 }
 
 
@@ -767,8 +898,18 @@ function ggResolveGreyAccount_(message, greyAccounts) {
 
   parts.push(ggGetRawHeaderBlock_(message));
 
-  const headerText = parts.filter(Boolean).join('\n');
+  return ggResolveFromText_(parts.filter(Boolean).join('\n'), greyAccounts);
+}
 
+
+/*
+ * Dò địa chỉ Grey account trong một đoạn văn bản đã được giới hạn sẵn — khối
+ * header thật, hoặc khối trích dẫn của mail forward tay.
+ *
+ * Người gọi chịu trách nhiệm đưa vào đúng phạm vi. Đưa cả thân mail vào là
+ * mở đường cho khớp nhầm, vì thân mail giao dịch Grey có chứa địa chỉ email.
+ */
+function ggResolveFromText_(headerText, greyAccounts) {
   const matches = greyAccounts.accounts.filter(function (acc) {
     return ggHeaderContainsEmail_(headerText, acc.email);
   });
@@ -786,7 +927,7 @@ function ggResolveGreyAccount_(message, greyAccounts) {
 
   return {
     status: 'UNMAPPED', account: null, matches: [],
-    debug: ggTruncate_(headerText.replace(/\s+/g, ' '), 500)
+    debug: ggTruncate_(String(headerText || '').replace(/\s+/g, ' '), 500)
   };
 }
 
