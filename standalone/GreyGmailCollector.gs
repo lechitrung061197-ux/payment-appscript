@@ -3,15 +3,21 @@
  * ==========================================================
  * KHÔNG thuộc project Payment All.
  *
- * Mỗi Gmail nhận mail Grey = một Apps Script project riêng.
- * Copy trọn file này vào project đó, sửa đúng khối CONFIG
- * bên dưới, chạy setupGreyDailyTrigger() một lần là xong.
+ * Copy trọn file này vào một Apps Script project gắn với hộp
+ * thư nhận mail Grey, sửa khối CONFIG bên dưới, chạy
+ * setupGreyDailyTrigger() một lần là xong.
  *
- * Dùng được cho cả hai kiểu hộp thư: hộp thư riêng của từng
- * Grey account, và hộp thư trung tâm nhận forward từ nhiều
- * account. Account của mỗi email được suy ra từ header người
- * nhận rồi đối chiếu cột Email của sheet Grey, nên không phụ
- * thuộc vào việc khai đúng account key trong config.
+ * MỘT HỘP THƯ TRUNG TÂM NHẬN FORWARD TỪ NHIỀU ACCOUNT chỉ
+ * cần MỘT project và MỘT trigger. Account của từng email được
+ * tra từ địa chỉ người nhận rồi đối chiếu cột Email của sheet
+ * Grey — không phải từ config, không phải từ project nào chạy.
+ *
+ * Gom mail về một chỗ KHÔNG gộp tài khoản: GR001/GR002/GR003
+ * vẫn là ba tài khoản Grey riêng, tiền của ai vẫn của người
+ * đó. Cái gom được là số project và số trigger.
+ *
+ * Vẫn dùng được cho hộp thư riêng của một account — khi đó
+ * nên tắt READ_FORWARDED cho nhanh.
  *
  * NHIỆM VỤ DUY NHẤT: Gmail -> Transaction (dữ liệu thô).
  * Không tính Type / Direction / Gross / Net / Fee / Currency,
@@ -102,9 +108,18 @@ const GG_CFG = Object.freeze({
   // Đặt 0 = quét toàn bộ (chỉ dùng cho lần nạp đầu tiên).
   LOOKBACK_DAYS: 7,
 
-  // Giờ chạy hằng ngày. Xếp lệch nhau giữa các project:
-  //   GR001 -> HOUR 1,  GR002 -> HOUR 2,  GR003 -> HOUR 3
-  // nearMinute() có thể lệch ±15 phút nên đừng để cách nhau dưới 30 phút.
+  // Giờ chạy hằng ngày, giờ Việt Nam.
+  //
+  // Một hộp thư trung tâm thì chỉ cần MỘT trigger — dù nó nhận mail của bao
+  // nhiêu Grey account, vì account được tra từ địa chỉ người nhận chứ không
+  // phải từ project nào chạy.
+  //
+  // Chỉ khi còn nhiều project cùng ghi vào một workbook mới cần xếp lệch giờ,
+  // và lệch để khỏi chờ advisory lock chứ không phải để an toàn. Xếp lệch cả
+  // với syncFlow bên Payment All (đang chạy 7h và 19h).
+  //
+  // atHour() chạy đâu đó TRONG khoảng một tiếng đó; nearMinute() thu hẹp lại
+  // nhưng vẫn lệch tới ±15 phút. Đừng để hai trigger cách nhau dưới 30 phút.
   TRIGGER_HOUR: 1,
   TRIGGER_NEAR_MINUTE: 0,
   TIMEZONE: 'Asia/Ho_Chi_Minh',
