@@ -78,6 +78,24 @@ function triggerSyncFlowAndCustomers() {
     throw err;
   }
 
+  /*
+   * Dashboard chỉ đọc lại kết quả của hai bước trên nên phải đứng sau, và
+   * nằm NGOÀI try chính: nó hỏng thì dữ liệu vẫn đúng, không được để một
+   * lượt sync đã thành công trông như thất bại.
+   *
+   * Nhưng vẫn phải báo — dashboard đứng im hiện số của hôm qua mà không ai
+   * biết thì tệ hơn là không có dashboard.
+   */
+  try {
+    updateDashboard();
+  } catch (dashError) {
+    Logger.log('Không dựng được dashboard: ' + dashError);
+    trigNotify_('⚠️ PAYMENT ALL · DASHBOARD LỖI\n\n' +
+      (dashError && dashError.message ? dashError.message : String(dashError)) +
+      '\n\nSync vẫn thành công, số liệu trên các sheet là đúng. ' +
+      'Chỉ tab Dashboard đang hiện số của lần chạy trước.');
+  }
+
   Logger.log(
     'TRIGGER SYNC DONE in ' +
     ((new Date().getTime() - started.getTime()) / 1000).toFixed(1) + 's'
@@ -250,6 +268,7 @@ function trigBuildReport_(ss) {
   trigCollectOverdueWithdrawals_(ss, issues);
   trigCollectForeignCurrency_(ss, issues);
   trigCollectUnknownEvents_(ss, issues);
+  trigCollectDraftOverUsdt_(ss, issues);
   trigCollectStaleGrey_(ss, issues);
 
   lines.push('');
@@ -342,6 +361,26 @@ function trigCollectOverdueWithdrawals_(ss, issues) {
     issues.push(count + ' khoản rút OVERDUE · ' + trigMoney_(total) +
       ' chưa tới nơi nhận');
   }
+}
+
+
+/*
+ * Payout đã duyệt nhiều hơn USDT hệ thống ghi nhận. Không tab nào thấy được
+ * điều này vì hai con số nằm ở hai bảng khác nhau.
+ *
+ * Chưa chắc là sai: USDT!A1 vốn ghi rõ đó là "phần hệ thống ghi nhận", ví
+ * thật có thể còn dư. Nhưng nếu đúng là thiếu thì trả hết DRAFT sẽ âm quỹ,
+ * nên đây là thứ phải biết TRƯỚC khi bấm trả chứ không phải sau.
+ */
+function trigCollectDraftOverUsdt_(ss, issues) {
+  const usdt = dashUsdtRemaining_(ss);
+  if (usdt === null) return;
+
+  const draft = trigDraftPayoutTotal_(ss);
+  if (draft - usdt <= CUST_CFG.EPSILON) return;
+
+  issues.push('Payout DRAFT ' + trigMoney_(draft) + ' > USDT còn ' +
+    trigMoney_(usdt) + ' · thiếu ' + trigMoney_(draft - usdt));
 }
 
 
