@@ -247,6 +247,9 @@ function trigBuildReport_(ss) {
   /********** Những thứ cần người nhìn **********/
 
   trigCollectStuckMoney_(ss, issues);
+  trigCollectOverdueWithdrawals_(ss, issues);
+  trigCollectForeignCurrency_(ss, issues);
+  trigCollectUnknownEvents_(ss, issues);
   trigCollectStaleGrey_(ss, issues);
 
   lines.push('');
@@ -305,6 +308,102 @@ function trigCollectStuckMoney_(ss, issues) {
   Object.keys(stuck).forEach(function (provider) {
     issues.push('UNSUPPORTED_PROVIDER · ' + provider + ' ' +
       trigMoney_(stuck[provider]) + ' đang kẹt');
+  });
+}
+
+
+/*
+ * Khoản rút quá hạn mà chưa tới nơi nhận. Hai khả năng, và cả hai đều cần
+ * người nhìn: hoặc nơi nhận chưa gửi mail về, hoặc PayPal đã trả tiền lại
+ * theo cách hệ thống chưa nhận ra.
+ *
+ * Chừng nào khoản rút chưa được đánh RETURNED thì nó vẫn giữ chỗ nguồn của
+ * khách, nên tiền đó không phân bổ lại được cho lần rút sau. Số kẹt chứ
+ * không phải số sai — nhưng tự nó không gỡ được.
+ */
+function trigCollectOverdueWithdrawals_(ss, issues) {
+  const sheet = ss.getSheetByName(FLOW_CFG.TRANSACTION_SHEET);
+  if (!sheet) return;
+
+  const h = custHeaderMap_(sheet);
+  if (!h['Reconcile Status'] || !h['Type']) return;
+
+  let count = 0;
+  let total = 0;
+
+  custReadRowsObjects_(sheet, h).forEach(function (t) {
+    if (custUpper_(t['Type']) !== 'PAYPAL_WITHDRAWAL') return;
+    if (custUpper_(t['Reconcile Status']) !== 'OVERDUE') return;
+    count++;
+    total += custNum_(t['Net Amount']);
+  });
+
+  if (count) {
+    issues.push(count + ' khoản rút OVERDUE · ' + trigMoney_(total) +
+      ' chưa tới nơi nhận');
+  }
+}
+
+
+/*
+ * Dòng sổ khách còn mang đơn vị ngoài USD. Bình thường PayPal đổi ngoại tệ
+ * bằng một cặp T0200 và sổ ghi thẳng số USD đo được; còn ngoại tệ nghĩa là
+ * KHÔNG tìm thấy cặp đó, nên con số đang là tiền gốc bị coi như USD.
+ *
+ * Cả chuỗi tính phía sau không có phép đổi tiền nào, nên đây là chỗ duy
+ * nhất một đơn vị lạ có thể lọt vào mà vẫn trông như bình thường.
+ */
+function trigCollectForeignCurrency_(ss, issues) {
+  const sheet = ss.getSheetByName(CUST_CFG.LEDGER_SHEET);
+  if (!sheet) return;
+
+  const h = custHeaderMap_(sheet);
+  if (!h['Currency']) return;
+
+  const seen = {};
+
+  custReadRowsObjects_(sheet, h).forEach(function (r) {
+    const cur = custUpper_(r['Currency']);
+    if (!cur || cur === 'USD') return;
+    if (!seen[cur]) seen[cur] = { n: 0, total: 0 };
+    seen[cur].n++;
+    seen[cur].total += custNum_(r['Net Amount']);
+  });
+
+  Object.keys(seen).sort().forEach(function (cur) {
+    issues.push('Sổ khách còn ' + seen[cur].n + ' dòng ' + cur + ' · ' +
+      trigMoney_(seen[cur].total) + ' — chưa quy đổi được sang USD');
+  });
+}
+
+
+/*
+ * Mã sự kiện PayPal chưa từng được ánh xạ. Phần lớn là vô hại, nhưng đây
+ * chính là chỗ một loại giao dịch mới đi vào hệ thống mà không ai đọc —
+ * nên thà kêu thừa còn hơn im lặng bỏ qua tiền.
+ */
+function trigCollectUnknownEvents_(ss, issues) {
+  const sheet = ss.getSheetByName(FLOW_CFG.PAYPAL_SHEET);
+  if (!sheet) return;
+
+  const h = custHeaderMap_(sheet);
+  if (!h['Type']) return;
+
+  const seen = {};
+
+  custReadRowsObjects_(sheet, h).forEach(function (row) {
+    const type = custUpper_(row['Type']);
+    if (type.indexOf('UNMAPPED_') !== 0) return;
+
+    const code = type.substring('UNMAPPED_'.length);
+    if (!seen[code]) seen[code] = { n: 0, total: 0 };
+    seen[code].n++;
+    seen[code].total += custNum_(row['Transaction Amount']);
+  });
+
+  Object.keys(seen).sort().forEach(function (code) {
+    issues.push('Mã PayPal chưa biết ' + code + ' · ' + seen[code].n +
+      ' dòng · ' + trigMoney_(seen[code].total));
   });
 }
 

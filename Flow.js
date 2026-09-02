@@ -3594,14 +3594,29 @@ function flowPaypalType_(
 
     T0114: 'DISPUTE_FEE',
 
+    T0200: 'CURRENCY_CONVERSION',
+
     T0400: 'BANK_WITHDRAWAL',
     T0401: 'BANK_WITHDRAWAL',
     T0403: 'BANK_WITHDRAWAL',
 
+    /*
+     * T1101 là dòng PayPal ghi khi trả lại một khoản đã đi ra — gặp thực
+     * tế với khoản rút bị từ chối: cùng Transaction ID, ngược dấu, Status
+     * DENIED, còn dòng rút gốc vẫn nguyên PENDING. PASS 2 dựa vào cặp đó.
+     */
+    T1101: 'REVERSAL',
+
+    T1105: 'HOLD_RELEASE',
     T1106: 'PAYMENT_REVERSAL',
     T1107: 'PAYMENT_REFUND',
 
-    T1111: 'DISPUTE_HOLD_RELEASE'
+    T1110: 'HOLD',
+    T1111: 'DISPUTE_HOLD_RELEASE',
+
+    T1201: 'CHARGEBACK',
+
+    T1501: 'HOLD'
 
   };
 
@@ -3702,6 +3717,13 @@ function flowSyncPaypalToTransaction_(
   const withdrawalIds = {};
 
 
+  /*
+   * Số tiền của từng khoản rút, để PASS 2 đối chiếu được khi dòng trả về
+   * nối bằng Transaction ID chung thay vì bằng Reference ID.
+   */
+  const withdrawalAmounts = {};
+
+
   /**********************************************************
    * PASS 1 — WITHDRAWALS
    **********************************************************/
@@ -3770,6 +3792,22 @@ function flowSyncPaypalToTransaction_(
         transactionId
       ] =
         true;
+
+
+      withdrawalAmounts[
+        accountKey +
+        '|' +
+        transactionId
+      ] =
+        flowRoundMoney_(
+          Math.abs(
+            flowNumber_(
+              row[
+                ph['Transaction Amount']
+              ]
+            )
+          )
+        );
 
 
       const account =
@@ -4027,20 +4065,59 @@ function flowSyncPaypalToTransaction_(
 
       if (
         !accountKey ||
-        !transactionId ||
-        !referenceId
+        !transactionId
       ) {
         return;
       }
 
 
+      /*
+       * PayPal nối dòng trả về với khoản rút theo HAI cách khác nhau:
+       *
+       *   1. Reference ID trỏ tới Transaction ID của khoản rút.
+       *
+       *   2. Dòng trả về dùng CHÍNH Transaction ID của khoản rút và bỏ
+       *      trống Reference ID. Gặp thực tế với T1101: khoản rút và dòng
+       *      trả về chung một Transaction ID, chỉ khác Event Code, và
+       *      PayPal KHÔNG lật trạng thái dòng rút gốc — nó vẫn là PENDING.
+       *
+       * Chỉ có nhánh 1 thì khoản rút bị trả về nằm IN_TRANSIT vĩnh viễn:
+       * nó vẫn giữ chỗ nguồn của khách nên tiền đó không bao giờ phân bổ
+       * lại được cho lần rút sau, mà cũng không ai hay biết.
+       *
+       * Nhánh 2 mới nên siết chặt hơn nhánh 1: đòi số tiền khớp đúng
+       * khoản rút. Cùng Transaction ID, ngược dấu, cùng số tiền thì gần
+       * như không thể là thứ gì khác.
+       */
+      let linkedId = '';
+      let linkedBySharedId = false;
+
       if (
-        !withdrawalIds[
+        referenceId &&
+        withdrawalIds[
           accountKey +
           '|' +
           referenceId
         ]
       ) {
+
+        linkedId = referenceId;
+
+      } else if (
+        withdrawalIds[
+          accountKey +
+          '|' +
+          transactionId
+        ]
+      ) {
+
+        linkedId = transactionId;
+        linkedBySharedId = true;
+
+      }
+
+
+      if (!linkedId) {
         return;
       }
 
@@ -4080,6 +4157,38 @@ function flowSyncPaypalToTransaction_(
         amount <= 0
       ) {
         return;
+      }
+
+
+      /*
+       * Siết nhánh Transaction ID chung: chỉ nhận khi số tiền khớp đúng
+       * khoản rút. Nhánh Reference ID cũ giữ nguyên, không siết thêm, để
+       * không đổi cách đọc dữ liệu lịch sử.
+       */
+      if (
+        linkedBySharedId &&
+        !flowAmountEqual_(
+          withdrawalAmounts[
+            accountKey +
+            '|' +
+            linkedId
+          ],
+          amount
+        )
+      ) {
+        return;
+      }
+
+
+      if (linkedBySharedId) {
+
+        Logger.log(
+          '  ↩ trả về khoản rút (Transaction ID chung) · ' +
+          accountKey + ' ' + transactionId +
+          ' · ' + eventCode +
+          ' · ' + flowRoundMoney_(amount).toFixed(2)
+        );
+
       }
 
 
@@ -4150,8 +4259,14 @@ function flowSyncPaypalToTransaction_(
             )
               .toUpperCase(),
 
+          /*
+           * Matcher ghép chính xác bằng Reference của khoản rút, mà khoản
+           * rút lấy Transaction ID của nó làm Reference. Nên phải ghi
+           * linkedId chứ không phải referenceId — nhánh Transaction ID
+           * chung có referenceId rỗng.
+           */
           'Reference':
-            referenceId,
+            linkedId,
 
           'Counterparty Provider':
             '',

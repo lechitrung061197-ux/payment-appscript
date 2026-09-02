@@ -13,6 +13,10 @@ standalone/**
 docs/**
 **/*.md
 
+# Harness chạy bằng Node để đối chứng logic tiền ngoài Apps Script.
+# Đây là .js nên PHẢI chặn ở đây, khác docs/ vốn đã an toàn nhờ .md.
+tests/**
+
 .git/**
 .gitignore
 .claspignore

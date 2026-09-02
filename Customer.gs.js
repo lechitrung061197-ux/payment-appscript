@@ -400,13 +400,30 @@ function custBuildCustomerLedger_(paypalRows, customerState, oldLedgerState, now
       if (custIsHoldReleaseEvent_(ev.eventCode)) hold -= custEventMagnitude_(ev);
     });
     fee=Math.max(0,custRound2_(fee)); refund=Math.max(0,custRound2_(refund));
-    const gross=Math.max(0,custRound2_(root.transactionAmount));
+    let gross=Math.max(0,custRound2_(root.transactionAmount));
+    let currency=root.currency;
+
+    /*
+     * PayPal đổi ngoại tệ bằng một CẶP T0200: chân âm rút sạch ví tiền gốc,
+     * chân dương nạp số đã quy đổi vào ví đích. Số USD thật nằm ở chân
+     * dương — PayPal đo sẵn, không phải ước lượng như chặng Grey.
+     *
+     * Không đọc cặp này thì gross giữ nguyên con số ngoại tệ rồi bị coi như
+     * USD, và khách bị ghi thiếu đúng phần chênh lệch.
+     */
+    const conv=custResolveCurrencyConversion_(root,events);
+    if(conv){
+      gross=custRound2_(gross*conv.rate); fee=custRound2_(fee*conv.rate);
+      refund=custRound2_(refund*conv.rate); hold=hold*conv.rate;
+      currency=conv.currency;
+    }
+
     const net=Math.max(0,custRound2_(gross-fee-refund));
     hold=Math.min(Math.max(0,custRound2_(hold)),net);
     const sourceAvailable=Math.max(0,custRound2_(net-hold));
     const common={
       rootKey, accountKey:root.accountKey, transactionDate:root.transactionDate, transactionId:root.transactionId,
-      currency:root.currency, grossAmount:gross, paypalFee:fee, refundAmount:refund, netAmount:net,
+      currency, grossAmount:gross, paypalFee:fee, refundAmount:refund, netAmount:net,
       holdAmount:hold, sourceAvailable,
       customerKey:customer?customer.customerKey:'', customerName:customer?customer.customerName:'',
       invoiceId:root.invoiceId, invoicePrefix:custResolvePrefixForPaypalRow_(root,byTx,customerState)||'',
@@ -419,7 +436,7 @@ function custBuildCustomerLedger_(paypalRows, customerState, oldLedgerState, now
       ledgerKey, transactionDate:root.transactionDate, customerKey:customer.customerKey, customerName:customer.customerName,
       paypalAccountKey:root.accountKey, paypalTransactionId:root.transactionId, referenceId:root.referenceId,
       invoiceId:root.invoiceId, invoicePrefix:common.invoicePrefix, item:root.item, buyerName:root.buyerName,
-      eventType:'SALE', grossAmount:gross, paypalFee:fee, refundAmount:refund, netAmount:net, currency:root.currency,
+      eventType:'SALE', grossAmount:gross, paypalFee:fee, refundAmount:refund, netAmount:net, currency,
       sourceAvailable, allocatedAmount:0, invoicedAmount:0, remainingAmount:sourceAvailable,
       sourceUniqueKey:root.uniqueKey, lastSync:now, status:'PENDING', note:''
     });
@@ -469,6 +486,32 @@ function custIsFeeRecovery_(c){ return ['T1108','T1109'].indexOf(c)!==-1; }
 function custIsHoldEvent_(c){ return ['T1110','T1500','T1501','T1502','T1503','T2101','T2103','T2105','T2107','T2111','T2114','T2120'].indexOf(c)!==-1; }
 function custIsHoldReleaseEvent_(c){ return ['T1105','T1111','T2102','T2104','T2106','T2108','T2112','T2115','T2121'].indexOf(c)!==-1; }
 function custEventMagnitude_(e){ return Math.abs(e.transactionAmount)>=CUST_CFG.EPSILON?Math.abs(e.transactionAmount):Math.abs(e.balanceImpact); }
+
+/*
+ * Cặp quy đổi ngoại tệ: hai dòng T0200 cùng trỏ về một root sale, một chân
+ * âm ở tiền gốc và một chân dương ở tiền đích. Tỷ giá suy từ chính cặp đó
+ * nên là số ĐO ĐƯỢC — khác hẳn chặng đổi trong Grey, chỗ đó mù thật nên
+ * mới phải dùng Conversion Rate.
+ *
+ * Chỉ nhận khi có đủ hai chân và khác đơn vị tiền. Thiếu chân nào thì trả
+ * null để giữ nguyên cách tính cũ: thà không đổi còn hơn đổi sai. Trường
+ * hợp đó sẽ lộ ra ở báo cáo sáng vì ledger còn giữ đơn vị ngoại tệ.
+ */
+function custResolveCurrencyConversion_(root, events){
+  const base=custUpper_(root.currency);
+  if(!base)return null;
+  let outLeg=null, inLeg=null;
+  events.forEach(ev=>{
+    if(ev.eventCode!=='T0200')return;
+    const cur=custUpper_(ev.currency);
+    if(ev.transactionAmount<0&&cur===base){ if(!outLeg)outLeg=ev; }
+    else if(ev.transactionAmount>0&&cur&&cur!==base){ if(!inLeg)inLeg=ev; }
+  });
+  if(!outLeg||!inLeg)return null;
+  const from=Math.abs(outLeg.transactionAmount);
+  if(from<=CUST_CFG.EPSILON)return null;
+  return {rate:inLeg.transactionAmount/from, currency:custUpper_(inLeg.currency)};
+}
 
 /*********************** CENTRAL TX READ ************************/
 function custReadTransactionRows_(sheet, h){
