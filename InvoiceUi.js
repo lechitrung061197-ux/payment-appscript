@@ -28,6 +28,8 @@ const INV_UI_CFG = Object.freeze({
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Payment All')
+    .addItem('Bảng điều khiển', 'showDashboard')
+    .addSeparator()
     .addItem('Tạo Invoice…', 'showInvoiceDialog')
     .addToUi();
 }

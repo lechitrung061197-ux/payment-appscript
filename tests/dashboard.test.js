@@ -1,7 +1,7 @@
 /*
- * Dashboard: số học ba rổ và cảnh báo chéo, chạy bằng số thật của workbook.
- * Phần vẽ biểu đồ cần Apps Script nên không test được ở đây — cái test được
- * là con số đưa vào biểu đồ, và đó mới là chỗ sai được.
+ * Dashboard: số học chuỗi tiền, ba rổ, cảnh báo chéo — bằng số thật của
+ * workbook. Và chạy thật phần JS của trang HTML, vì lỗi runtime ở đó thì
+ * người dùng chỉ thấy một trang trắng, không có thông báo nào.
  */
 const fs = require('fs');
 const vm = require('vm');
@@ -22,51 +22,109 @@ function eq(name, actual, expected, tol) {
   ok(name, good, 'được ' + JSON.stringify(actual) + ', mong ' + JSON.stringify(expected));
 }
 
-/* ---- số thật lấy từ workbook 02/09 ---- */
+/* ---------------- số thật, workbook 02/09/2026 ---------------- */
+
 const CUSTOMERS = [
   { 'Customer Key': 'CUS001', 'Customer Name': 'HUI', 'Status': 'ACTIVE',
-    'Pending in PayPal': 1419.58, 'Outstanding Amount': 0.00,
-    'Invoiced Amount': 4129.19, 'Available Amount': 4129.19 },
+    'Prefixes': 'SHOPSH, VASC, BUDD, BERMSH', 'Payout Fee %': 0.05,
+    'Pending in PayPal': 1419.58, 'Outstanding Amount': 0, 'Invoiced Amount': 4129.19,
+    'Available Amount': 4129.19, 'Advance Outstanding': 0, 'Last Settlement': '' },
   { 'Customer Key': 'CUS002', 'Customer Name': 'DITECH', 'Status': 'ACTIVE',
-    'Pending in PayPal': 295.68, 'Outstanding Amount': 0.00,
-    'Invoiced Amount': 1740.14, 'Available Amount': 1740.14 },
+    'Prefixes': 'BOSSX, BEAC, THEWSH', 'Payout Fee %': 0.05,
+    'Pending in PayPal': 295.68, 'Outstanding Amount': 0, 'Invoiced Amount': 1740.14,
+    'Available Amount': 1740.14, 'Advance Outstanding': 0, 'Last Settlement': '' },
   { 'Customer Key': 'CUS003', 'Customer Name': 'ASON', 'Status': 'ACTIVE',
-    'Pending in PayPal': 25.90, 'Outstanding Amount': 684.39,
-    'Invoiced Amount': 0.00, 'Available Amount': 684.39 }
+    'Prefixes': 'USAH', 'Payout Fee %': 0,
+    'Pending in PayPal': 25.90, 'Outstanding Amount': 684.39, 'Invoiced Amount': 0,
+    'Available Amount': 684.39, 'Advance Outstanding': 0, 'Last Settlement': '' }
 ];
 
+/* Gross, Refunds, PPFee, Recv, Avail, Conv, Transfer, NetBefore, Fee, Due, Paid, Out */
+const S = [
+  ['HUI', 1885.92, 34.98, 80.15, 14.13, 1756.66, 3.51, 3.51, 1749.64, 87.48, 1662.16, 1662.16, 0],
+  ['HUI', 1782.69, 0, 70.94, 14.54, 1697.21, 3.39, 3.39, 1690.43, 84.52, 1605.91, 1605.91, 0],
+  ['DITECH', 312.03, 0, 14.26, 2.42, 295.35, 0.59, 1.00, 293.76, 14.69, 279.07, 0, 279.07],
+  ['DITECH', 929.00, 0, 38.68, 7.14, 883.18, 1.77, 1.77, 879.64, 43.98, 835.66, 835.66, 0],
+  ['DITECH', 271.55, 0, 10.56, 2.32, 258.67, 0.52, 1.00, 257.15, 12.86, 244.29, 0, 244.29],
+  ['HUI', 194.90, 0, 8.20, 6.00, 180.70, 0.45, 1.00, 179.25, 8.96, 170.29, 170.29, 0],
+  ['HUI', 523.68, 0, 22.64, 6.42, 494.62, 1.24, 1.24, 492.14, 24.61, 467.53, 0, 467.53],
+  ['DITECH', 323.83, 1.47, 13.80, 7.09, 302.94, 0.76, 1.00, 299.71, 14.99, 284.72, 0, 284.72]
+];
+const SETTLEMENTS = S.map((r, i) => ({
+  'Settlement Key': 'SET-' + (i + 1), 'Invoice Number': 'INV-' + (i + 1),
+  'Customer Key': r[0] === 'HUI' ? 'CUS001' : 'CUS002', 'Customer Name': r[0],
+  'Gross Sales': r[1], 'Refunds': r[2], 'PayPal Fees': r[3], 'Receiving Fees': r[4],
+  'Available Amount': r[5], 'Conversion Cost': r[6], 'Transfer Cost': r[7],
+  'Net Before Payout Fee': r[8], 'Payout Fee Amount': r[9], 'Amount Due': r[10],
+  'Amount Paid': r[11], 'Outstanding Payable': r[12],
+  'Status': r[11] > 0 && r[12] === 0 ? 'PAID' : 'ISSUED', 'Issued At': ''
+}));
+
 const PAYOUTS = [
-  { 'Status': 'DRAFT', 'Amount': 700.00 }, { 'Status': 'DRAFT', 'Amount': 575.61 },
-  { 'Status': 'PAID', 'Amount': 5572.02 }
+  { 'Payout Key': 'PO-000003', 'Payee': 'DITECH', 'Reference': 'INV-000003', 'Amount': 279.07, 'Status': 'DRAFT' },
+  { 'Payout Key': 'PO-000005', 'Payee': 'DITECH', 'Reference': 'INV-000005', 'Amount': 244.29, 'Status': 'DRAFT' },
+  { 'Payout Key': 'PO-000011', 'Payee': 'HUI', 'Reference': 'INV-000007', 'Amount': 467.53, 'Status': 'DRAFT' },
+  { 'Payout Key': 'PO-000012', 'Payee': 'DITECH', 'Reference': 'INV-000008', 'Amount': 284.72, 'Status': 'DRAFT' },
+  { 'Payout Key': 'PO-000001', 'Payee': 'HUI', 'Reference': 'INV-000001', 'Amount': 1662.16, 'Status': 'PAID' }
 ];
 
 const ACCOUNTS = [
-  { 'Provider': 'PAYPAL', 'Account Key': 'PP1', 'Hold Balance': 0 },
-  { 'Provider': 'PAYPAL', 'Account Key': 'PP2', 'Hold Balance': 1589.43 },
-  { 'Provider': 'GREY', 'Account Key': 'GR001', 'Hold Balance': 999 }
+  { 'Account Key': 'PP1', 'Label': 'bellaboho', 'Provider': 'PAYPAL', 'Enabled': true,
+    'PayPal Status': 'SUSPENDED', 'Total Balance': 289.85, 'Hold Balance': 289.85, 'Total Withdrawn': 4931.62 },
+  { 'Account Key': 'PP2', 'Label': 'socialchics', 'Provider': 'PAYPAL', 'Enabled': true,
+    'PayPal Status': 'SUSPENDED', 'Total Balance': 1589.43, 'Hold Balance': 1589.43, 'Total Withdrawn': 1525.53 },
+  { 'Account Key': 'PP4', 'Label': 'bambini', 'Provider': 'PAYPAL', 'Enabled': true,
+    'PayPal Status': '', 'Total Balance': 204.18, 'Hold Balance': 0, 'Total Withdrawn': 0 },
+  { 'Account Key': 'GR001', 'Label': 'grey', 'Provider': 'GREY', 'Enabled': true,
+    'PayPal Status': '', 'Total Balance': 0, 'Hold Balance': 999, 'Total Withdrawn': 0 }
+];
+
+const GREY = [
+  { 'Account Key': 'GR001', 'Tag': '', 'Status': 'ACTIVE', 'Estimated USD Balance': 87.28,
+    'Total Received USD': 5380.17, 'Last Sync': '' }
+];
+const USDT_ROWS = [
+  { 'Account Key': 'USDT1', 'Tag': 'Nhat', 'Status': 'ACTIVE', 'Estimated Balance': 1078.06,
+    'Total Received USDT': 6652.08, 'Last Activity': '' }
+];
+
+const PAYPAL_ROWS = [
+  { 'Invoice Prefix': 'SHOPSH', 'Transaction Amount': 100 },
+  { 'Invoice Prefix': 'TTPEZ', 'Transaction Amount': 240.90 },
+  { 'Invoice Prefix': 'JUST', 'Transaction Amount': 130.28 },
+  { 'Invoice Prefix': 'PRAN', 'Transaction Amount': 78.05 },
+  { 'Invoice Prefix': 'MASTSH', 'Transaction Amount': 34.98 }
+];
+
+const TX = [
+  { 'Type': 'PAYPAL_WITHDRAWAL', 'Reconcile Status': 'ARRIVED', 'Net Amount': 100 },
+  { 'Type': 'PAYPAL_WITHDRAWAL', 'Reconcile Status': 'RETURNED', 'Net Amount': 860.4 },
+  { 'Type': 'GREY_FUNDING', 'Reconcile Status': 'MATCHED', 'Net Amount': 50 }
 ];
 
 const USDT_A1 = 'TỔNG USDT TRONG HỆ THỐNG · từ PayPal 6652.08 · đã chi 5574.02 ' +
-  '· CÒN LẠI 1078.06   (chỉ tính phần hệ thống ghi nhận, không phải số dư ví thật)';
+  '· CÒN LẠI 1078.06   (chỉ tính phần hệ thống ghi nhận)';
 
-function build(overrides) {
+function build(over) {
+  const o = over || {};
   const data = Object.assign({
-    'Customers': CUSTOMERS, 'Payouts': PAYOUTS, 'Account': ACCOUNTS,
-    'Customer Allocation': [], 'Customer Ledger': [], 'Transaction': [],
-    'Paypal': [], 'Grey': []
-  }, overrides || {});
+    'Customers': CUSTOMERS, 'Settlements': SETTLEMENTS, 'Payouts': PAYOUTS,
+    'Account': ACCOUNTS, 'Grey': GREY, 'USDT': USDT_ROWS, 'Paypal': PAYPAL_ROWS,
+    'Transaction': TX, 'Customer Allocation': [], 'Customer Ledger': []
+  }, o.sheets || {});
 
-  const usdtText = (overrides && overrides.__usdt !== undefined) ? overrides.__usdt : USDT_A1;
+  const usdtText = o.usdt !== undefined ? o.usdt : USDT_A1;
+  const history = o.history || [];
 
   const sb = {
-    console,
-    Logger: { log: () => {} },
+    console, Logger: { log: () => {} },
     Utilities: {
       formatDate: (d, tz, fmt) => {
         const p = n => String(n).padStart(2, '0');
         if (fmt === 'yyyy-MM-dd') return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+        if (fmt === 'dd/MM') return p(d.getDate()) + '/' + p(d.getMonth() + 1);
         if (fmt === 'H') return String(d.getHours());
-        return d.toISOString();
+        return 'HH:mm · dd/MM/yyyy';
       }
     },
     SpreadsheetApp: { getActive: () => ss },
@@ -75,11 +133,19 @@ function build(overrides) {
 
   const ss = {
     getSheetByName: name => {
-      if (name === 'USDT') {
-        return usdtText === null ? null
-          : { getRange: () => ({ getValue: () => usdtText }) };
+      if (name === 'Dashboard History') {
+        if (!history.length) return null;
+        return {
+          __name: name,
+          getLastRow: () => history.length + 2,
+          getRange: () => ({ getValues: () => history })
+        };
       }
-      return data[name] ? { __name: name } : null;
+      if (!data[name]) return null;
+      return {
+        __name: name,
+        getRange: () => ({ getValue: () => (name === 'USDT' ? usdtText : '') })
+      };
     }
   };
 
@@ -87,104 +153,152 @@ function build(overrides) {
   ['Flow.js', 'Customer.gs.js', 'Triggers.js', 'Dashboard.js'].forEach(f =>
     vm.runInContext(fs.readFileSync(path.join(REPO, f), 'utf8'), sb, { filename: f }));
 
-  /*
-   * Stub SAU khi nạp file: khai báo function ghi đè thuộc tính sandbox.
-   *
-   * custHeaderMap_ thật trả về map 1-BASED (m[k]=i+1), nên guard kiểu
-   * `if (h['Status'])` an toàn cả với cột A. Stub phải bắt chước đúng vậy,
-   * nếu không thì guard rớt và test báo lỗi giả.
-   */
+  /* custHeaderMap_ thật trả về map 1-BASED (m[k]=i+1) nên guard `if(h['X'])`
+     an toàn cả với cột A. Stub phải bắt chước đúng vậy. */
   sb.__data = data;
   vm.runInContext(
     'custHeaderMap_ = function(sheet){' +
     '  var rows = __data[sheet.__name] || [], m = {};' +
     '  if (rows.length) Object.keys(rows[0]).forEach(function(k,i){ m[k]=i+1; });' +
     '  return m; };' +
-    'custReadRowsObjects_ = function(sheet){ return __data[sheet.__name] || []; };',
-    sb);
+    'custReadRowsObjects_ = function(sheet){ return __data[sheet.__name] || []; };', sb);
 
   return sb;
 }
 
+function metrics(over) {
+  const sb = build(over);
+  return vm.runInContext('dashCollectMetrics_(SpreadsheetApp.getActive())', sb);
+}
+
 /* ════════════════════════════════════════════════════════ */
-console.log('\n1 · dashCollectMetrics_ · ba rổ không chồng lấn');
+console.log('\n1 · chuỗi tiền phải ĐÓNG ĐÚNG ở mọi mốc');
 {
-  const sb = build();
-  const m = vm.runInContext('dashCollectMetrics_(SpreadsheetApp.getActive())', sb);
+  const c = metrics().chain;
+  eq('số hoá đơn hiệu lực', c.invoiceCount, 8);
+  eq('tiền hàng', c.gross, 6223.60);
+  eq('phí PayPal', c.paypalFees, 259.23);
+  eq('phí Grey nhận', c.receivingFees, 60.06);
+  eq('tiền khả dụng', c.available, 5869.33);
 
-  eq('kẹt ở PayPal', m.pending, 1741.16);
-  eq('đã về, chưa xuất HĐ', m.outstanding, 684.39);
-  eq('đã xuất hoá đơn', m.invoiced, 5869.33);
-  eq('available', m.available, 6553.72);
+  /* Hai vị trí của hoàn trả được SUY RA, không đoán. Tổng hai phần phải
+     bằng đúng tổng Refunds trên sheet. */
+  eq('hoàn trả TRONG KỲ (suy ra)', c.refundInPeriod, 34.98);
+  eq('hoàn trả KẾT CHUYỂN (suy ra)', c.refundCarry, 1.47);
+  eq('hai phần cộng lại = tổng Refunds', c.refundInPeriod + c.refundCarry, 36.45);
 
-  /* Bất biến: Outstanding nghĩa là available TRỪ invoiced, nên hai rổ sau
-     cộng lại phải bằng đúng available. Sai chỗ này là biểu đồ đếm hai lần. */
-  eq('outstanding + invoiced = available', m.outstanding + m.invoiced, m.available);
+  eq('mốc 1 đóng: gross − pp − recv − refund = available',
+     c.gross - c.paypalFees - c.receivingFees - c.refundInPeriod, c.available);
+  eq('mốc 2 đóng: available − conv − transfer − carry = netBefore',
+     c.available - c.conversion - c.transfer - c.refundCarry, c.netBefore);
+  eq('mốc 3 đóng: netBefore − payoutFee = amountDue',
+     c.netBefore - c.payoutFee, c.amountDue);
+  eq('mốc 4 đóng: paid + outstanding = amountDue',
+     c.amountPaid + c.outstandingPayable, c.amountDue);
 
-  eq('USDT đọc từ A1', m.usdt, 1078.06);
-  eq('payout DRAFT', m.draft, 1275.61);
-  eq('payout PAID', m.paid, 5572.02);
-  eq('Hold Balance chỉ cộng PAYPAL', m.holdBalance, 1589.43);
-
-  eq('3 khách', m.customers.length, 3);
-  eq('sắp xếp giảm dần, HUI đứng đầu', m.customers[0].name, 'HUI');
-  eq('tổng của HUI', m.customers[0].total, 5548.77);
-  eq('ASON đứng cuối', m.customers[2].name, 'ASON');
+  eq('phí dịch vụ đã thu', c.payoutFee, 292.09);
+  eq('còn nợ khách', c.outstandingPayable, 1275.61);
 }
 
-console.log('\n2 · cảnh báo DRAFT vượt USDT');
+console.log('\n2 · ba rổ không chồng lấn');
 {
-  const sb = build();
-  const m = vm.runInContext('dashCollectMetrics_(SpreadsheetApp.getActive())', sb);
-  const hit = m.alerts.filter(a => a.indexOf('Payout DRAFT') === 0);
-  eq('có đúng 1 cảnh báo DRAFT', hit.length, 1);
-  ok('nêu đúng số thiếu 197,55', hit[0] && hit[0].indexOf('197,55') !== -1, hit[0]);
-}
-{
-  /* DRAFT thấp hơn USDT thì phải im */
-  const sb = build({ 'Payouts': [{ 'Status': 'DRAFT', 'Amount': 500 }] });
-  const m = vm.runInContext('dashCollectMetrics_(SpreadsheetApp.getActive())', sb);
-  eq('DRAFT < USDT → không cảnh báo', m.alerts.filter(a => a.indexOf('Payout DRAFT') === 0).length, 0);
-}
-{
-  /* Bằng đúng nhau cũng không được kêu */
-  const sb = build({ 'Payouts': [{ 'Status': 'DRAFT', 'Amount': 1078.06 }] });
-  const m = vm.runInContext('dashCollectMetrics_(SpreadsheetApp.getActive())', sb);
-  eq('DRAFT = USDT → không cảnh báo', m.alerts.filter(a => a.indexOf('Payout DRAFT') === 0).length, 0);
-}
-{
-  /* Chưa chạy syncFlow thì A1 chưa có dòng tổng — không được đoán bừa */
-  const sb = build({ __usdt: 'chưa có gì' });
-  const m = vm.runInContext('dashCollectMetrics_(SpreadsheetApp.getActive())', sb);
-  eq('A1 không đọc được → usdt null', m.usdt, null);
-  eq('và không cảnh báo bừa', m.alerts.filter(a => a.indexOf('Payout DRAFT') === 0).length, 0);
+  const m = metrics();
+  eq('kẹt PayPal', m.buckets.pending, 1741.16);
+  eq('chưa xuất HĐ', m.buckets.outstanding, 684.39);
+  eq('đã xuất HĐ', m.buckets.invoiced, 5869.33);
+  eq('tổng', m.buckets.total, 8294.88);
+  eq('đã xuất HĐ khớp Available Amount của Settlements',
+     m.buckets.invoiced, m.chain.available);
+  eq('còn nợ khách = tổng DRAFT', m.owed, m.draftTotal);
 }
 
-console.log('\n3 · dashDateKey_ · ô ngày là Date hay chuỗi đều được');
+console.log('\n3 · khách, DRAFT, prefix chưa gắn');
 {
-  const sb = build();
-  const k = v => { sb.__v = v; return vm.runInContext('dashDateKey_(__v)', sb); };
-  eq('Date', k(new Date(2026, 8, 2, 9, 49)), '2026-09-02');
-  eq('chuỗi yyyy-MM-dd', k('2026-09-02'), '2026-09-02');
-  eq('chuỗi có giờ kèm', k('2026-09-02 09:49:00'), '2026-09-02');
-  eq('rỗng', k(''), '');
-  eq('null', k(null), '');
+  const m = metrics();
+  eq('HUI đứng đầu', m.customers[0].name, 'HUI');
+  eq('HUI 4 hoá đơn', m.customers[0].invoices, 4);
+  eq('HUI còn nợ', m.customers[0].owed, 467.53);
+  eq('DITECH còn nợ', m.customers[1].owed, 808.08);
+  eq('ASON chưa hoá đơn nào', m.customers[2].invoices, 0);
+
+  eq('4 lệnh DRAFT', m.drafts.length, 4);
+  eq('DRAFT sắp giảm dần', m.drafts[0].amount, 467.53);
+  eq('tổng DRAFT', m.draftTotal, 1275.61);
+
+  eq('4 prefix chưa gắn', m.unassigned.length, 4);
+  eq('tổng chưa gắn', m.unassignedTotal, 484.21);
+  eq('lớn nhất là TTPEZ', m.unassigned[0].prefix, 'TTPEZ');
+  ok('SHOPSH đã gắn nên KHÔNG xuất hiện',
+     m.unassigned.every(u => u.prefix !== 'SHOPSH'));
+
+  eq('PP2 mang trạng thái HOLD', m.paypal[0].state, 'HOLD');
+  eq('PP4 chưa rút lần nào', m.paypal.filter(a => a.key === 'PP4')[0].state, 'CHƯA RÚT');
+  eq('Hold Balance chỉ cộng PAYPAL', m.holdBalance, 1879.28);
+  ok('ngân quỹ gồm cả Grey và USDT', m.treasury.length === 2);
 }
 
-console.log('\n4 · dashUsdtRemaining_ · số âm và định dạng lạ');
+console.log('\n4 · cảnh báo');
 {
-  const cases = [
-    ['CÒN LẠI 1078.06 (ghi chú)', 1078.06],
-    ['... · CÒN LẠI 0.00   (x)', 0],
-    ['CÒN LẠI -12.50', -12.5],
-    ['không có từ khoá', null],
-    ['', null]
+  const m = metrics();
+  const draftAlert = m.alerts.filter(a => a.indexOf('Payout DRAFT') === 0);
+  eq('kêu DRAFT vượt USDT', draftAlert.length, 1);
+  ok('nêu số thiếu 197,55', draftAlert[0].indexOf('197,55') !== -1, draftAlert[0]);
+  ok('kêu tiền chưa gắn khách',
+     m.alerts.some(a => a.indexOf('484,21') !== -1 && a.indexOf('chưa gắn') !== -1));
+}
+{
+  const m = metrics({ sheets: { 'Payouts': [{ 'Payout Key': 'X', 'Payee': 'A', 'Reference': '', 'Amount': 500, 'Status': 'DRAFT' }] } });
+  eq('DRAFT < USDT thì im', m.alerts.filter(a => a.indexOf('Payout DRAFT') === 0).length, 0);
+}
+{
+  const m = metrics({ usdt: 'chưa chạy syncFlow' });
+  eq('A1 chưa có dòng tổng → usdt null', m.usdt, null);
+  eq('và không đoán bừa', m.alerts.filter(a => a.indexOf('Payout DRAFT') === 0).length, 0);
+}
+
+console.log('\n5 · trang HTML chạy thật, không ném lỗi');
+{
+  const raw = fs.readFileSync(path.join(REPO, 'DashboardDialog.html'), 'utf8');
+  ok('có chỗ nhồi payload', raw.indexOf('<?!= payload ?>') !== -1);
+
+  const script = raw.substring(raw.lastIndexOf('<script>') + 8, raw.lastIndexOf('</script>'));
+
+  const render = (m) => {
+    let out = '';
+    const doc = { getElementById: () => ({ set innerHTML(v) { out = v; } }) };
+    const s = { document: doc, Math, JSON, Object, Array, String, Number, isNaN, console };
+    vm.createContext(s);
+    vm.runInContext(script.replace('<?!= payload ?>', JSON.stringify(m)), s);
+    return out;
+  };
+
+  const html = render(metrics());
+  ok('dựng ra HTML', html.length > 3000, html.length + ' ký tự');
+  ok('có chuỗi tiền', html.indexOf('Chuỗi tiền') !== -1);
+  ok('số hiện đúng định dạng Việt', html.indexOf('6.223,60') !== -1);
+  ok('có bảng DRAFT', html.indexOf('PO-000011') !== -1);
+  ok('có prefix chưa gắn', html.indexOf('TTPEZ') !== -1);
+  ok('mới 0 ngày lịch sử thì KHÔNG vẽ đường', html.indexOf('<svg') === -1);
+  ok('không lọt chuỗi undefined/NaN vào trang',
+     html.indexOf('undefined') === -1 && html.indexOf('NaN') === -1);
+
+  /* Đủ 3 ngày thì mới vẽ */
+  const hist = [
+    ['2026-09-01', 1700, 700, 5800, 1100, 1200, 0],
+    ['2026-09-02', 1741.16, 684.39, 5869.33, 1078.06, 1275.61, 1879.28],
+    ['2026-09-03', 1600, 690, 5900, 1050, 1300, 1879.28]
   ];
-  cases.forEach(c => {
-    const sb = build({ __usdt: c[0] });
-    const v = vm.runInContext('dashUsdtRemaining_(SpreadsheetApp.getActive())', sb);
-    eq(JSON.stringify(c[0].substring(0, 24)), v, c[1]);
-  });
+  const html2 = render(metrics({ history: hist }));
+  ok('đủ 3 ngày thì vẽ đường', html2.indexOf('<svg') !== -1);
+  ok('có 4 đường', (html2.match(/<path /g) || []).length === 4);
+
+  /* Sổ rỗng hoàn toàn cũng không được vỡ */
+  const empty = metrics({ sheets: {
+    'Customers': [], 'Settlements': [], 'Payouts': [], 'Paypal': [], 'Transaction': []
+  } });
+  const html3 = render(empty);
+  ok('sổ rỗng vẫn dựng được trang', html3.length > 500);
+  ok('sổ rỗng không có NaN', html3.indexOf('NaN') === -1);
 }
 
 console.log('\n' + (fail ? '✗ ' + fail + ' FAIL' : '✓ tất cả') + ' · ' + pass + ' pass\n');

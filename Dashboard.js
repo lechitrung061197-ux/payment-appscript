@@ -4,189 +4,111 @@
  * ============================================================================
  * Một trang trả lời hai câu hỏi hay được hỏi nhất: "tiền đang ở đâu" và "có
  * gì sai không". Báo cáo Telegram đẩy tới bạn mỗi sáng; trang này thì ngược
- * lại — mở ra xem lúc nào cũng được.
+ * lại — mở ra xem lúc nào cũng được, qua menu Payment All.
  *
  * ==========================================================================
- * VÌ SAO CÓ SHEET DỮ LIỆU ẨN
+ * VÌ SAO LÀ DIALOG HTML CHỨ KHÔNG PHẢI MỘT TAB SHEET
  * ==========================================================================
- * Biểu đồ nhúng của Sheets neo vào một VÙNG Ô. Nếu vùng đó nằm ngay trên
- * trang hiển thị, mỗi lần số khách tăng giảm là vùng đổi kích thước và biểu
- * đồ đọc sai cột, hoặc tệ hơn là đè lên phần bên dưới.
- *
- * Nên toàn bộ nguồn của biểu đồ nằm ở sheet ẩn `_Dashboard Data`, mỗi khối
- * có kích thước CỐ ĐỊNH, ô thừa để trống. Trang hiển thị thuần trình bày.
+ * Biểu đồ nhúng của Sheets chạy trên engine Google Charts đời cũ: chỉnh được
+ * màu và font, nhưng khoảng trắng, độ dày, chú thích thì không. Trần thẩm mỹ
+ * của nó chỉ tới đó. HTML thì toàn quyền, và số liệu vẫn sống.
  *
  * ==========================================================================
- * VÌ SAO XOÁ SẠCH BIỂU ĐỒ RỒI VẼ LẠI
+ * VÌ SAO KHÔNG DÙNG doGet
  * ==========================================================================
- * insertChart() luôn tạo đối tượng MỚI. Gọi lại mỗi lần sync mà không dọn
- * thì sau một tuần có mười bốn biểu đồ chồng lên nhau, và cái nhìn thấy là
- * cái cũ nhất. Dọn trước khi vẽ là cách duy nhất giữ đúng một bộ.
+ * doGet đang phục vụ webhook Telegram và web app đó để công khai. Đưa số liệu
+ * tài chính lên đó là hở ra ngoài. Dialog thì chỉ ai mở được sheet mới xem
+ * được — đúng bằng quyền họ vốn đã có.
  *
  * ==========================================================================
  * LỊCH SỬ
  * ==========================================================================
  * `Dashboard History` ghi MỘT dòng mỗi ngày, khoá theo ngày nên chạy lại
  * trong cùng ngày là ghi đè chứ không thêm dòng. Không vẽ được xu hướng cho
- * thứ chưa từng ghi lại, nên nó bắt đầu tích từ hôm nay và phải vài tuần
- * mới đủ dày để có nghĩa.
+ * thứ chưa từng ghi lại, nên nó bắt đầu tích từ hôm nay và phải vài tuần mới
+ * đủ dày. Trang HTML cố ý KHÔNG vẽ đường khi mới có một chấm.
  * ============================================================================
  */
 
 const DASH_CFG = Object.freeze({
   SHEET: 'Dashboard',
-  DATA_SHEET: '_Dashboard Data',
   HISTORY_SHEET: 'Dashboard History',
+  DIALOG_FILE: 'DashboardDialog',
+  DIALOG_TITLE: 'Bảng điều khiển',
+  WIDTH: 1280,
+  HEIGHT: 820,
 
-  /* Giữ đúng một năm. Xu hướng dài hơn thế thì đọc bằng mắt không ra gì. */
+  /* Giữ đúng hơn một năm. Dài hơn thế thì đọc bằng mắt không ra gì. */
   HISTORY_KEEP_DAYS: 400,
-
-  /* Số điểm cuối đưa vào biểu đồ xu hướng. */
   TREND_POINTS: 90,
 
-  TIMEZONE: 'Asia/Ho_Chi_Minh',
+  MAX_DRAFTS: 15,
+  MAX_ALERTS: 8,
 
-  /* Cùng bảng màu với tài liệu dòng tiền: xanh = tiền, đất nung = chi phí
-     và cảnh báo. Hai màu mang nghĩa, phần còn lại là xám trung tính. */
-  COLOR: Object.freeze({
-    INK: '#14202e',
-    MUTED: '#6b7787',
-    PAPER: '#f3f5f8',
-    CARD: '#ffffff',
-    LINE: '#d3dae4',
-    MONEY: '#0d6e63',
-    MONEY_SOFT: '#4c9c92',
-    MONEY_PALE: '#a8ccc7',
-    COST: '#a8503a',
-    COST_PALE: '#e8d5cf'
-  }),
-
-  LAYOUT: Object.freeze({
-    WIDTH: 10,
-    ROW_KPI_LABEL: 4,
-    ROW_KPI_VALUE: 5,
-    ROW_SECTION_WHERE: 7,
-    ROW_CHART_TOP: 8,
-    ROW_SECTION_CUSTOMER: 27,
-    ROW_TABLE_HEAD: 28,
-    ROW_TABLE_FIRST: 29,
-    ROW_SECTION_TREND: 35,
-    ROW_CHART_TREND: 36,
-    ROW_SECTION_ALERT: 55,
-    ROW_ALERT_FIRST: 56,
-    MAX_ALERTS: 10
-  })
+  TIMEZONE: 'Asia/Ho_Chi_Minh'
 });
 
 
 /*********************** ĐIỂM VÀO ************************/
 
 /*
- * Chạy tay lúc nào cũng được. Chuỗi trigger gọi nó sau syncCustomers, vì
- * nó chỉ ĐỌC kết quả của Flow và Customer chứ không tự tính lại gì.
+ * Mở trang. Số liệu nhồi thẳng vào HTML lúc dựng template nên trang hiện ra
+ * là có số ngay, không phải chờ một vòng google.script.run rồi nháy trắng.
+ */
+function showDashboard() {
+  const payload = dashCollectMetrics_(SpreadsheetApp.getActive());
+
+  const t = HtmlService.createTemplateFromFile(DASH_CFG.DIALOG_FILE);
+  t.payload = JSON.stringify(payload);
+
+  SpreadsheetApp.getUi().showModalDialog(
+    t.evaluate().setWidth(DASH_CFG.WIDTH).setHeight(DASH_CFG.HEIGHT),
+    DASH_CFG.DIALOG_TITLE
+  );
+}
+
+
+/*
+ * Chạy trong chuỗi trigger. Việc DUY NHẤT còn phải làm ngoài giờ mở trang là
+ * ghi ảnh chụp hằng ngày — trang HTML dựng lúc mở nên không cần chuẩn bị gì.
  */
 function updateDashboard() {
   const ss = SpreadsheetApp.getActive();
-  const started = new Date();
+  const m = dashCollectMetrics_(ss);
+  const history = dashUpsertHistory_(ss, m);
+  dashWriteSignpost_(ss, m);
 
-  const metrics = dashCollectMetrics_(ss);
-  const history = dashUpsertHistory_(ss, metrics);
-
-  dashWriteDataBlocks_(ss, metrics, history);
-  dashRender_(ss, metrics);
-
-  Logger.log(
-    'DASHBOARD DONE in ' +
-    ((new Date().getTime() - started.getTime()) / 1000).toFixed(1) + 's · ' +
-    history.length + ' ngày lịch sử'
-  );
+  Logger.log('DASHBOARD SNAPSHOT · ' + history.length + ' ngày lịch sử');
+  return history.length;
 }
 
 
 /*********************** SỐ LIỆU ************************/
 
-/*
- * Ba rổ KHÔNG chồng lấn, cộng lại đúng bằng toàn bộ tiền khách hệ thống
- * biết tới:
- *
- *   kẹt ở PayPal   — chưa rút ra được
- *   chưa xuất HĐ   — đã về nơi nhận, đủ điều kiện nhưng chưa lên hoá đơn
- *   đã xuất HĐ     — đã nằm trên một hoá đơn
- *
- * Lưu ý `Outstanding Amount` nghĩa là available TRỪ invoiced, tức là "đã về
- * nhưng chưa xuất hoá đơn" — KHÔNG phải "đã xuất hoá đơn mà chưa trả". Nhầm
- * chỗ này là vẽ sai cả biểu đồ.
- */
 function dashCollectMetrics_(ss) {
+  const now = new Date();
   const m = {
-    at: new Date(),
-    pending: 0, available: 0, invoiced: 0, outstanding: 0,
-    usdt: null, draft: 0, paid: 0, holdBalance: 0,
-    customers: [], alerts: []
+    at: Utilities.formatDate(now, DASH_CFG.TIMEZONE, 'HH:mm · dd/MM/yyyy'),
+    buckets: { pending: 0, outstanding: 0, invoiced: 0, total: 0 },
+    customers: [], chain: null, drafts: [], draftTotal: 0,
+    unassigned: [], unassignedTotal: 0,
+    paypal: [], treasury: [], health: { types: [], reconcile: [] },
+    usdt: null, holdBalance: 0, feeEarned: 0, owed: 0,
+    history: [], alerts: []
   };
 
-  const cs = ss.getSheetByName(CUST_CFG.CUSTOMERS_SHEET);
-  if (cs) {
-    const h = custHeaderMap_(cs);
-    custReadRowsObjects_(cs, h).forEach(function (c) {
-      const name = custStr_(c['Customer Name']) || custStr_(c['Customer Key']);
-      if (!name) return;
-      const row = {
-        name: name,
-        pending: custNum_(c['Pending in PayPal']),
-        outstanding: custNum_(c['Outstanding Amount']),
-        invoiced: custNum_(c['Invoiced Amount'])
-      };
-      row.total = custRound2_(row.pending + row.outstanding + row.invoiced);
-      m.customers.push(row);
-      m.pending += row.pending;
-      m.outstanding += row.outstanding;
-      m.invoiced += row.invoiced;
-      m.available += custNum_(c['Available Amount']);
-    });
-  }
-
-  ['pending', 'available', 'invoiced', 'outstanding'].forEach(function (k) {
-    m[k] = custRound2_(m[k]);
-  });
-
-  /* Khách nhiều tiền nhất lên trước — biểu đồ cột đọc mới ra thứ tự. */
-  m.customers.sort(function (a, b) { return b.total - a.total; });
-
-  m.usdt = dashUsdtRemaining_(ss);
-
-  const ps = ss.getSheetByName(CUST_CFG.PAYOUTS_SHEET);
-  if (ps) {
-    const h = custHeaderMap_(ps);
-    if (h['Status'] && h['Amount']) {
-      custReadRowsObjects_(ps, h).forEach(function (p) {
-        const st = custUpper_(p['Status']);
-        if (st === 'DRAFT') m.draft += custNum_(p['Amount']);
-        else if (st === 'PAID') m.paid += custNum_(p['Amount']);
-      });
-    }
-  }
-  m.draft = custRound2_(m.draft);
-  m.paid = custRound2_(m.paid);
-
-  const acc = ss.getSheetByName(FLOW_CFG.ACCOUNT_SHEET);
-  if (acc) {
-    const h = custHeaderMap_(acc);
-    if (h['Hold Balance']) {
-      custReadRowsObjects_(acc, h).forEach(function (a) {
-        if (custUpper_(a['Provider']) !== 'PAYPAL') return;
-        m.holdBalance += custNum_(a['Hold Balance']);
-      });
-    }
-  }
-  m.holdBalance = custRound2_(m.holdBalance);
+  dashReadCustomers_(ss, m);
+  dashReadSettlements_(ss, m);
+  dashReadPayouts_(ss, m);
+  dashReadAccounts_(ss, m);
+  dashReadTreasury_(ss, m);
+  dashReadUnassigned_(ss, m);
+  dashReadHealth_(ss, m);
+  dashReadHistory_(ss, m);
 
   /*
    * Dùng lại đúng các collector của báo cáo Telegram. Một nguồn sự thật cho
    * cảnh báo: sửa một chỗ thì cả hai nơi cùng đổi, không bao giờ lệch nhau.
-   *
-   * Gọi thẳng chứ không tra qua tên chuỗi — TRIGGERS.gs vắng mặt thì hỏng
-   * cả dashboard, mà im lặng bỏ qua cảnh báo còn tệ hơn là báo lỗi.
    */
   [
     trigCollectStuckMoney_, trigCollectOverdueWithdrawals_,
@@ -194,7 +116,300 @@ function dashCollectMetrics_(ss) {
     trigCollectDraftOverUsdt_, trigCollectStaleGrey_
   ].forEach(function (collect) { collect(ss, m.alerts); });
 
+  if (m.unassignedTotal > CUST_CFG.EPSILON) {
+    m.alerts.push(dashMoney_(m.unassignedTotal) + ' chưa gắn khách nào · ' +
+      m.unassigned.length + ' prefix: ' +
+      m.unassigned.map(function (u) { return u.prefix; }).join(' · '));
+  }
+
   return m;
+}
+
+
+/*
+ * Ba rổ KHÔNG chồng lấn, cộng lại đúng bằng toàn bộ tiền khách hệ thống biết
+ * tới. Lưu ý `Outstanding Amount` nghĩa là available TRỪ invoiced, tức "đã về
+ * nhưng chưa xuất hoá đơn" — KHÔNG phải "đã xuất hoá đơn mà chưa trả". Số nợ
+ * thật nằm ở `Outstanding Payable` bên Settlements.
+ */
+function dashReadCustomers_(ss, m) {
+  const sh = ss.getSheetByName(CUST_CFG.CUSTOMERS_SHEET);
+  if (!sh) return;
+
+  const h = custHeaderMap_(sh);
+  custReadRowsObjects_(sh, h).forEach(function (c) {
+    const name = custStr_(c['Customer Name']) || custStr_(c['Customer Key']);
+    if (!name) return;
+    if (custUpper_(c['Status']) === 'DISABLED') return;
+
+    const row = {
+      name: name,
+      prefixes: custStr_(c['Prefixes']),
+      pending: custNum_(c['Pending in PayPal']),
+      outstanding: custNum_(c['Outstanding Amount']),
+      invoiced: custNum_(c['Invoiced Amount']),
+      feePct: custNum_(c['Payout Fee %']),
+      advance: custNum_(c['Advance Outstanding']),
+      invoices: 0, owed: 0,
+      last: dashShortDate_(c['Last Settlement'])
+    };
+    row.total = custRound2_(row.pending + row.outstanding + row.invoiced);
+
+    m.customers.push(row);
+    m.buckets.pending += row.pending;
+    m.buckets.outstanding += row.outstanding;
+    m.buckets.invoiced += row.invoiced;
+  });
+
+  ['pending', 'outstanding', 'invoiced'].forEach(function (k) {
+    m.buckets[k] = custRound2_(m.buckets[k]);
+  });
+  m.buckets.total = custRound2_(
+    m.buckets.pending + m.buckets.outstanding + m.buckets.invoiced);
+
+  m.customers.sort(function (a, b) { return b.total - a.total; });
+}
+
+
+/*
+ * Chuỗi chi phí cộng dồn mọi hoá đơn hiệu lực.
+ *
+ * Hai vị trí của hoàn trả được SUY RA từ chính hai đẳng thức, không đoán:
+ *
+ *   hoàn trả trong kỳ   = gross − phí PayPal − phí nhận − khả dụng
+ *   hoàn trả kết chuyển = khả dụng − đổi − rút − trước phí dịch vụ
+ *
+ * Vì hoàn trả phát sinh trong kỳ thì đã trừ vào ledger nên nằm trước "khả
+ * dụng", còn khoản kết chuyển từ kỳ trước thì trừ sau chi phí đường ống.
+ * Suy ra như vậy thì chuỗi luôn đóng đúng, kể cả khi cơ chế đổi.
+ */
+function dashReadSettlements_(ss, m) {
+  const sh = ss.getSheetByName(CUST_CFG.SETTLEMENTS_SHEET);
+  if (!sh) return;
+
+  const h = custHeaderMap_(sh);
+  const sum = {
+    gross: 0, paypalFees: 0, receivingFees: 0, available: 0,
+    conversion: 0, transfer: 0, netBefore: 0, payoutFee: 0,
+    amountDue: 0, amountPaid: 0, outstandingPayable: 0, invoiceCount: 0
+  };
+
+  const byCustomer = {};
+
+  custReadRowsObjects_(sh, h).forEach(function (s) {
+    if (!custIsEffectiveSettlementStatus_(s['Status'])) return;
+
+    sum.invoiceCount++;
+    sum.gross += custNum_(s['Gross Sales']);
+    sum.paypalFees += custNum_(s['PayPal Fees']);
+    sum.receivingFees += custNum_(s['Receiving Fees']);
+    sum.available += custNum_(s['Available Amount']);
+    sum.conversion += custNum_(s['Conversion Cost']);
+    sum.transfer += custNum_(s['Transfer Cost']);
+    sum.netBefore += custNum_(s['Net Before Payout Fee']);
+    sum.payoutFee += custNum_(s['Payout Fee Amount']);
+    sum.amountDue += custNum_(s['Amount Due']);
+    sum.amountPaid += custNum_(s['Amount Paid']);
+    sum.outstandingPayable += custNum_(s['Outstanding Payable']);
+
+    const who = custStr_(s['Customer Name']) || custStr_(s['Customer Key']);
+    if (!byCustomer[who]) byCustomer[who] = { n: 0, owed: 0 };
+    byCustomer[who].n++;
+    byCustomer[who].owed += custNum_(s['Outstanding Payable']);
+  });
+
+  Object.keys(sum).forEach(function (k) {
+    if (k !== 'invoiceCount') sum[k] = custRound2_(sum[k]);
+  });
+
+  sum.refundInPeriod = custRound2_(
+    sum.gross - sum.paypalFees - sum.receivingFees - sum.available);
+  sum.refundCarry = custRound2_(
+    sum.available - sum.conversion - sum.transfer - sum.netBefore);
+
+  m.chain = sum;
+  m.feeEarned = sum.payoutFee;
+  m.owed = sum.outstandingPayable;
+
+  m.customers.forEach(function (c) {
+    const b = byCustomer[c.name];
+    if (!b) return;
+    c.invoices = b.n;
+    c.owed = custRound2_(b.owed);
+  });
+}
+
+
+function dashReadPayouts_(ss, m) {
+  const sh = ss.getSheetByName(CUST_CFG.PAYOUTS_SHEET);
+  if (!sh) return;
+
+  const h = custHeaderMap_(sh);
+  if (!h['Status'] || !h['Amount']) return;
+
+  custReadRowsObjects_(sh, h).forEach(function (p) {
+    if (custUpper_(p['Status']) !== 'DRAFT') return;
+    const amount = custNum_(p['Amount']);
+    m.draftTotal += amount;
+    m.drafts.push({
+      key: custStr_(p['Payout Key']),
+      payee: custStr_(p['Payee']),
+      ref: custStr_(p['Reference']),
+      amount: amount
+    });
+  });
+
+  m.draftTotal = custRound2_(m.draftTotal);
+  m.drafts.sort(function (a, b) { return b.amount - a.amount; });
+  m.drafts = m.drafts.slice(0, DASH_CFG.MAX_DRAFTS);
+}
+
+
+function dashReadAccounts_(ss, m) {
+  const sh = ss.getSheetByName(FLOW_CFG.ACCOUNT_SHEET);
+  if (!sh) return;
+
+  const h = custHeaderMap_(sh);
+  custReadRowsObjects_(sh, h).forEach(function (a) {
+    if (custUpper_(a['Provider']) !== 'PAYPAL') return;
+
+    const hold = custNum_(a['Hold Balance']);
+    m.holdBalance += hold;
+
+    const withdrawn = custNum_(a['Total Withdrawn']);
+    let state = 'ACTIVE';
+    if (custUpper_(a['PayPal Status']) === 'SUSPENDED') state = 'HOLD';
+    else if (!custBool_(a['Enabled'])) state = 'TẮT';
+    else if (withdrawn <= CUST_CFG.EPSILON) state = 'CHƯA RÚT';
+
+    m.paypal.push({
+      key: custStr_(a['Account Key']),
+      label: custStr_(a['Label']),
+      balance: custNum_(a['Total Balance']),
+      withdrawn: withdrawn,
+      state: state
+    });
+  });
+
+  m.holdBalance = custRound2_(m.holdBalance);
+  m.paypal.sort(function (a, b) { return b.balance - a.balance; });
+}
+
+
+function dashReadTreasury_(ss, m) {
+  [
+    { sheet: FLOW_CFG.GREY_SHEET, kind: 'Grey USD',
+      bal: 'Estimated USD Balance', got: 'Total Received USD' },
+    { sheet: FLOW_CFG.USDT_SHEET, kind: 'Ví USDT',
+      bal: 'Estimated Balance', got: 'Total Received USDT' }
+  ].forEach(function (src) {
+    const sh = ss.getSheetByName(src.sheet);
+    if (!sh) return;
+    const h = custHeaderMap_(sh);
+    custReadRowsObjects_(sh, h).forEach(function (r) {
+      const key = custStr_(r['Account Key']);
+      if (!key) return;
+      m.treasury.push({
+        key: key,
+        kind: custStr_(r['Tag']) || src.kind,
+        balance: custNum_(r[src.bal]),
+        received: custNum_(r[src.got]),
+        state: custUpper_(r['Status']) || 'ACTIVE',
+        sync: dashShortDate_(r['Last Sync'] || r['Last Activity'])
+      });
+    });
+  });
+
+  m.usdt = dashUsdtRemaining_(ss);
+}
+
+
+/*
+ * Prefix có tiền thật trên PayPal nhưng chưa khai cho khách nào. Không phải
+ * lỗi code — chỉ là tiền chưa vào được sổ, và nó im lặng nên phải nói ra.
+ */
+function dashReadUnassigned_(ss, m) {
+  const sh = ss.getSheetByName(FLOW_CFG.PAYPAL_SHEET);
+  if (!sh) return;
+
+  const known = {};
+  const cs = ss.getSheetByName(CUST_CFG.CUSTOMERS_SHEET);
+  if (cs) {
+    const ch = custHeaderMap_(cs);
+    custReadRowsObjects_(cs, ch).forEach(function (c) {
+      custStr_(c['Prefixes']).split(',').forEach(function (p) {
+        const k = custUpper_(p);
+        if (k) known[k] = true;
+      });
+    });
+  }
+
+  const h = custHeaderMap_(sh);
+  if (!h['Invoice Prefix']) return;
+
+  const acc = {};
+  custReadRowsObjects_(sh, h).forEach(function (r) {
+    const p = custUpper_(r['Invoice Prefix']);
+    if (!p || known[p]) return;
+    acc[p] = custRound2_((acc[p] || 0) + custNum_(r['Transaction Amount']));
+  });
+
+  Object.keys(acc).forEach(function (p) {
+    m.unassignedTotal += acc[p];
+    m.unassigned.push({ prefix: p, amount: acc[p] });
+  });
+
+  m.unassignedTotal = custRound2_(m.unassignedTotal);
+  m.unassigned.sort(function (a, b) { return b.amount - a.amount; });
+}
+
+
+function dashReadHealth_(ss, m) {
+  const sh = ss.getSheetByName(FLOW_CFG.TRANSACTION_SHEET);
+  if (!sh) return;
+
+  const h = custHeaderMap_(sh);
+  const types = {}, recon = {};
+
+  custReadRowsObjects_(sh, h).forEach(function (t) {
+    const ty = custUpper_(t['Type']);
+    const rc = custUpper_(t['Reconcile Status']);
+    if (ty) types[ty] = (types[ty] || 0) + 1;
+    if (rc) recon[rc] = (recon[rc] || 0) + 1;
+  });
+
+  const pack = function (obj) {
+    return Object.keys(obj)
+      .map(function (k) { return { name: k, n: obj[k] }; })
+      .sort(function (a, b) { return b.n - a.n; });
+  };
+
+  m.health.types = pack(types);
+  m.health.reconcile = pack(recon);
+}
+
+
+function dashReadHistory_(ss, m) {
+  const sh = ss.getSheetByName(DASH_CFG.HISTORY_SHEET);
+  if (!sh) return;
+
+  const last = sh.getLastRow();
+  if (last < 3) return;
+
+  sh.getRange(3, 1, last - 2, 7).getValues().forEach(function (r) {
+    const d = dashDateKey_(r[0]);
+    if (!d) return;
+    m.history.push({
+      d: d.substring(5).replace('-', '/'),
+      pending: custNum_(r[1]), outstanding: custNum_(r[2]),
+      invoiced: custNum_(r[3]), usdt: custNum_(r[4])
+    });
+  });
+
+  m.history.sort(function (a, b) { return a.d < b.d ? -1 : 1; });
+  if (m.history.length > DASH_CFG.TREND_POINTS) {
+    m.history = m.history.slice(-DASH_CFG.TREND_POINTS);
+  }
 }
 
 
@@ -203,8 +418,8 @@ function dashUsdtRemaining_(ss) {
   const sh = ss.getSheetByName(FLOW_CFG.USDT_SHEET);
   if (!sh) return null;
   const text = custStr_(sh.getRange(1, 1).getValue());
-  const m = text.match(/CÒN LẠI\s+(-?[\d.]+)/);
-  return m ? custRound2_(Number(m[1])) : null;
+  const found = text.match(/CÒN LẠI\s+(-?[\d.]+)/);
+  return found ? custRound2_(Number(found[1])) : null;
 }
 
 
@@ -212,26 +427,26 @@ function dashUsdtRemaining_(ss) {
 
 /*
  * Khoá theo NGÀY chứ không theo lần chạy. Sync chạy hai lượt mỗi ngày, mà
- * hai chấm cách nhau 12 tiếng trên cùng một đường xu hướng thì chỉ làm biểu
- * đồ răng cưa chứ không thêm thông tin nào.
+ * hai chấm cách nhau 12 tiếng trên cùng đường xu hướng chỉ làm biểu đồ răng
+ * cưa chứ không thêm thông tin nào.
  */
 function dashUpsertHistory_(ss, m) {
   const headers = ['Date', 'Pending in PayPal', 'Chưa xuất HĐ', 'Đã xuất HĐ',
-    'USDT còn lại', 'Payout DRAFT', 'Hold Balance'];
+    'USDT còn lại', 'Còn nợ khách', 'Hold Balance'];
 
   let sh = ss.getSheetByName(DASH_CFG.HISTORY_SHEET);
   if (!sh) {
     sh = ss.insertSheet(DASH_CFG.HISTORY_SHEET);
     sh.getRange(1, 1).setValue(
-      'Ảnh chụp mỗi ngày một dòng, do updateDashboard() ghi. ' +
-      'Đừng sửa tay — chạy lại trong ngày sẽ ghi đè dòng của ngày đó.');
+      'Ảnh chụp mỗi ngày một dòng, do updateDashboard() ghi. Đừng sửa tay — ' +
+      'chạy lại trong ngày sẽ ghi đè dòng của ngày đó.');
     sh.getRange(2, 1, 1, headers.length).setValues([headers]);
     sh.setFrozenRows(2);
   }
 
-  const today = Utilities.formatDate(m.at, DASH_CFG.TIMEZONE, 'yyyy-MM-dd');
-  const record = [today, m.pending, m.outstanding, m.invoiced,
-    m.usdt === null ? '' : m.usdt, m.draft, m.holdBalance];
+  const today = Utilities.formatDate(new Date(), DASH_CFG.TIMEZONE, 'yyyy-MM-dd');
+  const record = [today, m.buckets.pending, m.buckets.outstanding,
+    m.buckets.invoiced, m.usdt === null ? '' : m.usdt, m.owed, m.holdBalance];
 
   const last = sh.getLastRow();
   let target = 0;
@@ -246,15 +461,11 @@ function dashUpsertHistory_(ss, m) {
   if (!target) target = Math.max(last, 2) + 1;
   sh.getRange(target, 1, 1, record.length).setValues([record]);
 
-  /* Đọc lại để trả về đúng thứ đã nằm trên sheet, kể cả dòng vừa ghi. */
   const total = sh.getLastRow();
   if (total < 3) return [];
 
   const rows = sh.getRange(3, 1, total - 2, headers.length).getValues()
-    .filter(function (r) { return dashDateKey_(r[0]); })
-    .sort(function (a, b) {
-      return dashDateKey_(a[0]) < dashDateKey_(b[0]) ? -1 : 1;
-    });
+    .filter(function (r) { return dashDateKey_(r[0]); });
 
   if (rows.length > DASH_CFG.HISTORY_KEEP_DAYS) {
     const drop = rows.length - DASH_CFG.HISTORY_KEEP_DAYS;
@@ -276,270 +487,43 @@ function dashDateKey_(value) {
 }
 
 
-/*********************** NGUỒN CỦA BIỂU ĐỒ ************************/
+function dashShortDate_(value) {
+  const d = custDate_(value);
+  return d ? Utilities.formatDate(d, DASH_CFG.TIMEZONE, 'dd/MM') : '';
+}
+
+
+/* 1181.35 -> "1.181,35" — đọc quen mắt hơn trong câu cảnh báo. */
+function dashMoney_(value) {
+  const n = custNum_(value);
+  const parts = Math.abs(n).toFixed(2).split('.');
+  return (n < 0 ? '-' : '') +
+    parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ',' + parts[1];
+}
+
+
+/*********************** BIỂN CHỈ ĐƯỜNG ************************/
 
 /*
- * Ba khối, mỗi khối một kích thước CỐ ĐỊNH. Ô không dùng tới thì xoá trắng
- * chứ không thu hẹp vùng — vùng co giãn chính là thứ làm biểu đồ đọc lệch
- * cột sau vài lần chạy.
+ * Tab Dashboard cũ giờ chỉ còn một dòng chỉ đường. Cố ý KHÔNG xoá tab: xoá
+ * sheet của người khác là việc không hoàn tác được, mà giữ lại thì cũng
+ * không tốn gì.
  */
-function dashWriteDataBlocks_(ss, m, history) {
-  let sh = ss.getSheetByName(DASH_CFG.DATA_SHEET);
-  if (!sh) {
-    sh = ss.insertSheet(DASH_CFG.DATA_SHEET);
-    sh.getRange(1, 1).setValue(
-      'Nguồn dữ liệu của biểu đồ Dashboard. Sheet này cố ý bị ẩn — ' +
-      'sửa tay ở đây sẽ bị ghi đè ở lần updateDashboard() kế tiếp.');
-  }
-
-  const MAX_CUST = 12;
-
-  /* Khối 1 — ba rổ tiền, cho biểu đồ tròn. A3:B6 */
-  sh.getRange(3, 1, 4, 2).clearContent();
-  sh.getRange(3, 1, 4, 2).setValues([
-    ['Rổ', 'Số tiền'],
-    ['Kẹt ở PayPal', m.pending],
-    ['Đã về, chưa xuất HĐ', m.outstanding],
-    ['Đã xuất hoá đơn', m.invoiced]
-  ]);
-
-  /* Khối 2 — theo khách, cột chồng. D3:G(3+MAX_CUST) */
-  const custBlock = [['Khách', 'Kẹt ở PayPal', 'Chưa xuất HĐ', 'Đã xuất HĐ']];
-  for (let i = 0; i < MAX_CUST; i++) {
-    const c = m.customers[i];
-    custBlock.push(c ? [c.name, c.pending, c.outstanding, c.invoiced] : ['', '', '', '']);
-  }
-  sh.getRange(3, 4, MAX_CUST + 1, 4).clearContent();
-  sh.getRange(3, 4, MAX_CUST + 1, 4).setValues(custBlock);
-
-  /* Khối 3 — xu hướng. I3:M(3+TREND_POINTS) */
-  const N = DASH_CFG.TREND_POINTS;
-  const tail = history.slice(-N);
-  const trend = [['Ngày', 'Kẹt ở PayPal', 'Chưa xuất HĐ', 'Đã xuất HĐ', 'USDT còn lại']];
-  for (let i = 0; i < N; i++) {
-    const r = tail[i];
-    trend.push(r ? [dashDateKey_(r[0]), r[1], r[2], r[3], r[4]] : ['', '', '', '', '']);
-  }
-  sh.getRange(3, 9, N + 1, 5).clearContent();
-  sh.getRange(3, 9, N + 1, 5).setValues(trend);
-
-  sh.hideSheet();
-  return sh;
-}
-
-
-/*********************** TRÌNH BÀY ************************/
-
-function dashRender_(ss, m) {
-  const L = DASH_CFG.LAYOUT;
-  const C = DASH_CFG.COLOR;
-
+function dashWriteSignpost_(ss, m) {
   let sh = ss.getSheetByName(DASH_CFG.SHEET);
-  if (!sh) sh = ss.insertSheet(DASH_CFG.SHEET);
+  if (!sh) return;
 
-  /*
-   * Dọn sạch rồi dựng lại. Trang này không chứa dữ liệu gốc nào — mọi thứ
-   * đều suy ra được — nên xoá trắng là an toàn và tránh được tàn dư của
-   * lần chạy trước khi số dòng co lại.
-   *
-   * breakApart() là bắt buộc: clear() KHÔNG gỡ ô đã gộp. Lần sau số khách
-   * đổi, merge chồng lên một vùng gộp cũ có biên khác là ném lỗi giữa chừng.
-   */
+  sh.getCharts().forEach(function (c) { sh.removeChart(c); });
   sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
   sh.clear();
-  dashRemoveCharts_(sh);
 
-  sh.setHiddenGridlines(true);
-  sh.getRange(1, 1, sh.getMaxRows(), L.WIDTH).setBackground(C.PAPER);
-
-  /* Tiêu đề */
-  sh.getRange(1, 1, 1, L.WIDTH).merge()
-    .setValue('PAYMENT ALL')
-    .setFontSize(22).setFontWeight('bold').setFontColor(C.INK)
-    .setVerticalAlignment('middle');
-  sh.setRowHeight(1, 44);
-
-  sh.getRange(2, 1, 1, L.WIDTH).merge()
-    .setValue('Cập nhật ' +
-      Utilities.formatDate(m.at, DASH_CFG.TIMEZONE, 'HH:mm · dd/MM/yyyy') +
-      '   ·   số liệu do syncFlow và syncCustomers dựng, trang này chỉ đọc lại')
-    .setFontSize(10).setFontColor(C.MUTED);
-
-  /* Bốn ô số lớn */
-  const kpi = [
-    ['Kẹt ở PayPal', m.pending, C.COST],
-    ['Đã về, chưa xuất HĐ', m.outstanding, C.MONEY],
-    ['USDT còn lại', m.usdt, C.MONEY],
-    ['Payout DRAFT chờ trả', m.draft, C.COST]
-  ];
-
-  kpi.forEach(function (k, i) {
-    const col = 1 + i * 2;
-    sh.getRange(L.ROW_KPI_LABEL, col, 1, 2).merge()
-      .setValue(k[0].toUpperCase())
-      .setFontSize(8).setFontColor(C.MUTED).setFontWeight('bold');
-    const cell = sh.getRange(L.ROW_KPI_VALUE, col, 1, 2).merge()
-      .setValue(k[1] === null ? '—' : k[1])
-      .setFontSize(19).setFontWeight('bold').setFontColor(k[2])
-      .setVerticalAlignment('middle');
-    if (k[1] !== null) cell.setNumberFormat('#,##0.00');
-  });
-  sh.setRowHeight(L.ROW_KPI_VALUE, 36);
-
-  dashSection_(sh, L.ROW_SECTION_WHERE, 'TIỀN ĐANG Ở ĐÂU');
-
-  /* Bảng theo khách */
-  dashSection_(sh, L.ROW_SECTION_CUSTOMER, 'THEO KHÁCH');
-
-  const head = ['Khách', 'Kẹt ở PayPal', 'Đã về, chưa xuất HĐ', 'Đã xuất hoá đơn', 'Tổng'];
-  sh.getRange(L.ROW_TABLE_HEAD, 1, 1, head.length).setValues([head])
-    .setFontSize(9).setFontWeight('bold').setFontColor(C.MUTED)
-    .setBorder(null, null, true, null, null, null, C.LINE,
-      SpreadsheetApp.BorderStyle.SOLID);
-  sh.getRange(L.ROW_TABLE_HEAD, 2, 1, 4).setHorizontalAlignment('right');
-
-  const body = m.customers.map(function (c) {
-    return [c.name, c.pending, c.outstanding, c.invoiced, c.total];
-  });
-  body.push(['TỔNG', m.pending, m.outstanding, m.invoiced,
-    custRound2_(m.pending + m.outstanding + m.invoiced)]);
-
-  if (body.length) {
-    const rng = sh.getRange(L.ROW_TABLE_FIRST, 1, body.length, 5);
-    rng.setValues(body).setFontSize(10).setFontColor(C.INK);
-    sh.getRange(L.ROW_TABLE_FIRST, 2, body.length, 4)
-      .setNumberFormat('#,##0.00').setHorizontalAlignment('right');
-    sh.getRange(L.ROW_TABLE_FIRST + body.length - 1, 1, 1, 5)
-      .setFontWeight('bold')
-      .setBorder(true, null, null, null, null, null, C.LINE,
-        SpreadsheetApp.BorderStyle.SOLID);
-  }
-
-  dashSection_(sh, L.ROW_SECTION_TREND, 'XU HƯỚNG THEO NGÀY');
-
-  /* Cảnh báo */
-  dashSection_(sh, L.ROW_SECTION_ALERT, 'CẦN XEM');
-
-  if (!m.alerts.length) {
-    sh.getRange(L.ROW_ALERT_FIRST, 1, 1, L.WIDTH).merge()
-      .setValue('✓  Không có gì bất thường')
-      .setFontSize(11).setFontColor(C.MONEY);
-  } else {
-    const shown = m.alerts.slice(0, L.MAX_ALERTS);
-    shown.forEach(function (a, i) {
-      sh.getRange(L.ROW_ALERT_FIRST + i, 1, 1, L.WIDTH).merge()
-        .setValue('⚠  ' + a)
-        .setFontSize(11).setFontColor(C.COST);
-    });
-    if (m.alerts.length > shown.length) {
-      sh.getRange(L.ROW_ALERT_FIRST + shown.length, 1, 1, L.WIDTH).merge()
-        .setValue('… và ' + (m.alerts.length - shown.length) +
-          ' mục nữa — chạy validateCustomerSystem()')
-        .setFontSize(10).setFontColor(C.MUTED);
-    }
-  }
-
-  sh.setColumnWidth(1, 190);
-  for (let c = 2; c <= L.WIDTH; c++) sh.setColumnWidth(c, 122);
-
-  dashBuildCharts_(ss, sh, m);
-  sh.setActiveSelection('A1');
-}
-
-
-function dashSection_(sheet, row, label) {
-  const C = DASH_CFG.COLOR;
-  sheet.getRange(row, 1, 1, DASH_CFG.LAYOUT.WIDTH).merge()
-    .setValue(label)
-    .setFontSize(9).setFontWeight('bold').setFontColor(C.MUTED)
-    .setVerticalAlignment('bottom');
-  sheet.setRowHeight(row, 30);
-}
-
-
-/*********************** BIỂU ĐỒ ************************/
-
-function dashRemoveCharts_(sheet) {
-  sheet.getCharts().forEach(function (c) { sheet.removeChart(c); });
-}
-
-
-function dashBuildCharts_(ss, sheet, m) {
-  const data = ss.getSheetByName(DASH_CFG.DATA_SHEET);
-  if (!data) return;
-
-  const L = DASH_CFG.LAYOUT;
-  const C = DASH_CFG.COLOR;
-  const MAX_CUST = 12;
-  const N = DASH_CFG.TREND_POINTS;
-
-  /* 1 — ba rổ tiền */
-  sheet.insertChart(
-    sheet.newChart()
-      .setChartType(Charts.ChartType.PIE)
-      .addRange(data.getRange(3, 1, 4, 2))
-      .setPosition(L.ROW_CHART_TOP, 1, 0, 0)
-      .setNumHeaders(1)
-      .setOption('title', 'Tiền khách, theo nơi đang nằm')
-      .setOption('titleTextStyle', { color: C.INK, fontSize: 13, bold: true })
-      .setOption('pieHole', 0.55)
-      .setOption('colors', [C.COST, C.MONEY_SOFT, C.MONEY])
-      .setOption('legend', { position: 'labeled', textStyle: { color: C.MUTED, fontSize: 11 } })
-      .setOption('pieSliceText', 'value')
-      .setOption('backgroundColor', C.CARD)
-      .setOption('chartArea', { left: 10, top: 46, width: '92%', height: '78%' })
-      .setOption('width', 560)
-      .setOption('height', 340)
-      .build()
-  );
-
-  /* 2 — theo khách, cột chồng: cùng ba rổ, nhìn được ai đang kẹt ở đâu */
-  sheet.insertChart(
-    sheet.newChart()
-      .setChartType(Charts.ChartType.COLUMN)
-      .addRange(data.getRange(3, 4, MAX_CUST + 1, 4))
-      .setPosition(L.ROW_CHART_TOP, 6, 0, 0)
-      .setNumHeaders(1)
-      .setOption('title', 'Từng khách, tiền đang ở đâu')
-      .setOption('titleTextStyle', { color: C.INK, fontSize: 13, bold: true })
-      .setOption('isStacked', true)
-      .setOption('colors', [C.COST, C.MONEY_SOFT, C.MONEY])
-      .setOption('legend', { position: 'top', textStyle: { color: C.MUTED, fontSize: 11 } })
-      .setOption('backgroundColor', C.CARD)
-      .setOption('hAxis', { textStyle: { color: C.MUTED, fontSize: 11 } })
-      .setOption('vAxis', {
-        textStyle: { color: C.MUTED, fontSize: 10 },
-        gridlines: { color: C.LINE }, minorGridlines: { count: 0 }
-      })
-      .setOption('chartArea', { left: 64, top: 64, width: '88%', height: '68%' })
-      .setOption('width', 560)
-      .setOption('height', 340)
-      .build()
-  );
-
-  /* 3 — xu hướng. Một điểm thì chưa ra đường, phải đợi lịch sử dày lên. */
-  sheet.insertChart(
-    sheet.newChart()
-      .setChartType(Charts.ChartType.LINE)
-      .addRange(data.getRange(3, 9, N + 1, 5))
-      .setPosition(L.ROW_CHART_TREND, 1, 0, 0)
-      .setNumHeaders(1)
-      .setOption('title', 'Diễn biến theo ngày')
-      .setOption('titleTextStyle', { color: C.INK, fontSize: 13, bold: true })
-      .setOption('colors', [C.COST, C.MONEY_SOFT, C.MONEY, C.INK])
-      .setOption('legend', { position: 'top', textStyle: { color: C.MUTED, fontSize: 11 } })
-      .setOption('backgroundColor', C.CARD)
-      .setOption('curveType', 'none')
-      .setOption('pointSize', 3)
-      .setOption('lineWidth', 2)
-      .setOption('hAxis', { textStyle: { color: C.MUTED, fontSize: 10 }, showTextEvery: 7 })
-      .setOption('vAxis', {
-        textStyle: { color: C.MUTED, fontSize: 10 },
-        gridlines: { color: C.LINE }, minorGridlines: { count: 0 }
-      })
-      .setOption('chartArea', { left: 64, top: 56, width: '90%', height: '72%' })
-      .setOption('width', 1140)
-      .setOption('height', 320)
-      .build()
-  );
+  sh.getRange(1, 1).setValue('BẢNG ĐIỀU KHIỂN ĐÃ CHUYỂN SANG TRANG RIÊNG')
+    .setFontSize(13).setFontWeight('bold');
+  sh.getRange(2, 1).setValue('Mở bằng menu  Payment All  ›  Bảng điều khiển')
+    .setFontSize(11);
+  sh.getRange(4, 1).setValue(
+    'Ảnh chụp hằng ngày vẫn được ghi ở sheet "' + DASH_CFG.HISTORY_SHEET +
+    '" để dựng biểu đồ xu hướng. Cập nhật gần nhất: ' + m.at)
+    .setFontSize(10).setFontColor('#6d7d92');
+  sh.setColumnWidth(1, 640);
 }
