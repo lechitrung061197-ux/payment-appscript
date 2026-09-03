@@ -1555,7 +1555,21 @@ function flowPayoutManualCategories_() {
  * Quy tắc này phải nằm ở ĐÚNG MỘT chỗ. Trước đó sổ chủ loại giá trị lạ ra
  * còn cảnh báo lại cộng vào, nên hai nơi báo hai số khác nhau.
  */
-function flowPayoutIsOwnerCost_(category) {
+function flowPayoutIsOwnerCost_(category, settlementKey) {
+  /*
+   * Settlement Key thắng mọi thứ. Nó là mối nối DUY NHẤT giữa một hoá đơn và
+   * số tiền hoá đơn đó tiêu, nên payout mang nó là tiền khách — bất kể ai gõ
+   * gì vào cột Category.
+   *
+   * Không phải phòng hờ: trên sheet thật đang có một dòng "Auto-created from
+   * INV-000009" bị đổi Category thành MANUAL_PAYOUT. Thiếu guard này thì chỉ
+   * cần ai đó gõ EXPENSE vào đúng dòng đó là 680,97 vừa trả nợ hoá đơn vừa
+   * bị tính là chủ rút ra.
+   */
+  if (flowString_(settlementKey)) {
+    return false;
+  }
+
   const c = flowString_(category).toUpperCase();
   if (!c || c === 'CUSTOMER_PAYOUT') {
     return false;

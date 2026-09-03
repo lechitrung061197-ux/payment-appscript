@@ -61,9 +61,10 @@ const SETTLEMENTS = S.map((r, i) => ({
 }));
 
 /* Category/Fee đúng như sheet thật ngày 02/09: 3 dòng trống, 1 dòng lạ. */
-const P_ = (k, payee, ref, amt, st, cat, fee) => ({
+const P_ = (k, payee, ref, amt, st, cat, fee, settlement) => ({
   'Payout Key': k, 'Payee': payee, 'Reference': ref, 'Amount': amt,
-  'Status': st, 'Category': cat || '', 'Fee': fee || 0
+  'Status': st, 'Category': cat || '', 'Fee': fee || 0,
+  'Settlement Key': settlement || ''
 });
 const PAYOUTS = [
   P_('PO-000003', 'DITECH', 'INV-000003', 279.07, 'DRAFT', 'CUSTOMER_PAYOUT'),
@@ -336,6 +337,15 @@ console.log('\n6 · sổ chủ');
      sẽ báo hai con số khác nhau cho cùng một sheet. */
   eq('giá trị lạ MANUAL_PAYOUT → false', own('MANUAL_PAYOUT'), false);
 
+  /* Settlement Key thắng Category. Trên sheet thật có dòng
+     "Auto-created from INV-000009" bị đổi thành MANUAL_PAYOUT. */
+  const own2 = (cat, sk) => { sb.__c = cat; sb.__k = sk;
+    return vm.runInContext('flowPayoutIsOwnerCost_(__c, __k)', sb); };
+  eq('có Settlement Key thì EXPENSE cũng không phải phần chủ',
+     own2('EXPENSE', 'SET-000009'), false);
+  eq('có Settlement Key + MANUAL_PAYOUT', own2('MANUAL_PAYOUT', 'SET-000009'), false);
+  eq('không Settlement Key thì EXPENSE là phần chủ', own2('EXPENSE', ''), true);
+
   /* Chưa phân loại: KHÔNG được đoán bừa vào "đã lấy ra" */
   const m = metrics();
   eq('kiếm được', m.owner.earned, 292.09);
@@ -352,6 +362,16 @@ console.log('\n6 · sổ chủ');
   eq('EXPENSE gộp đúng (466+2+708)', f.owner.byCategory.filter(x => x.name === 'EXPENSE')[0].amount, 1176.00);
   eq('theo người nhận: ASON', f.owner.byPayee[0].name, 'ASON');
   eq('ASON 1.176,00', f.owner.byPayee[0].amount, 1176.00);
+
+  /* Ca thật trên sheet 03/09: payout của hoá đơn ASON bị gõ nhầm Category.
+     Không được tính là chủ rút, cũng không được kêu "chưa phân loại". */
+  const asonCase = metrics({ sheets: { 'Payouts': PAYOUTS_FIXED.concat([
+    P_('PO-000013', 'ASON', 'INV-000009', 680.97, 'PAID', 'MANUAL_PAYOUT', 0, 'SET-000009')
+  ]) } });
+  eq('payout gắn hoá đơn không vào sổ chủ', asonCase.owner.drawn, 1300.00);
+  eq('và không bị kêu chưa phân loại', asonCase.owner.unclassified.n, 0);
+  eq('cảnh báo phân loại cũng im',
+     asonCase.alerts.filter(a => a.indexOf('chưa phân loại') !== -1).length, 0);
 
   /* DRAFT không bao giờ tính là đã lấy */
   const d2 = metrics({ sheets: { 'Payouts': [

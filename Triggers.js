@@ -408,6 +408,9 @@ function trigCollectPayoutCategory_(ss, issues) {
   custReadRowsObjects_(sheet, h).forEach(function (p) {
     if (custUpper_(p['Status']) !== 'PAID') return;
 
+    /* Có Settlement Key là tiền khách, đã có chủ — không đòi phân loại. */
+    if (custStr_(p['Settlement Key'])) return;
+
     const category = custUpper_(p['Category']);
     if (category && known.indexOf(category) !== -1) return;
 
@@ -453,7 +456,7 @@ function trigCollectOwnerOverdraw_(ss, issues) {
   let drawn = 0;
   custReadRowsObjects_(payouts, ph).forEach(function (p) {
     if (custUpper_(p['Status']) !== 'PAID') return;
-    if (!flowPayoutIsOwnerCost_(p['Category'])) return;
+    if (!flowPayoutIsOwnerCost_(p['Category'], p['Settlement Key'])) return;
     drawn += custNum_(p['Amount']) + custNum_(p['Fee']);
   });
 

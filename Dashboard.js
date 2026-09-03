@@ -286,6 +286,13 @@ function dashReadPayouts_(ss, m) {
 
     const left = custRound2_(amount + custNum_(p['Fee']));
     const category = custUpper_(p['Category']);
+    const settlement = custStr_(p['Settlement Key']);
+
+    /*
+     * Dòng gắn Settlement Key là tiền khách dù Category ghi gì — không đếm
+     * vào sổ chủ, cũng không kêu "chưa phân loại" vì nó có chủ rõ ràng rồi.
+     */
+    if (settlement) return;
 
     if (!category || known.indexOf(category) === -1) {
       m.owner.unclassified.n++;
@@ -293,7 +300,7 @@ function dashReadPayouts_(ss, m) {
       return;
     }
 
-    if (!flowPayoutIsOwnerCost_(category)) return;
+    if (!flowPayoutIsOwnerCost_(category, settlement)) return;
 
     m.owner.drawn = custRound2_(m.owner.drawn + left);
     byCategory[category] = custRound2_((byCategory[category] || 0) + left);
@@ -504,12 +511,19 @@ function dashUpsertHistory_(ss, m) {
   let sh = ss.getSheetByName(DASH_CFG.HISTORY_SHEET);
   if (!sh) {
     sh = ss.insertSheet(DASH_CFG.HISTORY_SHEET);
-    sh.getRange(1, 1).setValue(
-      'Ảnh chụp mỗi ngày một dòng, do updateDashboard() ghi. Đừng sửa tay — ' +
-      'chạy lại trong ngày sẽ ghi đè dòng của ngày đó.');
-    sh.getRange(2, 1, 1, headers.length).setValues([headers]);
     sh.setFrozenRows(2);
   }
+
+  /*
+   * Ghi header MỖI LẦN, không chỉ lúc tạo sheet. Thêm cột mới vào bản ghi mà
+   * chỉ đặt header lúc tạo thì sheet cũ nhận giá trị ở những cột không tên,
+   * và cột đổi ý nghĩa vẫn mang nhãn cũ — đọc lại sau vài tuần là hiểu sai.
+   * Ghi đè một hàng bảy ô mỗi ngày thì không đáng kể.
+   */
+  sh.getRange(1, 1).setValue(
+    'Ảnh chụp mỗi ngày một dòng, do updateDashboard() ghi. Đừng sửa tay — ' +
+    'chạy lại trong ngày sẽ ghi đè dòng của ngày đó.');
+  sh.getRange(2, 1, 1, headers.length).setValues([headers]);
 
   const today = Utilities.formatDate(new Date(), DASH_CFG.TIMEZONE, 'yyyy-MM-dd');
   const record = [today, m.buckets.pending, m.buckets.outstanding,
