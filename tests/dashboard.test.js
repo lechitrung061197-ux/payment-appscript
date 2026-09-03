@@ -86,8 +86,9 @@ const PAYOUTS = [
 const FIXED_ = {
   'PO-000006': P_('PO-000006', 'TRUNG', '', 100.00, 'PAID', 'OWNER_DRAW'),
   'PO-000007': P_('PO-000007', 'TRUNG', '', 24.00, 'PAID', 'OWNER_DRAW'),
-  'PO-000008': P_('PO-000008', 'ASON', '', 466.00, 'PAID', 'EXPENSE', 2.00),
-  'PO-000009': P_('PO-000009', 'ASON', '', 708.00, 'PAID', 'EXPENSE')
+  /* Bù trừ phần ghi thừa vào ví mặc định, không phải tiền tiêu. */
+  'PO-000008': P_('PO-000008', 'ASON', '', 466.00, 'PAID', 'ADJUSTMENT', 2.00),
+  'PO-000009': P_('PO-000009', 'ASON', '', 708.00, 'PAID', 'ADJUSTMENT')
 };
 const PAYOUTS_FIXED = PAYOUTS.map(p => FIXED_[p['Payout Key']] || p);
 
@@ -337,6 +338,13 @@ console.log('\n6 · sổ chủ');
      sẽ báo hai con số khác nhau cho cùng một sheet. */
   eq('giá trị lạ MANUAL_PAYOUT → false', own('MANUAL_PAYOUT'), false);
 
+  /* Chỉ OWNER_DRAW và EXPENSE mới là chủ tiêu. Ca thật: 1.176,00 bù trừ ghi
+     ví từng bị tính thành chủ tiêu, kéo sổ chủ xuống âm oan. */
+  eq('ADJUSTMENT không phải chủ tiêu', own('ADJUSTMENT'), false);
+  eq('TRANSFER không phải chủ tiêu', own('TRANSFER'), false);
+  eq('REFUND không phải chủ tiêu', own('REFUND'), false);
+  eq('OTHER không kết luận', own('OTHER'), false);
+
   /* Settlement Key thắng Category. Trên sheet thật có dòng
      "Auto-created from INV-000009" bị đổi thành MANUAL_PAYOUT. */
   const own2 = (cat, sk) => { sb.__c = cat; sb.__k = sk;
@@ -355,20 +363,20 @@ console.log('\n6 · sổ chủ');
 
   /* Sau khi điền category */
   const f = metrics({ sheets: { 'Payouts': PAYOUTS_FIXED } });
-  eq('đã lấy ra', f.owner.drawn, 1300.00);
-  eq('còn được lấy → ÂM', f.owner.remaining, -1007.91);
+  eq('chỉ TRUNG là chủ rút', f.owner.drawn, 124.00);
+  eq('còn được lấy → DƯƠNG', f.owner.remaining, 168.09);
   eq('hết dòng chưa phân loại', f.owner.unclassified.n, 0);
   eq('OWNER_DRAW gộp đúng', f.owner.byCategory.filter(x => x.name === 'OWNER_DRAW')[0].amount, 124.00);
-  eq('EXPENSE gộp đúng (466+2+708)', f.owner.byCategory.filter(x => x.name === 'EXPENSE')[0].amount, 1176.00);
-  eq('theo người nhận: ASON', f.owner.byPayee[0].name, 'ASON');
-  eq('ASON 1.176,00', f.owner.byPayee[0].amount, 1176.00);
+  eq('1.176,00 bù trừ KHÔNG lọt vào', f.owner.byCategory.length, 1);
+  eq('theo người nhận chỉ còn TRUNG', f.owner.byPayee[0].name, 'TRUNG');
+  eq('TRUNG 124,00', f.owner.byPayee[0].amount, 124.00);
 
   /* Ca thật trên sheet 03/09: payout của hoá đơn ASON bị gõ nhầm Category.
      Không được tính là chủ rút, cũng không được kêu "chưa phân loại". */
   const asonCase = metrics({ sheets: { 'Payouts': PAYOUTS_FIXED.concat([
     P_('PO-000013', 'ASON', 'INV-000009', 680.97, 'PAID', 'MANUAL_PAYOUT', 0, 'SET-000009')
   ]) } });
-  eq('payout gắn hoá đơn không vào sổ chủ', asonCase.owner.drawn, 1300.00);
+  eq('payout gắn hoá đơn không vào sổ chủ', asonCase.owner.drawn, 124.00);
   eq('và không bị kêu chưa phân loại', asonCase.owner.unclassified.n, 0);
   eq('cảnh báo phân loại cũng im',
      asonCase.alerts.filter(a => a.indexOf('chưa phân loại') !== -1).length, 0);
@@ -397,9 +405,16 @@ console.log('\n7 · cảnh báo phân loại và rút quá');
   const f = metrics({ sheets: { 'Payouts': PAYOUTS_FIXED } });
   eq('phân loại xong thì hết kêu thiếu',
      f.alerts.filter(a => a.indexOf('chưa phân loại') !== -1).length, 0);
-  const over = f.alerts.filter(a => a.indexOf('Đã lấy ra') === 0);
+  eq('và KHÔNG còn kêu rút quá — bù trừ không phải tiêu',
+     f.alerts.filter(a => a.indexOf('Đã lấy ra') === 0).length, 0);
+
+  /* Rút quá thật thì vẫn phải kêu */
+  const real = metrics({ sheets: { 'Payouts': [
+    P_('X1', 'TRUNG', '', 400, 'PAID', 'OWNER_DRAW')
+  ] } });
+  const over = real.alerts.filter(a => a.indexOf('Đã lấy ra') === 0);
   eq('kêu rút quá', over.length, 1);
-  ok('nêu vượt 1.007,91', over[0].indexOf('1.007,91') !== -1, over[0]);
+  ok('nêu vượt 107,91', over[0].indexOf('107,91') !== -1, over[0]);
 
   /* Lấy ít hơn kiếm được thì im */
   const okCase = metrics({ sheets: { 'Payouts': [
@@ -424,10 +439,16 @@ console.log('\n8 · trang HTML với sổ chủ');
 
   const html = render(metrics({ sheets: { 'Payouts': PAYOUTS_FIXED } }));
   ok('có khối Sổ chủ', html.indexOf('Sổ chủ') !== -1);
-  ok('hiện số âm', html.indexOf('-1.007,91') !== -1);
-  ok('nói rõ đang lấy vào tiền khách', html.indexOf('tiền của khách') !== -1);
+  ok('hiện còn được lấy 168,09', html.indexOf('168,09') !== -1);
+  ok('không cảnh báo lấy vào tiền khách', html.indexOf('tiền của khách') === -1);
   ok('có breakdown OWNER_DRAW', html.indexOf('OWNER_DRAW') !== -1);
   ok('không NaN', html.indexOf('NaN') === -1);
+
+  const negative = render(metrics({ sheets: { 'Payouts': [
+    P_('X1', 'TRUNG', '', 400, 'PAID', 'OWNER_DRAW')
+  ] } }));
+  ok('rút quá thật thì hiện số âm', negative.indexOf('-107,91') !== -1);
+  ok('và cảnh báo lấy vào tiền khách', negative.indexOf('tiền của khách') !== -1);
 
   const html2 = render(metrics());
   ok('còn dòng chưa phân loại thì nói ra', html2.indexOf('chưa phân loại') !== -1);

@@ -1570,11 +1570,29 @@ function flowPayoutIsOwnerCost_(category, settlementKey) {
     return false;
   }
 
+  /*
+   * Danh sách CHO PHÉP, không phải danh sách loại trừ. Chỉ hai loại này là
+   * chủ thật sự tiêu mất phần phí kiếm được:
+   *
+   *   OWNER_DRAW — chủ rút ra dùng việc riêng
+   *   EXPENSE    — chi phí nuôi chính hệ thống
+   *
+   * Những loại còn lại KHÔNG phải tiêu:
+   *
+   *   ADJUSTMENT — bù trừ ghi sai ví. Mọi tài khoản Grey đều trỏ mặc định về
+   *                cùng một ví USDT, nên tiền rút ra ví khác vẫn bị ghi có
+   *                cho ví mặc định; dòng payout bù trừ chỉ gỡ phần ghi thừa
+   *                đó ra, không có đồng nào rời đi thêm.
+   *   TRANSFER   — chuyển sang ví khác, tiền vẫn còn.
+   *   REFUND     — trả lại người mua, đó là tiền khách.
+   *   OTHER      — chưa xác định được thì không kết luận.
+   *
+   * Viết theo kiểu loại trừ ("mọi thứ không phải CUSTOMER_PAYOUT") là sai:
+   * trên sheet thật, 1.176,00 tiền bù trừ ghi ví bị tính thành chủ tiêu, kéo
+   * sổ chủ xuống âm 1.007,91 trong khi thực tế còn dương 168,09.
+   */
   const c = flowString_(category).toUpperCase();
-  if (!c || c === 'CUSTOMER_PAYOUT') {
-    return false;
-  }
-  return flowPayoutCategories_().indexOf(c) !== -1;
+  return c === 'OWNER_DRAW' || c === 'EXPENSE';
 }
 
 
