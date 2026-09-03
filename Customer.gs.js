@@ -2352,6 +2352,25 @@ function custEnsurePayoutRowValidations_(ss,sheet,h,row,provider){
     );
   }
 
+  /*
+   * Category dùng danh sách ĐẦY ĐỦ, kể cả CUSTOMER_PAYOUT: chính engine hoá
+   * đơn ghi giá trị đó vào các dòng này, loại nó ra là mọi dòng payout khách
+   * đều mọc tam giác cảnh báo. Người tự gõ CUSTOMER_PAYOUT vẫn bị Flow chặn
+   * bằng guard MISSING SETTLEMENT sẵn có.
+   *
+   * Và setAllowInvalid(TRUE) — khác Provider/Status ở trên. Sheet đang có
+   * sẵn giá trị lạ (MANUAL_PAYOUT); chặn cứng là sửa dữ liệu của người dùng
+   * mà không hỏi. Cảnh báo mềm để họ tự sửa, còn báo cáo sáng thì nêu tên.
+   */
+  if(h['Category']){
+    sheet.getRange(row,h['Category']).setDataValidation(
+      SpreadsheetApp.newDataValidation()
+        .requireValueInList(flowPayoutCategories_(),true)
+        .setAllowInvalid(true)
+        .build()
+    );
+  }
+
   custSetPayoutAccountValidation_(ss,sheet,h,row,provider);
 }
 

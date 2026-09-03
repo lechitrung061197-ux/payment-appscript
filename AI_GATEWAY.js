@@ -187,7 +187,7 @@ function payAiToolDefinitions_() {
           amount: { type: 'number', description: 'create_manual_payout only: amount to pay out, greater than 0. Use 0 otherwise.' },
           fee: { type: 'number', description: 'create_manual_payout only: known fee, 0 if none.' },
           payee: { type: 'string', description: 'create_manual_payout only: who or what is being paid. Empty otherwise.' },
-          category: { type: 'string', description: 'create_manual_payout only: EXPENSE, REFUND, TRANSFER, ADJUSTMENT or OTHER. Never CUSTOMER_PAYOUT — invoices own that. Empty otherwise.' },
+          category: { type: 'string', description: 'create_manual_payout only: OWNER_DRAW (the owner taking their own service-fee earnings), EXPENSE, REFUND, TRANSFER, ADJUSTMENT or OTHER. Never CUSTOMER_PAYOUT — invoices own that. Empty otherwise.' },
           note: { type: 'string', description: 'create_manual_payout only: what this payment is for, in the owner\'s own words. Empty otherwise.' }
         },
         required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force','advance_amount','advance_note','provider','account_key','amount','fee','payee','category','note'],
@@ -611,14 +611,15 @@ function payAiRunSafeAction_(args) {
  * Chỉ những loại này. CUSTOMER_PAYOUT cố tình vắng mặt: đó là lãnh địa của
  * engine hoá đơn, nơi mỗi đồng phải truy được về allocation đã tiêu. Một dòng
  * tay đội lốt payout khách sẽ trốn được cổng settlement của Flow.
+ *
+ * Danh sách gốc nằm ở flowPayoutManualCategories_ trong Flow.gs, dùng chung
+ * với dropdown trên sheet. Đọc qua HÀM chứ không giữ một bản sao: hai danh
+ * sách rời nhau thì sớm muộn cũng lệch, và lệch ở đây nghĩa là AI ghi được
+ * giá trị mà dropdown không cho phép.
  */
-const PAY_AI_MANUAL_CATEGORIES = Object.freeze([
-  'EXPENSE',
-  'REFUND',
-  'TRANSFER',
-  'ADJUSTMENT',
-  'OTHER'
-]);
+function payAiManualCategories_() {
+  return flowPayoutManualCategories_();
+}
 
 
 /*
@@ -646,8 +647,8 @@ function payAiCreateManualPayout_(args) {
   if (category === 'CUSTOMER_PAYOUT') {
     throw new Error('CUSTOMER_PAYOUT belongs to the invoice engine. Create an invoice instead; a manual row cannot carry a settlement.');
   }
-  if (PAY_AI_MANUAL_CATEGORIES.indexOf(category) === -1) {
-    throw new Error('category must be one of: ' + PAY_AI_MANUAL_CATEGORIES.join(', ') + '. Got: ' + category);
+  if (payAiManualCategories_().indexOf(category) === -1) {
+    throw new Error('category must be one of: ' + payAiManualCategories_().join(', ') + '. Got: ' + category);
   }
 
   const amount = payAiToNumber_(args.amount);

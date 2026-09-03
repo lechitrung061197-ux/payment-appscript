@@ -60,13 +60,35 @@ const SETTLEMENTS = S.map((r, i) => ({
   'Status': r[11] > 0 && r[12] === 0 ? 'PAID' : 'ISSUED', 'Issued At': ''
 }));
 
+/* Category/Fee đúng như sheet thật ngày 02/09: 3 dòng trống, 1 dòng lạ. */
+const P_ = (k, payee, ref, amt, st, cat, fee) => ({
+  'Payout Key': k, 'Payee': payee, 'Reference': ref, 'Amount': amt,
+  'Status': st, 'Category': cat || '', 'Fee': fee || 0
+});
 const PAYOUTS = [
-  { 'Payout Key': 'PO-000003', 'Payee': 'DITECH', 'Reference': 'INV-000003', 'Amount': 279.07, 'Status': 'DRAFT' },
-  { 'Payout Key': 'PO-000005', 'Payee': 'DITECH', 'Reference': 'INV-000005', 'Amount': 244.29, 'Status': 'DRAFT' },
-  { 'Payout Key': 'PO-000011', 'Payee': 'HUI', 'Reference': 'INV-000007', 'Amount': 467.53, 'Status': 'DRAFT' },
-  { 'Payout Key': 'PO-000012', 'Payee': 'DITECH', 'Reference': 'INV-000008', 'Amount': 284.72, 'Status': 'DRAFT' },
-  { 'Payout Key': 'PO-000001', 'Payee': 'HUI', 'Reference': 'INV-000001', 'Amount': 1662.16, 'Status': 'PAID' }
+  P_('PO-000003', 'DITECH', 'INV-000003', 279.07, 'DRAFT', 'CUSTOMER_PAYOUT'),
+  P_('PO-000005', 'DITECH', 'INV-000005', 244.29, 'DRAFT', 'CUSTOMER_PAYOUT'),
+  P_('PO-000011', 'HUI', 'INV-000007', 467.53, 'DRAFT', 'CUSTOMER_PAYOUT'),
+  P_('PO-000012', 'DITECH', 'INV-000008', 284.72, 'DRAFT', 'CUSTOMER_PAYOUT'),
+  P_('PO-000001', 'HUI', 'INV-000001', 1662.16, 'PAID', 'CUSTOMER_PAYOUT'),
+  P_('PO-000006', 'TRUNG', '', 100.00, 'PAID', ''),
+  P_('PO-000007', 'TRUNG', '', 24.00, 'PAID', ''),
+  P_('PO-000008', 'ASON', '', 466.00, 'PAID', '', 2.00),
+  P_('PO-000009', 'ASON', '', 708.00, 'PAID', 'MANUAL_PAYOUT')
 ];
+
+/*
+ * Cùng dữ liệu nhưng đã phân loại xong. Thay THEO KHOÁ chứ không lọc theo
+ * "có category hay chưa" — PO-000009 vốn đã mang MANUAL_PAYOUT, lọc kiểu đó
+ * là giữ lại bản cũ rồi thêm bản mới, thành đếm 708 hai lần.
+ */
+const FIXED_ = {
+  'PO-000006': P_('PO-000006', 'TRUNG', '', 100.00, 'PAID', 'OWNER_DRAW'),
+  'PO-000007': P_('PO-000007', 'TRUNG', '', 24.00, 'PAID', 'OWNER_DRAW'),
+  'PO-000008': P_('PO-000008', 'ASON', '', 466.00, 'PAID', 'EXPENSE', 2.00),
+  'PO-000009': P_('PO-000009', 'ASON', '', 708.00, 'PAID', 'EXPENSE')
+};
+const PAYOUTS_FIXED = PAYOUTS.map(p => FIXED_[p['Payout Key']] || p);
 
 const ACCOUNTS = [
   { 'Account Key': 'PP1', 'Label': 'bellaboho', 'Provider': 'PAYPAL', 'Enabled': true,
@@ -299,6 +321,103 @@ console.log('\n5 · trang HTML chạy thật, không ném lỗi');
   const html3 = render(empty);
   ok('sổ rỗng vẫn dựng được trang', html3.length > 500);
   ok('sổ rỗng không có NaN', html3.indexOf('NaN') === -1);
+}
+
+console.log('\n6 · sổ chủ');
+{
+  const sb = build();
+  const own = (cat) => { sb.__c = cat; return vm.runInContext('flowPayoutIsOwnerCost_(__c)', sb); };
+  eq('CUSTOMER_PAYOUT không phải phần chủ', own('CUSTOMER_PAYOUT'), false);
+  eq('rỗng → false (chưa phân loại thì chưa kết luận)', own(''), false);
+  eq('OWNER_DRAW', own('OWNER_DRAW'), true);
+  eq('EXPENSE', own('EXPENSE'), true);
+  eq('chữ thường vẫn nhận', own('expense'), true);
+  /* Giá trị lạ KHÔNG được coi là đã lấy — nếu không, sổ chủ và cảnh báo
+     sẽ báo hai con số khác nhau cho cùng một sheet. */
+  eq('giá trị lạ MANUAL_PAYOUT → false', own('MANUAL_PAYOUT'), false);
+
+  /* Chưa phân loại: KHÔNG được đoán bừa vào "đã lấy ra" */
+  const m = metrics();
+  eq('kiếm được', m.owner.earned, 292.09);
+  eq('đã lấy ra (chỉ dòng đã phân loại)', m.owner.drawn, 0);
+  eq('4 dòng chưa phân loại', m.owner.unclassified.n, 4);
+  eq('tổng chưa phân loại = 1.300,00 (gồm Fee)', m.owner.unclassified.total, 1300.00);
+
+  /* Sau khi điền category */
+  const f = metrics({ sheets: { 'Payouts': PAYOUTS_FIXED } });
+  eq('đã lấy ra', f.owner.drawn, 1300.00);
+  eq('còn được lấy → ÂM', f.owner.remaining, -1007.91);
+  eq('hết dòng chưa phân loại', f.owner.unclassified.n, 0);
+  eq('OWNER_DRAW gộp đúng', f.owner.byCategory.filter(x => x.name === 'OWNER_DRAW')[0].amount, 124.00);
+  eq('EXPENSE gộp đúng (466+2+708)', f.owner.byCategory.filter(x => x.name === 'EXPENSE')[0].amount, 1176.00);
+  eq('theo người nhận: ASON', f.owner.byPayee[0].name, 'ASON');
+  eq('ASON 1.176,00', f.owner.byPayee[0].amount, 1176.00);
+
+  /* DRAFT không bao giờ tính là đã lấy */
+  const d2 = metrics({ sheets: { 'Payouts': [
+    P_('X1', 'TRUNG', '', 500, 'DRAFT', 'OWNER_DRAW')
+  ] } });
+  eq('DRAFT không tính vào đã lấy', d2.owner.drawn, 0);
+  eq('DRAFT vẫn vào danh sách chờ', d2.drafts.length, 1);
+}
+
+console.log('\n7 · cảnh báo phân loại và rút quá');
+{
+  const m = metrics();
+  const cat = m.alerts.filter(a => a.indexOf('chưa phân loại') !== -1);
+  eq('kêu payout chưa phân loại', cat.length, 1);
+  ok('nêu 3 dòng trống', cat[0].indexOf('3 dòng để trống') !== -1, cat[0]);
+  ok('nêu tên giá trị lạ MANUAL_PAYOUT', cat[0].indexOf('MANUAL_PAYOUT') !== -1, cat[0]);
+  ok('nêu tổng 1.300,00', cat[0].indexOf('1.300,00') !== -1, cat[0]);
+
+  /* Chưa phân loại thì chưa kết luận rút quá */
+  eq('chưa kêu rút quá khi còn dòng trống',
+     m.alerts.filter(a => a.indexOf('Đã lấy ra') === 0).length, 0);
+
+  const f = metrics({ sheets: { 'Payouts': PAYOUTS_FIXED } });
+  eq('phân loại xong thì hết kêu thiếu',
+     f.alerts.filter(a => a.indexOf('chưa phân loại') !== -1).length, 0);
+  const over = f.alerts.filter(a => a.indexOf('Đã lấy ra') === 0);
+  eq('kêu rút quá', over.length, 1);
+  ok('nêu vượt 1.007,91', over[0].indexOf('1.007,91') !== -1, over[0]);
+
+  /* Lấy ít hơn kiếm được thì im */
+  const okCase = metrics({ sheets: { 'Payouts': [
+    P_('X1', 'TRUNG', '', 50, 'PAID', 'OWNER_DRAW')
+  ] } });
+  eq('lấy ít hơn kiếm được → im', okCase.alerts.filter(a => a.indexOf('Đã lấy ra') === 0).length, 0);
+  eq('còn được lấy', okCase.owner.remaining, 242.09);
+}
+
+console.log('\n8 · trang HTML với sổ chủ');
+{
+  const raw = fs.readFileSync(path.join(REPO, 'DashboardDialog.html'), 'utf8');
+  const script = raw.substring(raw.lastIndexOf('<script>') + 8, raw.lastIndexOf('</script>'));
+  const render = (m) => {
+    let out = '';
+    const doc = { getElementById: () => ({ set innerHTML(v) { out = v; } }) };
+    const s2 = { document: doc, Math, JSON, Object, Array, String, Number, isNaN, console };
+    vm.createContext(s2);
+    vm.runInContext(script.replace('<?!= payload ?>', JSON.stringify(m)), s2);
+    return out;
+  };
+
+  const html = render(metrics({ sheets: { 'Payouts': PAYOUTS_FIXED } }));
+  ok('có khối Sổ chủ', html.indexOf('Sổ chủ') !== -1);
+  ok('hiện số âm', html.indexOf('-1.007,91') !== -1);
+  ok('nói rõ đang lấy vào tiền khách', html.indexOf('tiền của khách') !== -1);
+  ok('có breakdown OWNER_DRAW', html.indexOf('OWNER_DRAW') !== -1);
+  ok('không NaN', html.indexOf('NaN') === -1);
+
+  const html2 = render(metrics());
+  ok('còn dòng chưa phân loại thì nói ra', html2.indexOf('chưa phân loại') !== -1);
+
+  const empty = metrics({ sheets: {
+    'Customers': [], 'Settlements': [], 'Payouts': [], 'Paypal': [], 'Transaction': []
+  } });
+  const html3 = render(empty);
+  ok('sổ rỗng vẫn dựng được', html3.length > 500);
+  ok('sổ rỗng không NaN', html3.indexOf('NaN') === -1);
 }
 
 console.log('\n' + (fail ? '✗ ' + fail + ' FAIL' : '✓ tất cả') + ' · ' + pass + ' pass\n');

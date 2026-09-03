@@ -94,12 +94,19 @@ function dashCollectMetrics_(ss) {
     unassigned: [], unassignedTotal: 0,
     paypal: [], treasury: [], health: { types: [], reconcile: [] },
     usdt: null, holdBalance: 0, feeEarned: 0, owed: 0,
+    owner: {
+      earned: 0, drawn: 0, remaining: 0,
+      byCategory: [], byPayee: [],
+      unclassified: { n: 0, total: 0 }
+    },
     history: [], alerts: []
   };
 
   dashReadCustomers_(ss, m);
+  /* Settlements phải đứng trước Payouts: sổ chủ dùng feeEarned nó tính ra. */
   dashReadSettlements_(ss, m);
   dashReadPayouts_(ss, m);
+  dashFinishOwnerAccount_(m);
   dashReadAccounts_(ss, m);
   dashReadTreasury_(ss, m);
   dashReadUnassigned_(ss, m);
@@ -113,7 +120,8 @@ function dashCollectMetrics_(ss) {
   [
     trigCollectStuckMoney_, trigCollectOverdueWithdrawals_,
     trigCollectForeignCurrency_, trigCollectUnknownEvents_,
-    trigCollectDraftOverUsdt_, trigCollectStaleGrey_
+    trigCollectDraftOverUsdt_, trigCollectPayoutCategory_,
+    trigCollectOwnerOverdraw_, trigCollectStaleGrey_
   ].forEach(function (collect) { collect(ss, m.alerts); });
 
   if (m.unassignedTotal > CUST_CFG.EPSILON) {
@@ -240,6 +248,14 @@ function dashReadSettlements_(ss, m) {
 }
 
 
+/*
+ * Một lượt đọc Payouts phục vụ hai việc: danh sách DRAFT chờ trả, và sổ chủ.
+ *
+ * Sổ chủ cộng bằng Amount + Fee chứ không phải Amount, vì đó mới là số thật
+ * rời khỏi ví — giống hệt cách flowUpdateUsdtSummary_ trừ bằng Gross.
+ *
+ * DRAFT không tính vào "đã lấy ra": nó là ý định, chưa phải tiền đi.
+ */
 function dashReadPayouts_(ss, m) {
   const sh = ss.getSheetByName(CUST_CFG.PAYOUTS_SHEET);
   if (!sh) return;
@@ -247,21 +263,71 @@ function dashReadPayouts_(ss, m) {
   const h = custHeaderMap_(sh);
   if (!h['Status'] || !h['Amount']) return;
 
+  const known = flowPayoutCategories_();
+  const byCategory = {};
+  const byPayee = {};
+
   custReadRowsObjects_(sh, h).forEach(function (p) {
-    if (custUpper_(p['Status']) !== 'DRAFT') return;
+    const status = custUpper_(p['Status']);
     const amount = custNum_(p['Amount']);
-    m.draftTotal += amount;
-    m.drafts.push({
-      key: custStr_(p['Payout Key']),
-      payee: custStr_(p['Payee']),
-      ref: custStr_(p['Reference']),
-      amount: amount
-    });
+
+    if (status === 'DRAFT') {
+      m.draftTotal += amount;
+      m.drafts.push({
+        key: custStr_(p['Payout Key']),
+        payee: custStr_(p['Payee']),
+        ref: custStr_(p['Reference']),
+        amount: amount
+      });
+      return;
+    }
+
+    if (status !== 'PAID') return;
+
+    const left = custRound2_(amount + custNum_(p['Fee']));
+    const category = custUpper_(p['Category']);
+
+    if (!category || known.indexOf(category) === -1) {
+      m.owner.unclassified.n++;
+      m.owner.unclassified.total = custRound2_(m.owner.unclassified.total + left);
+      return;
+    }
+
+    if (!flowPayoutIsOwnerCost_(category)) return;
+
+    m.owner.drawn = custRound2_(m.owner.drawn + left);
+    byCategory[category] = custRound2_((byCategory[category] || 0) + left);
+
+    const payee = custStr_(p['Payee']) || '(không ghi)';
+    byPayee[payee] = custRound2_((byPayee[payee] || 0) + left);
   });
 
   m.draftTotal = custRound2_(m.draftTotal);
   m.drafts.sort(function (a, b) { return b.amount - a.amount; });
   m.drafts = m.drafts.slice(0, DASH_CFG.MAX_DRAFTS);
+
+  const pack = function (obj) {
+    return Object.keys(obj)
+      .map(function (k) { return { name: k, amount: obj[k] }; })
+      .sort(function (a, b) { return b.amount - a.amount; });
+  };
+
+  m.owner.byCategory = pack(byCategory);
+  m.owner.byPayee = pack(byPayee);
+}
+
+
+/*
+ * Sổ chủ: phí dịch vụ kiếm được, trừ đi mọi khoản đã lấy ra khỏi ví mà
+ * không phải trả khách. Người dùng đã chốt gộp chung chi phí vận hành với
+ * tiền tự rút — nên chỉ có MỘT con số "còn được lấy".
+ *
+ * Phần kiếm được lấy từ chuỗi hoá đơn đã tính sẵn ở dashReadSettlements_,
+ * nên không đọc lại Settlements lần nữa.
+ */
+function dashFinishOwnerAccount_(m) {
+  m.owner.earned = m.feeEarned;
+  m.owner.remaining = custRound2_(m.owner.earned - m.owner.drawn);
 }
 
 
@@ -396,7 +462,7 @@ function dashReadHistory_(ss, m) {
   const last = sh.getLastRow();
   if (last < 3) return;
 
-  sh.getRange(3, 1, last - 2, 7).getValues().forEach(function (r) {
+  sh.getRange(3, 1, last - 2, 9).getValues().forEach(function (r) {
     const d = dashDateKey_(r[0]);
     if (!d) return;
     m.history.push({
@@ -432,7 +498,8 @@ function dashUsdtRemaining_(ss) {
  */
 function dashUpsertHistory_(ss, m) {
   const headers = ['Date', 'Pending in PayPal', 'Chưa xuất HĐ', 'Đã xuất HĐ',
-    'USDT còn lại', 'Còn nợ khách', 'Hold Balance'];
+    'USDT còn lại', 'Còn nợ khách', 'Hold Balance',
+    'Phí kiếm được', 'Đã lấy ra'];
 
   let sh = ss.getSheetByName(DASH_CFG.HISTORY_SHEET);
   if (!sh) {
@@ -446,7 +513,8 @@ function dashUpsertHistory_(ss, m) {
 
   const today = Utilities.formatDate(new Date(), DASH_CFG.TIMEZONE, 'yyyy-MM-dd');
   const record = [today, m.buckets.pending, m.buckets.outstanding,
-    m.buckets.invoiced, m.usdt === null ? '' : m.usdt, m.owed, m.holdBalance];
+    m.buckets.invoiced, m.usdt === null ? '' : m.usdt, m.owed, m.holdBalance,
+    m.owner.earned, m.owner.drawn];
 
   const last = sh.getLastRow();
   let target = 0;

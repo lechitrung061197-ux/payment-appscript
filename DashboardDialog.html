@@ -159,7 +159,10 @@
     ['c-cost', 'Còn nợ khách', DATA.owed, DATA.drafts.length + ' lệnh DRAFT'],
     ['c-money', 'USDT còn lại', DATA.usdt, 'ngân quỹ ghi nhận'],
     ['c-warn', 'Phí dịch vụ đã thu', DATA.feeEarned,
-      (DATA.chain ? DATA.chain.invoiceCount : 0) + ' hoá đơn · phần của bạn']
+      (DATA.chain ? DATA.chain.invoiceCount : 0) + ' hoá đơn · phần của bạn'],
+    [DATA.owner.remaining < 0 ? 'c-cost' : 'c-money', 'Còn được lấy',
+      DATA.owner.remaining,
+      DATA.owner.remaining < 0 ? 'đã lấy quá phần của mình' : 'chưa lấy ra']
   ];
   P('<div class="kpis">');
   kpi.forEach(function (k) {
@@ -219,6 +222,55 @@
     P('<div class="tail due"><span>còn nợ</span><div class="am n">' + money(c.outstandingPayable) + '</div></div>');
     P('</div></div>');
   }
+
+  /* ---------- sổ chủ ---------- */
+  var o = DATA.owner;
+  P('<div class="panel"><h2>Sổ chủ — phần của bạn</h2>' +
+    '<p class="hint">Phí dịch vụ thu từ khách không phải một giao dịch, nó là khoản TRỪ trên hoá đơn ' +
+    'nên ở lại trong ví. Bảng này suy ra từ hoá đơn và Payouts, không nhập tay chỗ nào.</p>' +
+    '<div class="wf">' +
+    '<div class="r sum"><div class="lb">Phí dịch vụ kiếm được</div>' +
+    '<div class="bar"><i style="width:100%"></i></div>' +
+    '<div class="am n">' + money(o.earned) + '</div></div>' +
+    '<div class="r cut"><div class="lb">Đã lấy ra khỏi ví</div>' +
+    '<div class="bar"><i style="width:' + w(o.drawn, Math.max(o.earned, o.drawn)).toFixed(1) + '%"></i></div>' +
+    '<div class="am n">−' + money(o.drawn) + '</div></div>' +
+    '<div class="r sum ' + (o.remaining < 0 ? 'own' : 'fin') + '">' +
+    '<div class="lb">' + (o.remaining < 0 ? 'Đã lấy quá' : 'Còn được lấy') + '</div>' +
+    '<div class="bar"><i style="width:' + w(Math.abs(o.remaining), Math.max(o.earned, o.drawn)).toFixed(1) + '%"></i></div>' +
+    '<div class="am n">' + money(o.remaining) + '</div></div>' +
+    '</div>');
+
+  if (o.remaining < 0) {
+    P('<p class="hint" style="margin:14px 0 0;color:var(--cost)">' +
+      'Phần vượt đang lấy vào tiền của khách. Đây là lý do trực tiếp khiến ví ' +
+      'không đủ trả nợ.</p>');
+  }
+
+  if (o.unclassified.n) {
+    P('<p class="hint" style="margin:12px 0 0">' + o.unclassified.n +
+      ' lệnh đã chi (' + money(o.unclassified.total) + ') chưa phân loại nên ' +
+      '<b>không</b> được tính vào "đã lấy ra" — điền cột Category để con số trên đúng.</p>');
+  }
+
+  if (o.byCategory.length || o.byPayee.length) {
+    P('<div class="grid2" style="margin-top:16px">');
+    [['Theo loại', o.byCategory], ['Theo người nhận', o.byPayee]].forEach(function (blk) {
+      P('<div><div class="hint" style="margin-bottom:8px">' + blk[0] + '</div>');
+      if (blk[1].length) {
+        P('<div class="scroll"><table><tbody>');
+        blk[1].forEach(function (x) {
+          P('<tr><td>' + esc(x.name) + '</td><td class="r">' + money(x.amount) + '</td></tr>');
+        });
+        P('</tbody></table></div>');
+      } else {
+        P('<div class="soon" style="padding:14px">Chưa có</div>');
+      }
+      P('</div>');
+    });
+    P('</div>');
+  }
+  P('</div>');
 
   /* ---------- ba rổ ---------- */
   P('<div class="panel"><h2>Tiền khách đang ở đâu</h2>' +

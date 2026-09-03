@@ -269,6 +269,8 @@ function trigBuildReport_(ss) {
   trigCollectForeignCurrency_(ss, issues);
   trigCollectUnknownEvents_(ss, issues);
   trigCollectDraftOverUsdt_(ss, issues);
+  trigCollectPayoutCategory_(ss, issues);
+  trigCollectOwnerOverdraw_(ss, issues);
   trigCollectStaleGrey_(ss, issues);
 
   lines.push('');
@@ -381,6 +383,85 @@ function trigCollectDraftOverUsdt_(ss, issues) {
 
   issues.push('Payout DRAFT ' + trigMoney_(draft) + ' > USDT còn ' +
     trigMoney_(usdt) + ' · thiếu ' + trigMoney_(draft - usdt));
+}
+
+
+/*
+ * Payout đã chi mà không phân loại. Category không tham gia phép tính số dư
+ * ví, nên dòng thiếu nó vẫn trừ tiền bình thường — chỉ là không ai biết tiền
+ * đó đi vào việc gì, và sổ chủ cố ý KHÔNG đoán bừa mà để riêng ra.
+ *
+ * Chỉ cảnh báo, không chặn: chặn nghĩa là transaction không được sinh, và số
+ * dư ví đổi ngay trên tiền thật chỉ vì một ô bỏ trống.
+ */
+function trigCollectPayoutCategory_(ss, issues) {
+  const sheet = ss.getSheetByName(CUST_CFG.PAYOUTS_SHEET);
+  if (!sheet) return;
+
+  const h = custHeaderMap_(sheet);
+  if (!h['Status'] || !h['Amount'] || !h['Category']) return;
+
+  const known = flowPayoutCategories_();
+  let blank = 0, odd = 0, total = 0;
+  const oddNames = {};
+
+  custReadRowsObjects_(sheet, h).forEach(function (p) {
+    if (custUpper_(p['Status']) !== 'PAID') return;
+
+    const category = custUpper_(p['Category']);
+    if (category && known.indexOf(category) !== -1) return;
+
+    if (category) { odd++; oddNames[category] = true; } else { blank++; }
+    total += custNum_(p['Amount']) + custNum_(p['Fee']);
+  });
+
+  if (!blank && !odd) return;
+
+  const parts = [];
+  if (blank) parts.push(blank + ' dòng để trống');
+  if (odd) parts.push(odd + ' dòng lạ (' + Object.keys(oddNames).join(', ') + ')');
+
+  issues.push('Payout đã chi chưa phân loại · ' + parts.join(' · ') +
+    ' · ' + trigMoney_(total));
+}
+
+
+/*
+ * Đã lấy ra khỏi ví nhiều hơn phần phí dịch vụ kiếm được.
+ *
+ * Đây thường là lời giải thích trực tiếp cho việc ví không đủ trả nợ khách:
+ * tiền của khách đã bị tiêu sang việc khác. Không phải lỗi kỹ thuật, nhưng
+ * là thứ phải biết trước khi hứa trả ai đồng nào.
+ */
+function trigCollectOwnerOverdraw_(ss, issues) {
+  const settlements = ss.getSheetByName(CUST_CFG.SETTLEMENTS_SHEET);
+  const payouts = ss.getSheetByName(CUST_CFG.PAYOUTS_SHEET);
+  if (!settlements || !payouts) return;
+
+  const sh = custHeaderMap_(settlements);
+  if (!sh['Payout Fee Amount'] || !sh['Status']) return;
+
+  let earned = 0;
+  custReadRowsObjects_(settlements, sh).forEach(function (s) {
+    if (!custIsEffectiveSettlementStatus_(s['Status'])) return;
+    earned += custNum_(s['Payout Fee Amount']);
+  });
+
+  const ph = custHeaderMap_(payouts);
+  if (!ph['Status'] || !ph['Amount'] || !ph['Category']) return;
+
+  let drawn = 0;
+  custReadRowsObjects_(payouts, ph).forEach(function (p) {
+    if (custUpper_(p['Status']) !== 'PAID') return;
+    if (!flowPayoutIsOwnerCost_(p['Category'])) return;
+    drawn += custNum_(p['Amount']) + custNum_(p['Fee']);
+  });
+
+  const over = custRound2_(drawn - earned);
+  if (over <= CUST_CFG.EPSILON) return;
+
+  issues.push('Đã lấy ra ' + trigMoney_(drawn) + ' nhưng phí kiếm được mới ' +
+    trigMoney_(earned) + ' · vượt ' + trigMoney_(over));
 }
 
 

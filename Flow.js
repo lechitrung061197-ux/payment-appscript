@@ -1509,6 +1509,62 @@ function refreshAllPayoutAccountDropdowns() {
 
 
 /************************************************************
+ * PAYOUTS — PHÂN LOẠI
+ *
+ * Khai bằng HÀM chứ không phải const top-level: Apps Script gộp mọi file
+ * lại và không đảm bảo thứ tự nạp, nên một const ở file này có thể chưa
+ * khởi tạo khi file khác đọc tới. Khai báo hàm thì luôn được hoist.
+ *
+ * Category KHÔNG tham gia phép tính số dư ví — mọi payout PAID đều trừ ví
+ * như nhau. Nó chỉ phục vụ hai việc: guard CUSTOMER_PAYOUT phải có
+ * Settlement Key, và sổ chủ đọc thêm ở lớp trên.
+ ************************************************************/
+
+/*
+ * CUSTOMER_PAYOUT do engine hoá đơn sinh, người dùng không tự gõ — nên nó
+ * có trong danh sách này nhưng bị loại khỏi dropdown và khỏi AI.
+ */
+function flowPayoutCategories_() {
+  return [
+    'CUSTOMER_PAYOUT',
+    'OWNER_DRAW',
+    'EXPENSE',
+    'REFUND',
+    'TRANSFER',
+    'ADJUSTMENT',
+    'OTHER'
+  ];
+}
+
+
+/* Những giá trị người dùng và AI được phép đặt. */
+function flowPayoutManualCategories_() {
+  return flowPayoutCategories_().filter(
+    function (c) { return c !== 'CUSTOMER_PAYOUT'; }
+  );
+}
+
+
+/*
+ * Khoản nào tiêu vào phần của chủ.
+ *
+ * Rỗng VÀ giá trị lạ đều trả về false một cách CỐ Ý: chưa phân loại được thì
+ * chưa kết luận được, và đoán bừa sẽ thổi phồng "đã lấy ra". Cả hai trường
+ * hợp được cảnh báo riêng thay vì bị gộp vào đây.
+ *
+ * Quy tắc này phải nằm ở ĐÚNG MỘT chỗ. Trước đó sổ chủ loại giá trị lạ ra
+ * còn cảnh báo lại cộng vào, nên hai nơi báo hai số khác nhau.
+ */
+function flowPayoutIsOwnerCost_(category) {
+  const c = flowString_(category).toUpperCase();
+  if (!c || c === 'CUSTOMER_PAYOUT') {
+    return false;
+  }
+  return flowPayoutCategories_().indexOf(c) !== -1;
+}
+
+
+/************************************************************
  * PAYOUTS — ROW ACTUALLY HAS A PAYOUT
  *
  * Important:
