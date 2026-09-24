@@ -21,6 +21,7 @@ flowchart TD
     CV -.->|"KHÔNG có mail"| S3["ước lượng"]
     W -.->|"mail Grey"| S4["Transaction · GREY_WITHDRAWAL → USDT_RECEIVED"]
     C -.->|"bạn tự ghi"| S5["sheet Payouts"]
+    
 ```
 
 Đường liền là tiền đi. Đường đứt là **hệ thống nhìn thấy bằng cách nào**.

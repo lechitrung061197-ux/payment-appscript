@@ -709,7 +709,29 @@ function custBuildRefundOwedState_(ss, ledgerRows){
     const paypalFee=custNum_(custLedgerField_(l,'paypalFee','PayPal Fee'));
     /* KHÔNG kẹp về 0 ở đây — phần âm chính là thứ đang bị đánh rơi. */
     const trueNet=custRound2_(gross-paypalFee-currentRefund);
-    const invoicedNet=custRound2_(sales.reduce((sum,it)=>sum+custNum_(it['PayPal Net Amount']),0));
+    /*
+     * MỘT ảnh chụp, KHÔNG cộng dồn.
+     *
+     * Dòng SALE ghi `PayPal Net Amount` = net ĐẦY ĐỦ của sale, không phải
+     * phần được tính trong kỳ đó — phần ấy nằm ở cột `Amount Included`. Nên
+     * một sale bị chẻ qua hai hoá đơn sinh ra HAI dòng SALE cùng mang trọn
+     * net, và cộng lại là gấp đôi:
+     *
+     *     totalLate = 2×net − net = net
+     *
+     * tức dựng ra một "late refund" bằng cả sale dù Refund Amount = 0. Đã
+     * xảy ra thật với ba sale của HUI, trừ oan 174,43.
+     *
+     * Ảnh chụp ĐẦU TIÊN mới là thứ cần so: nó là net tại lúc lên hoá đơn lần
+     * đầu, cùng gốc với baselineRefund ở trên (`sales` đã sort theo thời gian
+     * nên `first` là dòng sớm nhất). Refund phát sinh sau đó kéo trueNet
+     * xuống, và hiệu số chính là khoản phải thu lại.
+     *
+     * Không dùng `Amount Included` ở đây dù custReportConservation_ dùng:
+     * nó đã trừ phí nhận của provider, còn trueNet thì chưa — hai gốc khác
+     * nhau sẽ làm hụt việc phát hiện refund thật đúng bằng phần phí.
+     */
+    const invoicedNet=first?custRound2_(custNum_(first['PayPal Net Amount'])):0;
 
     const totalLate=custRound2_(Math.max(0,invoicedNet-trueNet));
 
@@ -3003,7 +3025,14 @@ function validateCustomerSystem(){
   txs.filter(t=>t.provider==='PAYPAL'&&t.type==='PAYPAL_WITHDRAWAL'&&t.direction==='OUT'&&t.reconcileStatus!=='RETURNED').forEach(w=>{
     const allocated=custRound2_(sums[w.transactionKey]||0),gross=Math.abs(custRound2_(w.grossAmount));if(allocated-gross>0.02)issues.push('OVER ALLOCATED '+w.transactionKey+' '+allocated+' > '+gross);
   });
-  Object.keys(late).forEach(k=>{if(late[k].overConsumed>0.02)issues.push('LATE REFUND OVER-CONSUMED '+k+' '+late[k].overConsumed);});
+  /*
+   * Đã thu về nhiều hơn số đáng thu. Nêu cả khách và mã giao dịch vì đây là
+   * khoản phải trả lại tay — hoá đơn cũ bất biến nên code không tự hoàn được.
+   */
+  Object.keys(late).forEach(k=>{if(late[k].overConsumed>0.02)issues.push(
+    'LATE REFUND OVER-CONSUMED · '+(late[k].customerKey||'?')+' · '+
+    (late[k].paypalTransactionId||k)+' · đã trừ thừa '+late[k].overConsumed.toFixed(2)+
+    ' (hoá đơn cũ bất biến, phải hoàn tay)');});
 
   custReportReceivingMatchWarnings_(allocs,txs,issues);
   custReportOrphanPaidPayouts_(ss,issues);
