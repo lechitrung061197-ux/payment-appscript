@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ink:#101a26; --ink-2:#3d4f66; --muted:#6d7d92; --faint:#9aa8b8;
+    --paper:#eef1f5; --card:#fff; --line:#dfe5ec; --line-soft:#eaeff4;
+    --money:#0a6459; --money-2:#3f9a8c; --money-3:#9ecabf;
+    --cost:#9c4530; --cost-2:#c8836e; --warn:#a8791f;
+    --f-body:"Be Vietnam Pro",system-ui,sans-serif;
+    --f-num:"IBM Plex Mono",ui-monospace,monospace;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--f-body); font-size:14px; line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { padding:18px 20px 40px; display:flex; flex-direction:column; gap:14px; }
+  .n { font-family:var(--f-num); font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+
+  .head { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+  .head h1 { margin:0; font-size:18px; font-weight:700; letter-spacing:-.02em; }
+  .head .ts { font-size:12px; color:var(--muted); }
+  .head .ts b { color:var(--ink-2); font-weight:500; }
+
+  .alerts { display:flex; flex-direction:column; gap:1px; background:var(--line-soft); border-radius:11px; overflow:hidden; }
+  .alert { display:flex; gap:10px; background:var(--card); padding:10px 14px; font-size:13px; border-left:3px solid var(--warn); }
+  .alert.hot { border-left-color:var(--cost); }
+  .alert i { font-style:normal; font-size:11px; line-height:1.7; flex:none; color:var(--warn); }
+  .alert.hot i { color:var(--cost); }
+
+  .kpis { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(178px,1fr)); }
+  .kpi { background:var(--card); border:1px solid var(--line); border-radius:11px; padding:12px 14px 13px; }
+  .kpi .lab { font-size:9.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); font-weight:600; }
+  .kpi .val { font-family:var(--f-num); font-variant-numeric:tabular-nums; font-size:22px; font-weight:600; letter-spacing:-.03em; line-height:1.25; }
+  .kpi .sub { font-size:11px; color:var(--faint); }
+  .kpi.c-cost .val{color:var(--cost);} .kpi.c-money .val{color:var(--money);} .kpi.c-warn .val{color:var(--warn);}
+
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:11px; padding:16px 18px 18px; }
+  .panel > h2 { margin:0 0 2px; font-size:13px; font-weight:600; letter-spacing:-.01em; }
+  .panel > .hint { margin:0 0 14px; font-size:11.5px; color:var(--muted); }
+  .grid2 { display:grid; gap:11px; grid-template-columns:1fr; }
+  @media (min-width:900px){ .grid2{ grid-template-columns:1fr 1fr;} }
+  .grid-w { display:grid; gap:11px; grid-template-columns:1fr; }
+  @media (min-width:980px){ .grid-w{ grid-template-columns:1.35fr 1fr;} }
+
+  .wf .r { display:grid; grid-template-columns:1fr 118px 86px; gap:12px; align-items:center; padding:4px 0; }
+  .wf .r .lb { font-size:12.5px; }
+  .wf .r .bar { height:9px; border-radius:3px; background:var(--line-soft); overflow:hidden; }
+  .wf .r .bar i { display:block; height:100%; border-radius:3px; min-width:2px; }
+  .wf .r .am { font-family:var(--f-num); font-variant-numeric:tabular-nums; font-size:12.5px; text-align:right; }
+  .wf .cut .lb { padding-left:15px; color:var(--ink-2); font-size:12px; }
+  .wf .cut .lb em { font-style:normal; color:var(--faint); font-size:10.5px; margin-left:6px; }
+  .wf .cut .am { color:var(--cost); }
+  .wf .cut .bar i { background:var(--cost-2); }
+  .wf .sum { border-top:1px solid var(--line-soft); margin-top:4px; padding-top:8px; }
+  .wf .sum .lb { font-weight:600; font-size:12.5px; }
+  .wf .sum .bar i { background:var(--money-3); }
+  .wf .sum .am { font-weight:600; }
+  .wf .fin .lb, .wf .fin .am { color:var(--money); font-weight:700; }
+  .wf .fin .bar i { background:var(--money); }
+  .wf .own .lb, .wf .own .am { color:var(--warn); }
+  .wf .own .bar i { background:var(--warn); }
+  .wf .tail { display:grid; grid-template-columns:1fr 86px; gap:12px; padding:2px 0 2px 15px; font-size:12px; color:var(--ink-2); }
+  .wf .tail .am { font-family:var(--f-num); font-variant-numeric:tabular-nums; text-align:right; }
+  .wf .tail.due span, .wf .tail.due .am { color:var(--cost); font-weight:600; }
+
+  .seg { display:flex; height:26px; border-radius:6px; overflow:hidden; background:var(--line-soft); }
+  .seg span { height:100%; }
+  .s1{background:var(--cost);} .s2{background:var(--money-2);} .s3{background:var(--money);}
+  .keys { display:flex; flex-wrap:wrap; gap:6px 22px; margin-top:12px; }
+  .key { display:flex; align-items:baseline; gap:8px; font-size:12px; }
+  .key .dot { width:9px; height:9px; border-radius:2px; flex:none; transform:translateY(-1px); }
+  .key .kn { color:var(--muted); }
+  .key .kv { font-family:var(--f-num); font-variant-numeric:tabular-nums; font-weight:600; }
+  .key .kp { color:var(--faint); font-size:11px; }
+
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th { font-size:9.5px; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); font-weight:600; text-align:left; padding:0 11px 6px 0; white-space:nowrap; }
+  td { padding:8px 11px 8px 0; border-top:1px solid var(--line-soft); vertical-align:middle; }
+  th.r, td.r { text-align:right; padding-right:0; }
+  td.r { font-family:var(--f-num); font-variant-numeric:tabular-nums; }
+  tbody tr:first-child td { border-top:1px solid var(--line); }
+  td .who { font-weight:600; }
+  td .who em { font-style:normal; display:block; font-size:10.5px; color:var(--faint); font-weight:400; }
+  .cb { height:15px; display:flex; border-radius:3px; overflow:hidden; background:var(--line-soft); min-width:50px; }
+  .cb span { height:100%; }
+
+  .chip { font-size:9.5px; font-weight:600; letter-spacing:.04em; padding:2px 7px; border-radius:99px; white-space:nowrap; display:inline-block; }
+  .chip.ok{background:rgba(10,100,89,.12); color:var(--money);}
+  .chip.hold{background:rgba(156,69,48,.13); color:var(--cost);}
+  .chip.idle{background:var(--line-soft); color:var(--muted);}
+  .chip.draft{background:rgba(168,121,31,.15); color:var(--warn);}
+
+  .soon { border:1px dashed var(--line); border-radius:10px; padding:20px 16px; text-align:center; color:var(--muted); font-size:12px; }
+  .soon b { display:block; color:var(--ink-2); font-size:12.5px; font-weight:600; margin-bottom:3px; }
+  .foot { font-size:11px; color:var(--faint); text-align:center; }
+  svg.trend { width:100%; height:190px; display:block; }
+</style>
+</head>
+<body>
+<div class="wrap" id="root"></div>
+
+<script>
+  var DATA = <?!= payload ?>;
+
+  /* ---------- định dạng ---------- */
+  function money(v) {
+    if (v === null || v === undefined || isNaN(v)) return '—';
+    var p = Math.abs(v).toFixed(2).split('.');
+    return (v < 0 ? '-' : '') +
+      p[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ',' + p[1];
+  }
+  function pct(part, whole) {
+    if (!whole) return '0,0%';
+    return (part / whole * 100).toFixed(1).replace('.', ',') + '%';
+  }
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+  function w(part, whole) {
+    if (!whole || whole <= 0) return 0;
+    return Math.max(0, Math.min(100, part / whole * 100));
+  }
+
+  var H = [];
+  function P(s) { H.push(s); }
+
+  /* ---------- đầu trang ---------- */
+  P('<div class="head"><h1>Payment All</h1>' +
+    '<div class="ts">Cập nhật <b>' + esc(DATA.at) + '</b> &nbsp;·&nbsp; USD, làm tròn 2 số</div></div>');
+
+  /* ---------- cảnh báo ---------- */
+  if (DATA.alerts && DATA.alerts.length) {
+    P('<div class="alerts">');
+    DATA.alerts.slice(0, 8).forEach(function (a, i) {
+      P('<div class="alert' + (i === 0 ? ' hot' : '') + '"><i>▲</i><div>' + esc(a) + '</div></div>');
+    });
+    P('</div>');
+  } else {
+    P('<div class="alerts"><div class="alert" style="border-left-color:var(--money)">' +
+      '<i style="color:var(--money)">✓</i><div>Không có gì bất thường</div></div></div>');
+  }
+
+  /* ---------- ô số lớn ---------- */
+  var b = DATA.buckets;
+  var kpi = [
+    ['c-cost', 'Kẹt ở PayPal', b.pending, 'chưa rút ra được'],
+    ['c-money', 'Chưa xuất hoá đơn', b.outstanding, 'đã về, đủ điều kiện'],
+    ['c-cost', 'Còn nợ khách', DATA.owed, DATA.drafts.length + ' lệnh DRAFT'],
+    ['c-money', 'USDT còn lại', DATA.usdt, 'ngân quỹ ghi nhận'],
+    ['c-warn', 'Phí dịch vụ đã thu', DATA.feeEarned,
+      (DATA.chain ? DATA.chain.invoiceCount : 0) + ' hoá đơn · phần của bạn'],
+    [DATA.owner.remaining < 0 ? 'c-cost' : 'c-money', 'Còn được lấy',
+      DATA.owner.remaining,
+      DATA.owner.remaining < 0 ? 'đã lấy quá phần của mình' : 'chưa lấy ra']
+  ];
+  P('<div class="kpis">');
+  kpi.forEach(function (k) {
+    P('<div class="kpi ' + k[0] + '"><div class="lab">' + esc(k[1]) + '</div>' +
+      '<div class="val n">' + money(k[2]) + '</div>' +
+      '<div class="sub">' + esc(k[3]) + '</div></div>');
+  });
+  P('</div>');
+
+  /* ---------- chuỗi tiền ---------- */
+  var c = DATA.chain;
+  if (c && c.gross > 0) {
+    /* Thanh của các khoản trừ so với NHAU, để thấy khoản nào ăn nhiều nhất.
+       Thanh của các mốc thì so với tiền hàng. */
+    var cuts = [
+      ['Phí PayPal', 'đo được', c.paypalFees],
+      ['Phí Grey nhận', 'đo được', c.receivingFees],
+      ['Hoàn trả trong kỳ', '', c.refundInPeriod]
+    ];
+    var cuts2 = [
+      ['Đổi USD sang USDT', 'ước lượng', c.conversion],
+      ['Rút USDT về ví', 'ước lượng', c.transfer],
+      ['Hoàn trả kết chuyển', 'từ kỳ trước', c.refundCarry]
+    ];
+    var biggest = Math.max(c.paypalFees, c.receivingFees, c.refundInPeriod,
+      c.conversion, c.transfer, c.refundCarry, c.payoutFee, 0.01);
+
+    var row = function (cls, label, note, amount, width, sign) {
+      return '<div class="r ' + cls + '"><div class="lb">' + esc(label) +
+        (note ? ' <em>' + esc(note) + '</em>' : '') + '</div>' +
+        '<div class="bar"><i style="width:' + width.toFixed(1) + '%"></i></div>' +
+        '<div class="am n">' + sign + money(amount) + '</div></div>';
+    };
+
+    P('<div class="panel"><h2>Chuỗi tiền — cộng dồn ' + c.invoiceCount +
+      ' hoá đơn đã phát hành</h2>' +
+      '<p class="hint">Mọi dòng khớp tuyệt đối. Thanh của các khoản trừ so với nhau ' +
+      'chứ không so với tổng — để thấy khoản nào ăn nhiều nhất. Hoàn trả vào chuỗi ở ' +
+      'hai điểm: trong kỳ thì trừ ngay, kết chuyển từ kỳ trước thì trừ sau chi phí đường ống.</p>' +
+      '<div class="wf">');
+
+    P(row('sum', 'Tiền hàng', '', c.gross, 100, ''));
+    cuts.forEach(function (x) {
+      if (Math.abs(x[2]) < 0.005) return;
+      P(row('cut', x[0], x[1], x[2], w(Math.abs(x[2]), biggest), '−'));
+    });
+    P(row('sum', 'Tiền khả dụng', '', c.available, w(c.available, c.gross), ''));
+    cuts2.forEach(function (x) {
+      if (Math.abs(x[2]) < 0.005) return;
+      P(row('cut', x[0], x[1], x[2], w(Math.abs(x[2]), biggest), '−'));
+    });
+    P(row('sum', 'Trước phí dịch vụ', '', c.netBefore, w(c.netBefore, c.gross), ''));
+    P(row('cut own', 'Phí dịch vụ', 'phần của bạn', c.payoutFee, w(c.payoutFee, biggest), '−'));
+    P(row('sum fin', 'Khách được nhận', '', c.amountDue, w(c.amountDue, c.gross), ''));
+
+    P('<div class="tail"><span>đã trả</span><div class="am n">' + money(c.amountPaid) + '</div></div>');
+    P('<div class="tail due"><span>còn nợ</span><div class="am n">' + money(c.outstandingPayable) + '</div></div>');
+    P('</div></div>');
+  }
+
+  /* ---------- sổ chủ ---------- */
+  var o = DATA.owner;
+  P('<div class="panel"><h2>Sổ chủ — phần của bạn</h2>' +
+    '<p class="hint">Phí dịch vụ thu từ khách không phải một giao dịch, nó là khoản TRỪ trên hoá đơn ' +
+    'nên ở lại trong ví. Bảng này suy ra từ hoá đơn và Payouts, không nhập tay chỗ nào.</p>' +
+    '<div class="wf">' +
+    '<div class="r sum"><div class="lb">Phí dịch vụ kiếm được</div>' +
+    '<div class="bar"><i style="width:100%"></i></div>' +
+    '<div class="am n">' + money(o.earned) + '</div></div>' +
+    '<div class="r cut"><div class="lb">Đã lấy ra khỏi ví</div>' +
+    '<div class="bar"><i style="width:' + w(o.drawn, Math.max(o.earned, o.drawn)).toFixed(1) + '%"></i></div>' +
+    '<div class="am n">−' + money(o.drawn) + '</div></div>' +
+    '<div class="r sum ' + (o.remaining < 0 ? 'own' : 'fin') + '">' +
+    '<div class="lb">' + (o.remaining < 0 ? 'Đã lấy quá' : 'Còn được lấy') + '</div>' +
+    '<div class="bar"><i style="width:' + w(Math.abs(o.remaining), Math.max(o.earned, o.drawn)).toFixed(1) + '%"></i></div>' +
+    '<div class="am n">' + money(o.remaining) + '</div></div>' +
+    '</div>');
+
+  if (o.remaining < 0) {
+    P('<p class="hint" style="margin:14px 0 0;color:var(--cost)">' +
+      'Phần vượt đang lấy vào tiền của khách. Đây là lý do trực tiếp khiến ví ' +
+      'không đủ trả nợ.</p>');
+  }
+
+  if (o.unclassified.n) {
+    P('<p class="hint" style="margin:12px 0 0">' + o.unclassified.n +
+      ' lệnh đã chi (' + money(o.unclassified.total) + ') chưa phân loại nên ' +
+      '<b>không</b> được tính vào "đã lấy ra" — điền cột Category để con số trên đúng.</p>');
+  }
+
+  if (o.byCategory.length || o.byPayee.length) {
+    P('<div class="grid2" style="margin-top:16px">');
+    [['Theo loại', o.byCategory], ['Theo người nhận', o.byPayee]].forEach(function (blk) {
+      P('<div><div class="hint" style="margin-bottom:8px">' + blk[0] + '</div>');
+      if (blk[1].length) {
+        P('<div class="scroll"><table><tbody>');
+        blk[1].forEach(function (x) {
+          P('<tr><td>' + esc(x.name) + '</td><td class="r">' + money(x.amount) + '</td></tr>');
+        });
+        P('</tbody></table></div>');
+      } else {
+        P('<div class="soon" style="padding:14px">Chưa có</div>');
+      }
+      P('</div>');
+    });
+    P('</div>');
+  }
+  P('</div>');
+
+  /* ---------- ba rổ ---------- */
+  P('<div class="panel"><h2>Tiền khách đang ở đâu</h2>' +
+    '<p class="hint">Ba rổ không chồng lấn, cộng lại bằng toàn bộ tiền khách hệ thống ghi nhận.</p>' +
+    '<div class="seg">' +
+    '<span class="s1" style="width:' + w(b.pending, b.total).toFixed(2) + '%"></span>' +
+    '<span class="s2" style="width:' + w(b.outstanding, b.total).toFixed(2) + '%"></span>' +
+    '<span class="s3" style="width:' + w(b.invoiced, b.total).toFixed(2) + '%"></span>' +
+    '</div><div class="keys">' +
+    '<div class="key"><i class="dot s1"></i><span class="kn">Kẹt ở PayPal</span><span class="kv n">' + money(b.pending) + '</span><span class="kp">' + pct(b.pending, b.total) + '</span></div>' +
+    '<div class="key"><i class="dot s2"></i><span class="kn">Đã về, chưa xuất HĐ</span><span class="kv n">' + money(b.outstanding) + '</span><span class="kp">' + pct(b.outstanding, b.total) + '</span></div>' +
+    '<div class="key"><i class="dot s3"></i><span class="kn">Đã xuất hoá đơn</span><span class="kv n">' + money(b.invoiced) + '</span><span class="kp">' + pct(b.invoiced, b.total) + '</span></div>' +
+    '<div class="key"><span class="kn">Tổng</span><span class="kv n">' + money(b.total) + '</span></div>' +
+    '</div></div>');
+
+  /* ---------- từng khách ---------- */
+  var maxTotal = 0;
+  DATA.customers.forEach(function (x) { if (x.total > maxTotal) maxTotal = x.total; });
+
+  if (DATA.customers.length) {
+    P('<div class="panel"><h2>Từng khách</h2>' +
+      '<p class="hint">Thanh dài ngắn thật so với nhau theo tổng tiền.</p><div class="scroll"><table>' +
+      '<thead><tr><th>Khách</th><th style="width:140px">Phân bố</th>' +
+      '<th class="r">Kẹt PayPal</th><th class="r">Chưa xuất HĐ</th><th class="r">Đã xuất HĐ</th>' +
+      '<th class="r">Tổng</th><th class="r">Phí</th><th class="r">HĐ</th><th class="r">Còn nợ</th><th>Gần nhất</th>' +
+      '</tr></thead><tbody>');
+    DATA.customers.forEach(function (x) {
+      P('<tr><td><div class="who">' + esc(x.name) +
+        (x.prefixes ? '<em>' + esc(x.prefixes.replace(/,\s*/g, ' · ')) + '</em>' : '') + '</div></td>' +
+        '<td><div class="cb" style="width:' + w(x.total, maxTotal).toFixed(1) + '%">' +
+        '<span class="s1" style="width:' + w(x.pending, x.total).toFixed(2) + '%"></span>' +
+        '<span class="s2" style="width:' + w(x.outstanding, x.total).toFixed(2) + '%"></span>' +
+        '<span class="s3" style="width:' + w(x.invoiced, x.total).toFixed(2) + '%"></span>' +
+        '</div></td>' +
+        '<td class="r">' + money(x.pending) + '</td>' +
+        '<td class="r">' + money(x.outstanding) + '</td>' +
+        '<td class="r">' + money(x.invoiced) + '</td>' +
+        '<td class="r"><b>' + money(x.total) + '</b></td>' +
+        '<td class="r">' + (x.feePct * 100).toFixed(0) + '%</td>' +
+        '<td class="r">' + x.invoices + '</td>' +
+        '<td class="r">' + (x.owed ? money(x.owed) : '—') + '</td>' +
+        '<td>' + (x.last || '—') + '</td></tr>');
+    });
+    P('</tbody></table></div></div>');
+  }
+
+  /* ---------- DRAFT + chưa gắn khách ---------- */
+  P('<div class="grid-w">');
+
+  P('<div class="panel"><h2>Payout DRAFT chờ trả</h2>' +
+    '<p class="hint">Đã duyệt nhưng chưa chuyển. Đổi sang PAID thì Flow mới dựng giao dịch và tiền mới thật sự rời ví.</p>');
+  if (DATA.drafts.length) {
+    P('<div class="scroll"><table><thead><tr><th>Lệnh</th><th>Khách</th><th>Hoá đơn</th><th class="r">Số tiền</th></tr></thead><tbody>');
+    DATA.drafts.forEach(function (d) {
+      P('<tr><td>' + esc(d.key) + '</td><td>' + esc(d.payee) + '</td><td>' + esc(d.ref) +
+        '</td><td class="r">' + money(d.amount) + '</td></tr>');
+    });
+    P('<tr><td colspan="3"><b>Tổng</b></td><td class="r"><b>' + money(DATA.draftTotal) + '</b></td></tr>');
+    P('</tbody></table></div>');
+  } else {
+    P('<div class="soon"><b>Không có lệnh nào chờ</b>Mọi hoá đơn đã phát hành đều đã trả xong.</div>');
+  }
+  P('</div>');
+
+  P('<div class="panel"><h2>Chưa gắn khách</h2>' +
+    '<p class="hint">Prefix có tiền thật trên PayPal nhưng chưa khai cho khách nào, nên chưa vào sổ.</p>');
+  if (DATA.unassigned.length) {
+    P('<div class="scroll"><table><thead><tr><th>Prefix</th><th class="r">Số tiền</th></tr></thead><tbody>');
+    DATA.unassigned.forEach(function (u) {
+      P('<tr><td>' + esc(u.prefix) + '</td><td class="r">' + money(u.amount) + '</td></tr>');
+    });
+    P('<tr><td><b>Tổng</b></td><td class="r"><b>' + money(DATA.unassignedTotal) + '</b></td></tr>');
+    P('</tbody></table></div>');
+  } else {
+    P('<div class="soon"><b>Không có</b>Mọi prefix đều đã gắn khách.</div>');
+  }
+  P('</div></div>');
+
+  /* ---------- nguồn tiền + ngân quỹ ---------- */
+  var chip = function (state) {
+    var cls = state === 'HOLD' ? 'hold' : (state === 'ACTIVE' ? 'ok' : 'idle');
+    return '<span class="chip ' + cls + '">' + esc(state) + '</span>';
+  };
+
+  P('<div class="grid2">');
+  P('<div class="panel"><h2>Nguồn tiền vào</h2><p class="hint">Số dư và tình trạng từng tài khoản PayPal.</p>' +
+    '<div class="scroll"><table><thead><tr><th>Tài khoản</th><th class="r">Số dư</th><th class="r">Đã rút</th><th>Tình trạng</th></tr></thead><tbody>');
+  DATA.paypal.forEach(function (a) {
+    P('<tr><td><div class="who">' + esc(a.key) + '<em>' + esc(a.label) + '</em></div></td>' +
+      '<td class="r">' + money(a.balance) + '</td><td class="r">' + money(a.withdrawn) + '</td>' +
+      '<td>' + chip(a.state) + '</td></tr>');
+  });
+  P('</tbody></table></div></div>');
+
+  P('<div class="panel"><h2>Ngân quỹ</h2><p class="hint">Grey nhận từ PayPal, rồi ra ví USDT.</p>' +
+    '<div class="scroll"><table><thead><tr><th>Ví</th><th class="r">Số dư ước</th><th class="r">Đã nhận</th><th>Sync</th></tr></thead><tbody>');
+  DATA.treasury.forEach(function (t) {
+    P('<tr><td><div class="who">' + esc(t.key) + '<em>' + esc(t.kind) + '</em></div></td>' +
+      '<td class="r">' + money(t.balance) + '</td><td class="r">' + money(t.received) + '</td>' +
+      '<td>' + esc(t.sync || '—') + '</td></tr>');
+  });
+  P('</tbody></table></div></div></div>');
+
+  /* ---------- sức khoẻ + xu hướng ---------- */
+  P('<div class="grid2">');
+  P('<div class="panel"><h2>Sức khoẻ đối chiếu</h2><p class="hint">Giao dịch trong sổ và trạng thái khớp lệnh.</p>' +
+    '<div class="scroll"><table><thead><tr><th>Loại</th><th class="r">Dòng</th><th>Trạng thái</th><th class="r">Dòng</th></tr></thead><tbody>');
+  var rows = Math.max(DATA.health.types.length, DATA.health.reconcile.length);
+  for (var i = 0; i < rows; i++) {
+    var t = DATA.health.types[i], r = DATA.health.reconcile[i];
+    P('<tr><td>' + (t ? esc(t.name) : '') + '</td><td class="r">' + (t ? t.n : '') + '</td>' +
+      '<td>' + (r ? esc(r.name) : '') + '</td><td class="r">' + (r ? r.n : '') + '</td></tr>');
+  }
+  P('</tbody></table></div></div>');
+
+  /* Xu hướng: cố ý KHÔNG vẽ đường khi mới có một chấm. */
+  P('<div class="panel"><h2>Diễn biến theo ngày</h2>' +
+    '<p class="hint">Ảnh chụp mỗi ngày một dòng, ghi trong lượt sync.</p>');
+  if (DATA.history.length < 3) {
+    P('<div class="soon"><b>Mới có ' + DATA.history.length + ' ngày dữ liệu</b>' +
+      'Cần khoảng 3–4 tuần mới đủ dày để đường xu hướng nói lên điều gì.<br>Không vẽ đường cho một chấm.</div>');
+  } else {
+    P(trend(DATA.history));
+  }
+  P('</div></div>');
+
+  P('<p class="foot">Số liệu do syncFlow và syncCustomers dựng · trang này chỉ đọc lại, không tính toán gì thêm</p>');
+
+  /* ---------- biểu đồ đường, vẽ tay bằng SVG ---------- */
+  function trend(hist) {
+    var W = 640, Ht = 190, padL = 8, padR = 8, padT = 12, padB = 20;
+    var series = [
+      { k: 'pending', c: 'var(--cost)' },
+      { k: 'outstanding', c: 'var(--money-2)' },
+      { k: 'invoiced', c: 'var(--money)' },
+      { k: 'usdt', c: 'var(--ink-2)' }
+    ];
+    var max = 0;
+    hist.forEach(function (h) {
+      series.forEach(function (s) { if (h[s.k] > max) max = h[s.k]; });
+    });
+    if (max <= 0) max = 1;
+
+    var x = function (i) { return padL + i * (W - padL - padR) / Math.max(1, hist.length - 1); };
+    var y = function (v) { return padT + (1 - v / max) * (Ht - padT - padB); };
+
+    var out = '<svg class="trend" viewBox="0 0 ' + W + ' ' + Ht + '" preserveAspectRatio="none" role="img">';
+    [0, 0.5, 1].forEach(function (f) {
+      out += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y(max * f) +
+        '" y2="' + y(max * f) + '" stroke="var(--line-soft)" stroke-width="1"/>';
+    });
+    series.forEach(function (s) {
+      var d = hist.map(function (h, i) { return (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(h[s.k]).toFixed(1); }).join(' ');
+      out += '<path d="' + d + '" fill="none" stroke="' + s.c + '" stroke-width="2" stroke-linejoin="round"/>';
+    });
+    out += '</svg><div class="keys">' +
+      '<div class="key"><i class="dot s1"></i><span class="kn">Kẹt ở PayPal</span></div>' +
+      '<div class="key"><i class="dot s2"></i><span class="kn">Chưa xuất HĐ</span></div>' +
+      '<div class="key"><i class="dot s3"></i><span class="kn">Đã xuất HĐ</span></div>' +
+      '<div class="key"><i class="dot" style="background:var(--ink-2)"></i><span class="kn">USDT còn lại</span></div>' +
+      '<div class="key"><span class="kp">' + esc(hist[0].d) + ' → ' + esc(hist[hist.length - 1].d) + '</span></div>' +
+      '</div>';
+    return out;
+  }
+
+  document.getElementById('root').innerHTML = H.join('');
+</script>
+</body>
+</html>

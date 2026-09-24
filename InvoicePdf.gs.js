@@ -178,6 +178,12 @@ function generateLatestInvoicePdf() {
     const key = invPdfStr_(row[headers['Settlement Key'] - 1]);
     if (!key) return;
 
+    // An unfinished or failed create is not an invoice; never pick it as "latest".
+    if (headers['Status'] &&
+        !invPdfIsEffectiveSettlementStatus_(row[headers['Status'] - 1])) {
+      return;
+    }
+
     const created = invPdfDate_(row[headers['Created At'] - 1]);
     const time = created ? created.getTime() : 0;
 
@@ -188,7 +194,7 @@ function generateLatestInvoicePdf() {
   });
 
   if (!newestKey) {
-    throw new Error('Could not find a settlement to generate.');
+    throw new Error('Could not find an issued settlement to generate.');
   }
 
   return invPdfGenerate_(newestKey, false);
@@ -257,6 +263,12 @@ function generateMissingInvoicePdfs() {
     const key = invPdfStr_(row[headers['Settlement Key'] - 1]);
     const pdfId = invPdfStr_(row[headers['PDF File ID'] - 1]);
 
+    // Skip non-issued settlements, otherwise one FAILED row aborts the batch.
+    if (headers['Status'] &&
+        !invPdfIsEffectiveSettlementStatus_(row[headers['Status'] - 1])) {
+      return;
+    }
+
     if (key && !pdfId) {
       keys.push(key);
     }
@@ -281,6 +293,26 @@ function generateMissingInvoicePdfs() {
  *************************************************/
 
 function invPdfGenerate_(settlementKey, forceRegenerate) {
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(
+      'invPdfGenerate',
+      function() {
+        return invPdfGenerateCore_(settlementKey, forceRegenerate);
+      }
+    );
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return invPdfGenerateCore_(settlementKey, forceRegenerate);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function invPdfGenerateCore_(settlementKey, forceRegenerate) {
   const ss = SpreadsheetApp.getActive();
   const settlementsSheet = invPdfRequireSheet_(ss, INV_PDF_CFG.SETTLEMENTS_SHEET);
   const itemsSheet = invPdfRequireSheet_(ss, INV_PDF_CFG.ITEMS_SHEET);
@@ -372,6 +404,15 @@ function invPdfGenerate_(settlementKey, forceRegenerate) {
   if (!settlement) {
     throw new Error('Settlement not found: ' + settlementKey);
   }
+
+  /*
+   * Only a real invoice may become a customer-facing document. A settlement at
+   * CREATING is an unfinished create and FAILED/CANCELLED never happened, so
+   * rendering either would put a document in a customer's hands for money that
+   * was never invoiced. PDF generation is a SAFE action for the AI gateway, so
+   * this is the only gate on that path.
+   */
+  invPdfRequireEffectiveSettlement_(settlement, settlementHeaders, settlementKey);
 
   const existingPdfId = invPdfStr_(settlement.values[settlementHeaders['PDF File ID'] - 1]);
   const existingPdfUrl = invPdfStr_(settlement.values[settlementHeaders['PDF URL'] - 1]);
@@ -657,15 +698,36 @@ function invPdfRenderSummary_(body, settlement, h) {
     .setFontSize(10.5)
     .setForegroundColor(INV_PDF_CFG.DARK_COLOR);
 
+  /*
+   * TẠM ỨNG
+   * -------
+   * Hai dòng này nằm SAU dòng phí, phản chiếu đúng thứ tự tính bên
+   * Customer.gs: tiền ứng là vốn của chủ cho mượn, không phải doanh thu của
+   * khách, nên phí không chạm vào nó ở cả hai chiều.
+   *
+   * Cột chỉ mọc ra khi bản Customer.gs mới ghi vào, nên hoá đơn cũ không có
+   * cột này vẫn render như trước — đọc thiếu cột phải là im lặng, không phải nổ.
+   */
+  const advanceGiven = h['Advance Amount'] ? invPdfNum_(v[h['Advance Amount'] - 1]) : 0;
+  const advanceRepaid = h['Advance Recovered'] ? invPdfNum_(v[h['Advance Recovered'] - 1]) : 0;
+
   const rows = [
     ['Sales', invPdfMoney_(v[h['Gross Sales'] - 1], sourceCurrency)],
     ['Refunds', invPdfMoneySignedFee_(v[h['Refunds'] - 1], sourceCurrency)],
     ['PayPal Fees', invPdfMoneySignedFee_(v[h['PayPal Fees'] - 1], sourceCurrency)],
     ['Transfer Fees', invPdfMoneySignedFee_(transferFees, sourceCurrency)],
     ['Net Before Payout Fee', invPdfMoney_(v[h['Net Before Payout Fee'] - 1], payoutCurrency)],
-    ['Payout Fee (' + invPdfPercent_(payoutFeeRate) + ')', invPdfMoneySignedFee_(v[h['Payout Fee Amount'] - 1], payoutCurrency)],
-    ['AMOUNT DUE', invPdfMoney_(amountDue, payoutCurrency)]
+    ['Payout Fee (' + invPdfPercent_(payoutFeeRate) + ')', invPdfMoneySignedFee_(v[h['Payout Fee Amount'] - 1], payoutCurrency)]
   ];
+
+  if (advanceRepaid > 0.0001) {
+    rows.push(['Advance Repayment', invPdfMoneySignedFee_(advanceRepaid, payoutCurrency)]);
+  }
+  if (advanceGiven > 0.0001) {
+    rows.push(['Advance', '+' + advanceGiven.toFixed(2) + ' ' + payoutCurrency]);
+  }
+
+  rows.push(['AMOUNT DUE', invPdfMoney_(amountDue, payoutCurrency)]);
 
   const table = body.appendTable(rows);
   table.setBorderWidth(0.35);
@@ -710,6 +772,22 @@ function invPdfRenderSummary_(body, settlement, h) {
       .setFontFamily(INV_PDF_CFG.FONT_FAMILY)
       .setFontSize(8.25)
       .setForegroundColor(INV_PDF_CFG.DARK_COLOR);
+  }
+
+  /*
+   * Khách phải thấy phần ứng còn nợ. Không hiện thì kỳ sau bị trừ mà không
+   * hiểu vì sao, và người phải giải thích là bạn.
+   */
+  const advanceLeft = h['Advance Outstanding After'] ? invPdfNum_(v[h['Advance Outstanding After'] - 1]) : 0;
+  if (advanceLeft > 0.0001) {
+    const advNote = body.appendParagraph(
+      'Advance balance carried forward: ' + advanceLeft.toFixed(2) + ' ' + payoutCurrency +
+      ' — recovered from future invoices.'
+    );
+    advNote.editAsText()
+      .setFontFamily(INV_PDF_CFG.FONT_FAMILY)
+      .setFontSize(7.5)
+      .setForegroundColor(INV_PDF_CFG.MUTED_COLOR);
   }
 
   const paid = invPdfNum_(v[h['Amount Paid'] - 1]);
@@ -1161,6 +1239,39 @@ function invPdfGetLogoBlob_() {
  * DATA READ
  *************************************************/
 
+/*
+ * Settlement status is owned by Customer.gs. Defer to its helper so the list of
+ * real-invoice statuses lives in exactly one place, and fall back to the same
+ * three only if that file is somehow unavailable.
+ */
+function invPdfIsEffectiveSettlementStatus_(status) {
+  if (typeof custIsEffectiveSettlementStatus_ === 'function') {
+    return custIsEffectiveSettlementStatus_(status);
+  }
+
+  const s = invPdfStr_(status).toUpperCase();
+  return s === 'ISSUED' || s === 'PARTIALLY_PAID' || s === 'PAID';
+}
+
+
+function invPdfRequireEffectiveSettlement_(settlement, headers, settlementKey) {
+  if (!headers['Status']) {
+    return;
+  }
+
+  const status =
+    invPdfStr_(settlement.values[headers['Status'] - 1]).toUpperCase() ||
+    'ISSUED';
+
+  if (!invPdfIsEffectiveSettlementStatus_(status)) {
+    throw new Error(
+      'Settlement ' + settlementKey + ' is ' + status +
+      ' and is not an issued invoice. No PDF was generated.'
+    );
+  }
+}
+
+
 function invPdfFindSettlement_(sheet, headers, settlementKey) {
   const lastRow = sheet.getLastRow();
 
@@ -1418,8 +1529,22 @@ function invPdfDate_(value) {
 }
 
 
+/*
+ * Không dùng instanceof: nó so theo constructor của từng realm, nên hỏng khi
+ * chạy trong sandbox test — và một phép kiểm mà test không xác minh được thì
+ * chẳng bảo vệ được gì. toString đúng ở mọi realm.
+ */
+function invPdfIsDate_(value) {
+  return Object.prototype.toString.call(value) === '[object Date]';
+}
+
+
 function invPdfNum_(value) {
   if (typeof value === 'number' && isFinite(value)) return value;
+
+  /* Xem chú thích ở custNum_: ngày tháng trong ô tiền phải thành 0, không
+     phải thành rác mười sáu chữ số. */
+  if (invPdfIsDate_(value)) return 0;
 
   let s = invPdfStr_(value);
   if (!s) return 0;

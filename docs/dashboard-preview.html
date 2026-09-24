@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bảng điều khiển Payment All</title>
+<meta name="description" content="Bản xem thử dashboard Payment All, dựng bằng số thật ngày 02/09/2026.">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root {
+    --ink:#101a26; --ink-2:#3d4f66; --muted:#6d7d92; --faint:#9aa8b8;
+    --paper:#eef1f5; --card:#fff; --line:#dfe5ec; --line-soft:#eaeff4;
+    --money:#0a6459; --money-2:#3f9a8c; --money-3:#9ecabf;
+    --cost:#9c4530; --cost-2:#c8836e; --warn:#a8791f;
+    --f-body:"Be Vietnam Pro",system-ui,sans-serif;
+    --f-num:"IBM Plex Mono",ui-monospace,monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink:#e9eef5; --ink-2:#b0becd; --muted:#7f8fa2; --faint:#5f6e80;
+      --paper:#0a1119; --card:#131d28; --line:#26333f; --line-soft:#1b2732;
+      --money:#4fc0ae; --money-2:#348a7d; --money-3:#1f5a51;
+      --cost:#e09a80; --cost-2:#a2624e; --warn:#d6ae5c;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink:#e9eef5; --ink-2:#b0becd; --muted:#7f8fa2; --faint:#5f6e80;
+    --paper:#0a1119; --card:#131d28; --line:#26333f; --line-soft:#1b2732;
+    --money:#4fc0ae; --money-2:#348a7d; --money-3:#1f5a51;
+    --cost:#e09a80; --cost-2:#a2624e; --warn:#d6ae5c;
+  }
+
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body {
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--f-body); font-size:14px; line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  img { max-width:100%; }
+
+  .wrap {
+    max-width:1240px; margin:0 auto;
+    padding:clamp(18px,3vw,32px) clamp(12px,3vw,28px) 60px;
+    display:flex; flex-direction:column; gap:16px;
+  }
+  .n { font-family:var(--f-num); font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+
+  /* head */
+  .head { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+  .head h1 { margin:0; font-size:19px; font-weight:700; letter-spacing:-.02em; }
+  .head .ts { font-size:12px; color:var(--muted); }
+  .head .ts b { color:var(--ink-2); font-weight:500; }
+
+  /* alerts */
+  .alerts { display:flex; flex-direction:column; gap:1px; background:var(--line-soft); border-radius:12px; overflow:hidden; }
+  .alert { display:flex; gap:11px; background:var(--card); padding:11px 15px; font-size:13.5px; border-left:3px solid var(--cost); }
+  .alert.warn { border-left-color:var(--warn); }
+  .alert i { font-style:normal; font-size:12px; line-height:1.6; flex:none; color:var(--cost); }
+  .alert.warn i { color:var(--warn); }
+  .alert .t b { font-weight:600; }
+  .alert .t em { font-style:normal; color:var(--muted); display:block; font-size:12.5px; margin-top:1px; }
+
+  /* kpi */
+  .kpis { display:grid; gap:10px; grid-template-columns:repeat(2,1fr); }
+  @media (min-width:700px){ .kpis{ grid-template-columns:repeat(3,1fr);} }
+  @media (min-width:1000px){ .kpis{ grid-template-columns:repeat(5,1fr);} }
+  .kpi { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:13px 15px 14px; }
+  .kpi .lab { font-size:9.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); font-weight:600; }
+  .kpi .val { font-family:var(--f-num); font-variant-numeric:tabular-nums; font-size:23px; font-weight:600; letter-spacing:-.03em; line-height:1.25; }
+  .kpi .sub { font-size:11px; color:var(--faint); }
+  .kpi.c-cost .val{color:var(--cost);} .kpi.c-money .val{color:var(--money);} .kpi.c-warn .val{color:var(--warn);}
+
+  /* panel */
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:17px 19px 19px; }
+  .panel > h2 { margin:0 0 2px; font-size:13px; font-weight:600; letter-spacing:-.01em; }
+  .panel > .hint { margin:0 0 15px; font-size:12px; color:var(--muted); }
+
+  .grid2 { display:grid; gap:12px; grid-template-columns:1fr; }
+  @media (min-width:900px){ .grid2{ grid-template-columns:1fr 1fr;} }
+  .grid-w { display:grid; gap:12px; grid-template-columns:1fr; }
+  @media (min-width:980px){ .grid-w{ grid-template-columns:1.35fr 1fr;} }
+
+  /* waterfall */
+  .wf { display:flex; flex-direction:column; }
+  .wf .r { display:grid; grid-template-columns:1fr 120px 88px; gap:12px; align-items:center; padding:5px 0; }
+  .wf .r .lb { font-size:13px; }
+  .wf .r .bar { height:9px; border-radius:3px; background:var(--line-soft); overflow:hidden; }
+  .wf .r .bar i { display:block; height:100%; border-radius:3px; min-width:2px; }
+  .wf .r .am { font-family:var(--f-num); font-variant-numeric:tabular-nums; font-size:13px; text-align:right; }
+  .wf .cut .lb { padding-left:16px; color:var(--ink-2); font-size:12.5px; }
+  .wf .cut .lb em { font-style:normal; color:var(--faint); font-size:11px; margin-left:6px; }
+  .wf .cut .am { color:var(--cost); }
+  .wf .cut .bar i { background:var(--cost-2); }
+  .wf .sum { border-top:1px solid var(--line-soft); margin-top:4px; padding-top:9px; }
+  .wf .sum .lb { font-weight:600; font-size:13px; }
+  .wf .sum .bar i { background:var(--money-3); }
+  .wf .sum .am { font-weight:600; }
+  .wf .fin .lb, .wf .fin .am { color:var(--money); font-weight:700; }
+  .wf .fin .bar i { background:var(--money); }
+  .wf .own .lb, .wf .own .am { color:var(--warn); }
+  .wf .own .bar i { background:var(--warn); }
+  .wf .tail { display:grid; grid-template-columns:1fr 88px; gap:12px; padding:3px 0 3px 16px; font-size:12.5px; color:var(--ink-2); }
+  .wf .tail .am { font-family:var(--f-num); font-variant-numeric:tabular-nums; text-align:right; }
+  .wf .tail.due .am, .wf .tail.due span { color:var(--cost); font-weight:600; }
+
+  /* segmented */
+  .seg { display:flex; height:28px; border-radius:6px; overflow:hidden; background:var(--line-soft); }
+  .seg span { height:100%; }
+  .s1{background:var(--cost);} .s2{background:var(--money-2);} .s3{background:var(--money);}
+  .keys { display:flex; flex-wrap:wrap; gap:6px 24px; margin-top:13px; }
+  .key { display:flex; align-items:baseline; gap:8px; font-size:12.5px; }
+  .key .dot { width:9px; height:9px; border-radius:2px; flex:none; transform:translateY(-1px); }
+  .key .kn { color:var(--muted); }
+  .key .kv { font-family:var(--f-num); font-variant-numeric:tabular-nums; font-weight:600; }
+  .key .kp { color:var(--faint); font-size:11.5px; }
+
+  /* tables */
+  .scroll { overflow-x:auto; margin:0 -4px; padding:0 4px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th { font-size:9.5px; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); font-weight:600; text-align:left; padding:0 12px 7px 0; white-space:nowrap; }
+  td { padding:9px 12px 9px 0; border-top:1px solid var(--line-soft); vertical-align:middle; }
+  th.r, td.r { text-align:right; padding-right:0; }
+  td.r { font-family:var(--f-num); font-variant-numeric:tabular-nums; }
+  tbody tr:first-child td { border-top:1px solid var(--line); }
+  td .who { font-weight:600; }
+  td .who em { font-style:normal; display:block; font-size:11px; color:var(--faint); font-weight:400; }
+  .cb { height:16px; display:flex; border-radius:3px; overflow:hidden; background:var(--line-soft); min-width:60px; }
+  .cb span { height:100%; }
+
+  .chip { font-size:10px; font-weight:600; letter-spacing:.04em; padding:2px 7px; border-radius:99px; white-space:nowrap; display:inline-block; }
+  .chip.ok{background:color-mix(in srgb,var(--money) 13%,transparent); color:var(--money);}
+  .chip.hold{background:color-mix(in srgb,var(--cost) 14%,transparent); color:var(--cost);}
+  .chip.idle{background:var(--line-soft); color:var(--muted);}
+  .chip.draft{background:color-mix(in srgb,var(--warn) 15%,transparent); color:var(--warn);}
+
+  .soon { border:1px dashed var(--line); border-radius:10px; padding:22px 18px; text-align:center; color:var(--muted); font-size:12.5px; }
+  .soon b { display:block; color:var(--ink-2); font-size:13px; font-weight:600; margin-bottom:3px; }
+  .foot { font-size:11.5px; color:var(--faint); text-align:center; margin-top:2px; }
+
+  @media print {
+    :root { --paper:#fff; --card:#fff; --ink:#000; --ink-2:#333; --muted:#555; --line:#bbb; --line-soft:#ddd; }
+    .wrap { max-width:none; padding:0; }
+    .panel,.kpi,.alert,.wf .r { break-inside:avoid; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <div class="head">
+    <h1>Payment All</h1>
+    <div class="ts">Cập nhật <b>09:49 · 02/09/2026</b> &nbsp;·&nbsp; USD, làm tròn 2 số</div>
+  </div>
+
+  <div class="alerts">
+    <div class="alert"><i>▲</i><div class="t">
+      <b>Còn nợ khách 1.275,61 nhưng USDT chỉ còn 1.078,06</b> — thiếu 197,55
+      <em>USDT!A1 chỉ tính phần hệ thống ghi nhận, ví thật có thể còn dư. Kiểm trước khi bấm trả 4 lệnh DRAFT.</em>
+    </div></div>
+    <div class="alert warn"><i>▲</i><div class="t">
+      <b>PP1 · PP2 · PP3 đang hold 1.919,28</b> — 120 ngày
+      <em>1.553,38 trong đó là tiền khách. Chưa xuất hoá đơn đồng nào nên không phải thu lại của ai.</em>
+    </div></div>
+    <div class="alert warn"><i>▲</i><div class="t">
+      <b>484,21 chưa gắn khách nào</b> — 4 prefix
+      <em>TTPEZ · JUST · PRAN · MASTSH. Tiền có thật nhưng chưa vào sổ khách.</em>
+    </div></div>
+    <div class="alert warn"><i>▲</i><div class="t">
+      <b>Mã PayPal chưa biết T0021</b> — 2 dòng, cộng lại bằng 0,00
+      <em>Cố ý để nguyên UNMAPPED_ vì chưa xác định được nghĩa.</em>
+    </div></div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi c-cost"><div class="lab">Kẹt ở PayPal</div><div class="val n">1.741,16</div><div class="sub">chưa rút ra được</div></div>
+    <div class="kpi c-money"><div class="lab">Chưa xuất hoá đơn</div><div class="val n">684,39</div><div class="sub">đã về, đủ điều kiện</div></div>
+    <div class="kpi c-cost"><div class="lab">Còn nợ khách</div><div class="val n">1.275,61</div><div class="sub">4 lệnh DRAFT</div></div>
+    <div class="kpi c-money"><div class="lab">USDT còn lại</div><div class="val n">1.078,06</div><div class="sub">về 6.652,08 · chi 5.574,02</div></div>
+    <div class="kpi c-warn"><div class="lab">Phí dịch vụ đã thu</div><div class="val n">292,09</div><div class="sub">8 hoá đơn · phần của bạn</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Chuỗi tiền — cộng dồn 8 hoá đơn đã phát hành</h2>
+    <p class="hint">Từ tiền hàng tới tay khách, mọi dòng khớp tuyệt đối. Thanh của các khoản trừ so với nhau chứ không so với tổng — để thấy khoản nào ăn nhiều nhất. Hoàn trả vào chuỗi ở hai điểm: trong kỳ thì trừ ngay, kết chuyển từ kỳ trước thì trừ sau chi phí đường ống.</p>
+
+    <div class="wf">
+      <div class="r sum"><div class="lb">Tiền hàng</div><div class="bar"><i style="width:100%"></i></div><div class="am n">6.223,60</div></div>
+
+      <div class="r cut"><div class="lb">Phí PayPal <em>đo được</em></div><div class="bar"><i style="width:88.7%"></i></div><div class="am n">−259,23</div></div>
+      <div class="r cut"><div class="lb">Phí Grey nhận <em>đo được</em></div><div class="bar"><i style="width:20.6%"></i></div><div class="am n">−60,06</div></div>
+      <div class="r cut"><div class="lb">Hoàn trả trong kỳ</div><div class="bar"><i style="width:12.0%"></i></div><div class="am n">−34,98</div></div>
+
+      <div class="r sum"><div class="lb">Tiền khả dụng</div><div class="bar"><i style="width:94.3%"></i></div><div class="am n">5.869,33</div></div>
+
+      <div class="r cut"><div class="lb">Đổi USD sang USDT <em>ước lượng</em></div><div class="bar"><i style="width:4.2%"></i></div><div class="am n">−12,23</div></div>
+      <div class="r cut"><div class="lb">Rút USDT về ví <em>ước lượng</em></div><div class="bar"><i style="width:4.8%"></i></div><div class="am n">−13,91</div></div>
+      <div class="r cut"><div class="lb">Hoàn trả kết chuyển <em>từ kỳ trước</em></div><div class="bar"><i style="width:0.5%"></i></div><div class="am n">−1,47</div></div>
+
+      <div class="r sum"><div class="lb">Trước phí dịch vụ</div><div class="bar"><i style="width:93.9%"></i></div><div class="am n">5.841,72</div></div>
+
+      <div class="r cut own"><div class="lb">Phí dịch vụ <em>phần của bạn</em></div><div class="bar"><i style="width:100%"></i></div><div class="am n">−292,09</div></div>
+
+      <div class="r sum fin"><div class="lb">Khách được nhận</div><div class="bar"><i style="width:89.2%"></i></div><div class="am n">5.549,63</div></div>
+
+      <div class="tail"><span>đã trả</span><div class="am n">4.274,02</div></div>
+      <div class="tail due"><span>còn nợ</span><div class="am n">1.275,61</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Tiền khách đang ở đâu</h2>
+    <p class="hint">Ba rổ không chồng lấn, cộng lại bằng toàn bộ tiền khách hệ thống ghi nhận.</p>
+    <div class="seg">
+      <span class="s1" style="width:20.99%"></span><span class="s2" style="width:8.25%"></span><span class="s3" style="width:70.76%"></span>
+    </div>
+    <div class="keys">
+      <div class="key"><i class="dot s1"></i><span class="kn">Kẹt ở PayPal</span><span class="kv n">1.741,16</span><span class="kp">21,0%</span></div>
+      <div class="key"><i class="dot s2"></i><span class="kn">Đã về, chưa xuất HĐ</span><span class="kv n">684,39</span><span class="kp">8,3%</span></div>
+      <div class="key"><i class="dot s3"></i><span class="kn">Đã xuất hoá đơn</span><span class="kv n">5.869,33</span><span class="kp">70,8%</span></div>
+      <div class="key"><span class="kn">Tổng</span><span class="kv n">8.294,88</span></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Từng khách</h2>
+    <p class="hint">Thanh dài ngắn thật so với nhau theo tổng tiền.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>Khách</th><th style="width:150px">Phân bố</th>
+          <th class="r">Kẹt PayPal</th><th class="r">Chưa xuất HĐ</th><th class="r">Đã xuất HĐ</th>
+          <th class="r">Tổng</th><th class="r">Phí</th><th class="r">HĐ</th><th class="r">Còn nợ</th><th>Gần nhất</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td><div class="who">HUI<em>SHOPSH · VASC · BUDD · BERMSH</em></div></td>
+            <td><div class="cb" style="width:100%"><span class="s1" style="width:25.58%"></span><span class="s3" style="width:74.42%"></span></div></td>
+            <td class="r">1.419,58</td><td class="r">0,00</td><td class="r">4.129,19</td>
+            <td class="r"><b>5.548,77</b></td><td class="r">5%</td><td class="r">4</td><td class="r">467,53</td><td>01/09</td>
+          </tr>
+          <tr>
+            <td><div class="who">DITECH<em>BOSSX · BEAC · THEWSH</em></div></td>
+            <td><div class="cb" style="width:36.7%"><span class="s1" style="width:14.52%"></span><span class="s3" style="width:85.48%"></span></div></td>
+            <td class="r">295,68</td><td class="r">0,00</td><td class="r">1.740,14</td>
+            <td class="r"><b>2.035,82</b></td><td class="r">5%</td><td class="r">4</td><td class="r">808,08</td><td>01/09</td>
+          </tr>
+          <tr>
+            <td><div class="who">ASON<em>USAH</em></div></td>
+            <td><div class="cb" style="width:12.8%"><span class="s1" style="width:3.65%"></span><span class="s2" style="width:96.35%"></span></div></td>
+            <td class="r">25,90</td><td class="r">684,39</td><td class="r">0,00</td>
+            <td class="r"><b>710,29</b></td><td class="r">0%</td><td class="r">0</td><td class="r">—</td><td>—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-w">
+    <div class="panel">
+      <h2>Payout DRAFT chờ trả</h2>
+      <p class="hint">Đã duyệt nhưng chưa chuyển. Đổi sang PAID thì Flow mới dựng giao dịch và tiền mới thật sự rời ví.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Lệnh</th><th>Khách</th><th>Hoá đơn</th><th class="r">Số tiền</th></tr></thead>
+          <tbody>
+            <tr><td>PO-000003</td><td>DITECH</td><td>INV-000003</td><td class="r">279,07</td></tr>
+            <tr><td>PO-000005</td><td>DITECH</td><td>INV-000005</td><td class="r">244,29</td></tr>
+            <tr><td>PO-000011</td><td>HUI</td><td>INV-000007</td><td class="r">467,53</td></tr>
+            <tr><td>PO-000012</td><td>DITECH</td><td>INV-000008</td><td class="r">284,72</td></tr>
+            <tr><td colspan="3"><b>Tổng</b></td><td class="r"><b>1.275,61</b></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Chưa gắn khách</h2>
+      <p class="hint">Prefix có tiền thật trên PayPal nhưng chưa khai cho khách nào, nên chưa vào sổ.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Prefix</th><th class="r">Số tiền</th></tr></thead>
+          <tbody>
+            <tr><td>TTPEZ</td><td class="r">240,90</td></tr>
+            <tr><td>JUST <span class="chip hold">CÓ GBP</span></td><td class="r">130,28</td></tr>
+            <tr><td>PRAN</td><td class="r">78,05</td></tr>
+            <tr><td>MASTSH</td><td class="r">34,98</td></tr>
+            <tr><td><b>Tổng</b></td><td class="r"><b>484,21</b></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>Nguồn tiền vào</h2>
+      <p class="hint">Số dư và tình trạng từng tài khoản PayPal.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Tài khoản</th><th class="r">Số dư</th><th class="r">Đã rút</th><th>Tình trạng</th></tr></thead>
+          <tbody>
+            <tr><td><div class="who">PP2<em>socialchics</em></div></td><td class="r">1.589,43</td><td class="r">1.525,53</td><td><span class="chip hold">HOLD</span></td></tr>
+            <tr><td><div class="who">PP1<em>bellabohoclothing</em></div></td><td class="r">289,85</td><td class="r">4.931,62</td><td><span class="chip hold">HOLD</span></td></tr>
+            <tr><td><div class="who">PP3<em>romandogcollars</em></div></td><td class="r">40,00</td><td class="r">165,66</td><td><span class="chip hold">HOLD</span></td></tr>
+            <tr><td><div class="who">PP4<em>bambiniclothing</em></div></td><td class="r">204,18</td><td class="r">0,00</td><td><span class="chip idle">CHƯA RÚT</span></td></tr>
+            <tr><td><div class="who">PP5<em>selenadawnsart</em></div></td><td class="r">85,77</td><td class="r">0,00</td><td><span class="chip idle">CHƯA RÚT</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Ngân quỹ</h2>
+      <p class="hint">Grey nhận từ PayPal, rồi ra ví USDT.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Ví</th><th class="r">Số dư ước</th><th class="r">Đã nhận</th><th>Sync</th></tr></thead>
+          <tbody>
+            <tr><td><div class="who">GR001<em>Grey USD</em></div></td><td class="r">87,28</td><td class="r">5.380,17</td><td>01/09 00:59</td></tr>
+            <tr><td><div class="who">GR002<em>Grey USD</em></div></td><td class="r">52,79</td><td class="r">1.499,02</td><td>01/09 14:02</td></tr>
+            <tr><td><div class="who">USDT1<em>Nhat</em></div></td><td class="r">1.078,06</td><td class="r">6.652,08</td><td>01/09 08:43</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>Sức khoẻ đối chiếu</h2>
+      <p class="hint">Giao dịch trong sổ và trạng thái khớp lệnh.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Loại</th><th class="r">Số dòng</th><th>Trạng thái</th><th class="r">Số dòng</th></tr></thead>
+          <tbody>
+            <tr><td>PayPal rút</td><td class="r">28</td><td><span class="chip ok">ARRIVED</span></td><td class="r">43</td></tr>
+            <tr><td>Grey nhận</td><td class="r">31</td><td><span class="chip ok">MATCHED</span></td><td class="r">47</td></tr>
+            <tr><td>Grey rút USDT</td><td class="r">18</td><td><span class="chip hold">RETURNED</span></td><td class="r">2</td></tr>
+            <tr><td>USDT nhận</td><td class="r">17</td><td><span class="chip draft">DRAFT</span></td><td class="r">4</td></tr>
+            <tr><td>USDT chi</td><td class="r">12</td><td><span class="chip idle">UNMATCHED</span></td><td class="r">6</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Diễn biến theo ngày</h2>
+      <p class="hint">Ảnh chụp mỗi ngày một dòng, bắt đầu tích từ hôm nay.</p>
+      <div class="soon">
+        <b>Mới có 1 ngày dữ liệu</b>
+        Cần khoảng 3–4 tuần mới đủ dày để đường xu hướng nói lên điều gì.<br>Không vẽ đường cho một chấm.
+      </div>
+    </div>
+  </div>
+
+  <p class="foot">Số liệu do syncFlow và syncCustomers dựng · trang này chỉ đọc lại, không tính toán gì thêm</p>
+
+</div>
+
+</body>
+</html>

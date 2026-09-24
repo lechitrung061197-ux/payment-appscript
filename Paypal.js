@@ -34,6 +34,21 @@ const PP_CFG = Object.freeze({
  ************************************************************/
 
 function syncPayPalAllAccounts() {
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(
+      'syncPayPalAllAccounts',
+      syncPayPalAllAccountsCore_
+    );
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return syncPayPalAllAccountsCore_(); }
+  finally { lock.releaseLock(); }
+}
+
+
+function syncPayPalAllAccountsCore_() {
   const ss = ppGetSpreadsheet_();
 
   const accountSheet = ss.getSheetByName(PP_CFG.ACCOUNT_SHEET);
@@ -52,9 +67,18 @@ function syncPayPalAllAccounts() {
 
   const accounts = ppReadAccounts_(accountSheet, accountHeaders);
 
+  /*
+   * Đo thời gian từng account. Trước khi bật trigger thì đây là số duy nhất cho
+   * biết còn cách giới hạn 6 phút bao xa — và ppSyncAccount_ chỉ ghi sau khi
+   * chạy xong, nên quá hạn là mất trắng cả lượt chứ không phải mất một phần.
+   */
+  const runStartedAt = new Date();
+  let okCount = 0, errCount = 0;
+
   accounts
     .filter(a => a.provider === 'PAYPAL' && a.enabled)
     .forEach(account => {
+      const accountStartedAt = new Date();
       try {
         ppSyncAccount_(
           account,
@@ -63,7 +87,21 @@ function syncPayPalAllAccounts() {
           paypalSheet,
           paypalHeaders
         );
+
+        okCount++;
+
+        Logger.log(
+          'PayPal OK ' +
+          account.accountKey +
+          ' in ' +
+          ((new Date().getTime() - accountStartedAt.getTime()) / 1000).toFixed(1) +
+          's'
+        );
+
       } catch (e) {
+
+        errCount++;
+
         ppSetAccountField_(
           accountSheet,
           account.rowNumber,
@@ -80,6 +118,18 @@ function syncPayPalAllAccounts() {
         );
       }
     });
+
+  const elapsed =
+    (new Date().getTime() - runStartedAt.getTime()) / 1000;
+
+  Logger.log(
+    'PAYPAL SYNC DONE in ' +
+    elapsed.toFixed(1) +
+    's · ' + okCount + ' ok · ' + errCount + ' lỗi' +
+    (elapsed > 240 ? '  ⚠ QUÁ 4 PHÚT — sát giới hạn 6 phút, thu hẹp Initial From' : '')
+  );
+
+  return { seconds: Number(elapsed.toFixed(1)), ok: okCount, errors: errCount };
 }
 
 
@@ -91,6 +141,23 @@ function syncPayPalAllAccounts() {
  ************************************************************/
 
 function syncPayPalOneAccount(accountKey) {
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_(
+      'syncPayPalOneAccount',
+      function() {
+        return syncPayPalOneAccountCore_(accountKey);
+      }
+    );
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return syncPayPalOneAccountCore_(accountKey); }
+  finally { lock.releaseLock(); }
+}
+
+
+function syncPayPalOneAccountCore_(accountKey) {
   const ss = ppGetSpreadsheet_();
 
   const accountSheet = ss.getSheetByName(PP_CFG.ACCOUNT_SHEET);

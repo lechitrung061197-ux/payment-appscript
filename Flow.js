@@ -23,8 +23,32 @@ const FLOW_CFG = Object.freeze({
   GREY_SHEET: 'Grey',
   USDT_SHEET: 'USDT',
   PINGPONG_SHEET: 'Pingpong',
+  MANUAL_IN_SHEET: 'Manual In',
   PAYOUTS_SHEET: 'Payouts',
   TRANSACTION_SHEET: 'Transaction',
+
+  /*
+   * Read-only. Flow never writes Settlements; it only needs to know whether a
+   * payout is backed by a real invoice before moving treasury money.
+   */
+  SETTLEMENTS_SHEET: 'Settlements',
+
+  /*
+   * Provider nhận mà reconcile THẬT SỰ biết cách đối chiếu.
+   *
+   * Sheet Account cho phép điền Linked Provider bất kỳ, nên danh sách này là
+   * thứ duy nhất phân biệt "đã khai đích đến và hệ thống tới được" với "đã khai
+   * đích đến nhưng không ai đi đón". Thiếu nó thì tiền kẹt im lặng ở OVERDUE.
+   *
+   * Thêm provider mới vào đây CHƯA đủ: còn cần collector và bộ chuẩn hoá raw
+   * của provider đó, cộng một nhánh reconcile.
+   */
+  RECEIVING_PROVIDERS: ['GREY'],
+
+  /* Cùng sheet khoá với collector Grey ở project khác. */
+  LOCK_SHEET: '_Sync Lock',
+  LOCK_WAIT_MS: 90000,
+  LOCK_STALE_MS: 600000,
 
   HEADER_ROW: 2,
   DATA_START_ROW: 3,
@@ -38,11 +62,281 @@ const FLOW_CFG = Object.freeze({
 });
 
 
+var PAYMENT_ALL_LOCK_DEPTH =
+  typeof PAYMENT_ALL_LOCK_DEPTH === 'number'
+    ? PAYMENT_ALL_LOCK_DEPTH
+    : 0;
+
+
+function paymentAllWithScriptLock_(
+  label,
+  fn
+) {
+
+  if (
+    PAYMENT_ALL_LOCK_DEPTH > 0
+  ) {
+
+    return fn();
+
+  }
+
+
+  const lock =
+    LockService.getScriptLock();
+
+
+  lock.waitLock(
+    30000
+  );
+
+
+  PAYMENT_ALL_LOCK_DEPTH++;
+
+
+  try {
+
+    return fn();
+
+  } finally {
+
+    PAYMENT_ALL_LOCK_DEPTH--;
+    lock.releaseLock();
+
+  }
+
+}
+
+
 /************************************************************
  * MAIN
  ************************************************************/
 
 function syncFlow() {
+
+  /*
+   * Hai lớp khoá, mỗi lớp một việc:
+   *
+   * paymentAllWithScriptLock_ chặn các entry point TRONG project này giẫm nhau.
+   * ScriptLock không xuyên được giữa các Apps Script project, mà collector Grey
+   * chạy ở project khác và cũng ghi sheet Transaction — nên cần thêm một khoá
+   * nằm trong chính spreadsheet dùng chung.
+   *
+   * Quan trọng vì flowWriteTransactionState_ ghi đè TOÀN BỘ vùng dữ liệu
+   * Transaction: chạy chồng với một bộ ghi khác là mất dòng, không phải trùng.
+   */
+  return paymentAllWithScriptLock_(
+    'syncFlow',
+    function () {
+
+      const lock =
+        flowAcquireSyncLock_(
+          flowGetSpreadsheet_()
+        );
+
+      try {
+
+        return syncFlowCore_();
+
+      } finally {
+
+        flowReleaseSyncLock_(lock);
+
+      }
+
+    }
+  );
+
+}
+
+
+/************************************************************
+ * ADVISORY LOCK DÙNG CHUNG VỚI COLLECTOR
+ *
+ * Cùng giao thức và cùng sheet với standalone/GreyGmailCollector.gs.
+ * Không dùng chung code được vì hai project khác nhau — sửa một bên
+ * thì phải sửa bên kia.
+ *
+ * Ghi token rồi đọc lại để xác nhận mình thắng. Vẫn còn khe hở rất
+ * nhỏ, nhưng đủ để hai bộ ghi-đè-toàn-sheet không chạy chồng nhau.
+ ************************************************************/
+
+function flowAcquireSyncLock_(
+  ss
+) {
+
+  let sheet =
+    ss.getSheetByName(
+      FLOW_CFG.LOCK_SHEET
+    );
+
+
+  if (!sheet) {
+
+    sheet =
+      ss.insertSheet(
+        FLOW_CFG.LOCK_SHEET
+      );
+
+    sheet.getRange('A1').setValue('holder');
+    sheet.getRange('B1').setValue('since');
+    sheet.hideSheet();
+
+  }
+
+
+  const token =
+    'FLOW|' +
+    Utilities.getUuid();
+
+
+  const deadline =
+    new Date().getTime() +
+    FLOW_CFG.LOCK_WAIT_MS;
+
+
+  while (
+    new Date().getTime() <
+    deadline
+  ) {
+
+    const holder =
+      flowString_(
+        sheet.getRange('A2').getValue()
+      );
+
+
+    const since =
+      sheet.getRange('B2').getValue();
+
+
+    const sinceMs =
+      since instanceof Date
+        ? since.getTime()
+        : 0;
+
+
+    const stale =
+      !sinceMs ||
+      (
+        new Date().getTime() -
+        sinceMs >
+        FLOW_CFG.LOCK_STALE_MS
+      );
+
+
+    if (
+      !holder ||
+      stale
+    ) {
+
+      sheet.getRange('A2').setValue(token);
+      sheet.getRange('B2').setValue(new Date());
+
+      SpreadsheetApp.flush();
+
+      Utilities.sleep(1200);
+
+
+      if (
+        flowString_(
+          sheet.getRange('A2').getValue()
+        ) === token
+      ) {
+
+        return {
+          sheet: sheet,
+          token: token
+        };
+
+      }
+
+    }
+
+
+    Utilities.sleep(3000);
+
+  }
+
+
+  throw new Error(
+    'Không lấy được sync lock sau ' +
+    (FLOW_CFG.LOCK_WAIT_MS / 1000) +
+    's — một collector khác đang ghi Transaction. Thử lại sau.'
+  );
+
+}
+
+
+/*
+ * So số dòng hiện tại với số dòng lúc flowLoadTransactionState_ đọc vào.
+ * Chỉ bắt được việc CHÈN THÊM dòng, nhưng đó đúng là thứ mà collector Grey
+ * làm (appendRow), nên đủ cho ca thực tế.
+ */
+function flowAssertTransactionUnchanged_(
+  sheet,
+  state
+) {
+
+  const expected =
+    FLOW_CFG.DATA_START_ROW +
+    state.oldRowCount -
+    1;
+
+
+  const actual =
+    sheet.getLastRow();
+
+
+  if (
+    state.oldRowCount > 0 &&
+    actual > expected
+  ) {
+
+    throw new Error(
+      'Sheet Transaction đã đổi trong lúc syncFlow chạy (' +
+      expected +
+      ' -> ' +
+      actual +
+      ' dòng). Huỷ lượt ghi để không xoá mất dòng của bộ ghi khác. Chạy lại syncFlow().'
+    );
+
+  }
+
+}
+
+
+function flowReleaseSyncLock_(
+  lock
+) {
+
+  if (!lock) {
+    return;
+  }
+
+
+  try {
+
+    if (
+      flowString_(
+        lock.sheet.getRange('A2').getValue()
+      ) === lock.token
+    ) {
+
+      lock.sheet.getRange('A2:B2').clearContent();
+
+      SpreadsheetApp.flush();
+
+    }
+
+  } catch (ignored) {
+    /* lock tự hết hạn sau LOCK_STALE_MS */
+  }
+
+}
+
+
+function syncFlowCore_() {
 
   const startedAt = new Date();
 
@@ -243,7 +537,8 @@ function syncFlow() {
       poh,
       payoutAccountMaps,
       txState,
-      th
+      th,
+      flowReadSettlementStatusMap_(ss)
     );
 
 
@@ -251,6 +546,44 @@ function syncFlow() {
     payoutsSheet,
     payoutRows
   );
+
+
+  /**********************************************************
+   * 7b. MANUAL IN -> TRANSACTION
+   *
+   * Tiền vào ví mà không đi qua đường ống nào: có người chuyển tới, ai đó trả
+   * lại, một khoản từ chỗ khác. Không có mail, không có API — nguồn duy nhất
+   * là chính bạn gõ vào.
+   *
+   * Optional như Pingpong: workbook chưa có sheet này thì bỏ qua, đừng làm
+   * hỏng cả lượt sync chỉ vì một tính năng chưa dùng tới.
+   **********************************************************/
+
+  const manualInSheet =
+    flowOptionalSheet_(ss, FLOW_CFG.MANUAL_IN_SHEET);
+
+
+  if (manualInSheet) {
+
+    const manualInRows =
+      flowReadRowsPreserve_(manualInSheet);
+
+
+    flowSyncManualInToTransaction_(
+      manualInRows,
+      flowHeaderMap_(manualInSheet),
+      payoutAccountMaps,
+      txState,
+      th
+    );
+
+
+    flowWriteRowsPreserve_(
+      manualInSheet,
+      manualInRows
+    );
+
+  }
 
 
   /**********************************************************
@@ -266,6 +599,18 @@ function syncFlow() {
   /**********************************************************
    * 9. WRITE TRANSACTION
    **********************************************************/
+
+  /*
+   * Lưới cuối dưới advisory lock: nếu sheet đã dài ra kể từ lúc đọc thì có bộ
+   * ghi khác vừa chèn dòng, và bản trong bộ nhớ này đã cũ. Ghi đè lúc đó là
+   * xoá mất dòng của họ, nên huỷ hẳn lượt này. Lần chạy sau sẽ đọc lại và làm
+   * đúng — không mất gì ngoài một lượt.
+   */
+  flowAssertTransactionUnchanged_(
+    txSheet,
+    txState
+  );
+
 
   flowWriteTransactionState_(
     txSheet,
@@ -370,6 +715,12 @@ function syncFlow() {
   Logger.log(
     'Payout INVALID: ' +
     payoutResult.invalid
+  );
+
+  /* Counted apart from INVALID: this one needs a person to look, not a retype. */
+  Logger.log(
+    'Payout BLOCKED (settlement): ' +
+    payoutResult.blocked
   );
 
 
@@ -1158,6 +1509,94 @@ function refreshAllPayoutAccountDropdowns() {
 
 
 /************************************************************
+ * PAYOUTS — PHÂN LOẠI
+ *
+ * Khai bằng HÀM chứ không phải const top-level: Apps Script gộp mọi file
+ * lại và không đảm bảo thứ tự nạp, nên một const ở file này có thể chưa
+ * khởi tạo khi file khác đọc tới. Khai báo hàm thì luôn được hoist.
+ *
+ * Category KHÔNG tham gia phép tính số dư ví — mọi payout PAID đều trừ ví
+ * như nhau. Nó chỉ phục vụ hai việc: guard CUSTOMER_PAYOUT phải có
+ * Settlement Key, và sổ chủ đọc thêm ở lớp trên.
+ ************************************************************/
+
+/*
+ * CUSTOMER_PAYOUT do engine hoá đơn sinh, người dùng không tự gõ — nên nó
+ * có trong danh sách này nhưng bị loại khỏi dropdown và khỏi AI.
+ */
+function flowPayoutCategories_() {
+  return [
+    'CUSTOMER_PAYOUT',
+    'OWNER_DRAW',
+    'EXPENSE',
+    'REFUND',
+    'TRANSFER',
+    'ADJUSTMENT',
+    'OTHER'
+  ];
+}
+
+
+/* Những giá trị người dùng và AI được phép đặt. */
+function flowPayoutManualCategories_() {
+  return flowPayoutCategories_().filter(
+    function (c) { return c !== 'CUSTOMER_PAYOUT'; }
+  );
+}
+
+
+/*
+ * Khoản nào tiêu vào phần của chủ.
+ *
+ * Rỗng VÀ giá trị lạ đều trả về false một cách CỐ Ý: chưa phân loại được thì
+ * chưa kết luận được, và đoán bừa sẽ thổi phồng "đã lấy ra". Cả hai trường
+ * hợp được cảnh báo riêng thay vì bị gộp vào đây.
+ *
+ * Quy tắc này phải nằm ở ĐÚNG MỘT chỗ. Trước đó sổ chủ loại giá trị lạ ra
+ * còn cảnh báo lại cộng vào, nên hai nơi báo hai số khác nhau.
+ */
+function flowPayoutIsOwnerCost_(category, settlementKey) {
+  /*
+   * Settlement Key thắng mọi thứ. Nó là mối nối DUY NHẤT giữa một hoá đơn và
+   * số tiền hoá đơn đó tiêu, nên payout mang nó là tiền khách — bất kể ai gõ
+   * gì vào cột Category.
+   *
+   * Không phải phòng hờ: trên sheet thật đang có một dòng "Auto-created from
+   * INV-000009" bị đổi Category thành MANUAL_PAYOUT. Thiếu guard này thì chỉ
+   * cần ai đó gõ EXPENSE vào đúng dòng đó là 680,97 vừa trả nợ hoá đơn vừa
+   * bị tính là chủ rút ra.
+   */
+  if (flowString_(settlementKey)) {
+    return false;
+  }
+
+  /*
+   * Danh sách CHO PHÉP, không phải danh sách loại trừ. Chỉ hai loại này là
+   * chủ thật sự tiêu mất phần phí kiếm được:
+   *
+   *   OWNER_DRAW — chủ rút ra dùng việc riêng
+   *   EXPENSE    — chi phí nuôi chính hệ thống
+   *
+   * Những loại còn lại KHÔNG phải tiêu:
+   *
+   *   ADJUSTMENT — bù trừ ghi sai ví. Mọi tài khoản Grey đều trỏ mặc định về
+   *                cùng một ví USDT, nên tiền rút ra ví khác vẫn bị ghi có
+   *                cho ví mặc định; dòng payout bù trừ chỉ gỡ phần ghi thừa
+   *                đó ra, không có đồng nào rời đi thêm.
+   *   TRANSFER   — chuyển sang ví khác, tiền vẫn còn.
+   *   REFUND     — trả lại người mua, đó là tiền khách.
+   *   OTHER      — chưa xác định được thì không kết luận.
+   *
+   * Viết theo kiểu loại trừ ("mọi thứ không phải CUSTOMER_PAYOUT") là sai:
+   * trên sheet thật, 1.176,00 tiền bù trừ ghi ví bị tính thành chủ tiêu, kéo
+   * sổ chủ xuống âm 1.007,91 trong khi thực tế còn dương 168,09.
+   */
+  const c = flowString_(category).toUpperCase();
+  return c === 'OWNER_DRAW' || c === 'EXPENSE';
+}
+
+
+/************************************************************
  * PAYOUTS — ROW ACTUALLY HAS A PAYOUT
  *
  * Important:
@@ -1237,13 +1676,15 @@ function flowSyncPayoutsToTransaction_(
   h,
   providerMaps,
   state,
-  th
+  th,
+  settlementStatusMap
 ) {
 
   let paid = 0;
   let draft = 0;
   let cancelled = 0;
   let invalid = 0;
+  let blocked = 0;
 
 
   /**********************************************************
@@ -1701,6 +2142,123 @@ function flowSyncPayoutsToTransaction_(
 
 
       /********************************************************
+       * SETTLEMENT VALIDATION
+       *
+       * Everything past the check above is PAID, so this is the last gate
+       * before real treasury money moves. A payout is only as real as the
+       * invoice behind it: CREATING means a create that never finished,
+       * FAILED and CANCELLED never happened at all.
+       *
+       * Skipped entirely when there is no Settlements sheet, so Flow still
+       * runs standalone on a workbook without the Customer module.
+       ********************************************************/
+
+      if (settlementStatusMap) {
+
+        const settlementKey =
+          h['Settlement Key']
+            ? flowCell_(
+                row,
+                h,
+                'Settlement Key'
+              )
+            : '';
+
+
+        const category =
+          flowCell_(
+            row,
+            h,
+            'Category'
+          )
+            .toUpperCase();
+
+
+        let blockReason = '';
+
+
+        /*
+         * CUSTOMER_PAYOUT is only ever written by the invoice engine, always
+         * with a Settlement Key. A blank key means the row was edited by hand,
+         * which is exactly how someone would route around this guard.
+         */
+        if (
+          !settlementKey &&
+          category ===
+            'CUSTOMER_PAYOUT'
+        ) {
+
+          blockReason =
+            'MISSING SETTLEMENT';
+
+        } else if (
+          settlementKey &&
+          !flowIsEffectiveSettlementStatus_(
+            settlementStatusMap[
+              settlementKey
+            ]
+          )
+        ) {
+
+          blockReason =
+            'SETTLEMENT NOT EFFECTIVE (' +
+            (
+              settlementStatusMap[
+                settlementKey
+              ] ||
+              'MISSING'
+            ) +
+            ')';
+
+        }
+
+
+        if (blockReason) {
+
+          row[
+            h['Validation']
+          ] =
+            blockReason;
+
+
+          /*
+           * An existing transaction already marked PAID records money that
+           * really left. Leave it counted so a mistaken edit to
+           * Settlement.Status cannot inflate the treasury balance; the
+           * Validation cell is what tells a human to look.
+           */
+          const alreadyPaidOut =
+            existingTx &&
+            flowCell_(
+              existingTx,
+              th,
+              'Reconcile Status'
+            )
+              .toUpperCase() ===
+              'PAID';
+
+
+          if (!alreadyPaidOut) {
+
+            flowSetExistingPayoutTxState_(
+              existingTx,
+              th,
+              'INVALID'
+            );
+
+          }
+
+
+          blocked++;
+
+          return;
+
+        }
+
+      }
+
+
+      /********************************************************
        * PROVIDER VALIDATION
        ********************************************************/
 
@@ -2072,7 +2630,10 @@ function flowSyncPayoutsToTransaction_(
       cancelled,
 
     invalid:
-      invalid
+      invalid,
+
+    blocked:
+      blocked
 
   };
 
@@ -2082,6 +2643,446 @@ function flowSyncPayoutsToTransaction_(
 /************************************************************
  * EXISTING PAYOUT TX STATUS
  ************************************************************/
+
+/************************************************************
+ * MANUAL IN -> TRANSACTION
+ *
+ * Đối xứng với Payouts nhưng chỉ một chiều: tiền RA đã có Payouts lo, sheet
+ * này chỉ nhận tiền VÀO. Không trùng vai, nên không có chuyện một khoản được
+ * ghi ở hai nơi.
+ *
+ * Không có trạng thái DRAFT: tiền đã nằm trong ví rồi, không có giai đoạn "dự
+ * định" như một lệnh chi. Gõ nhầm thì đổi sang CANCELLED — dòng transaction
+ * tương ứng bị đánh dấu chứ không xoá, để còn dấu vết.
+ ************************************************************/
+
+function flowSyncManualInToTransaction_(
+  rows,
+  h,
+  providerMaps,
+  state,
+  th
+) {
+
+  const required = [
+    'Entry Key',
+    'Date',
+    'Provider',
+    'Account Key',
+    'Amount',
+    'Status'
+  ];
+
+
+  for (
+    let i = 0;
+    i < required.length;
+    i++
+  ) {
+
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        h,
+        required[i]
+      )
+    ) {
+
+      Logger.log(
+        'Manual In: thiếu cột "' + required[i] +
+        '", bỏ qua sheet này. Header phải nằm ở hàng ' +
+        FLOW_CFG.HEADER_ROW + ' và viết đúng từng ký tự.'
+      );
+
+      return {
+        confirmed: 0,
+        cancelled: 0,
+        invalid: 0
+      };
+
+    }
+
+  }
+
+
+  /********************************************************
+   * CẤP KHOÁ
+   ********************************************************/
+
+  let maxKeyNumber = 0;
+
+
+  rows.forEach(
+    row => {
+
+      const match =
+        flowCell_(row, h, 'Entry Key')
+          .match(/^ME-(\d+)$/i);
+
+
+      if (match) {
+
+        maxKeyNumber =
+          Math.max(
+            maxKeyNumber,
+            Number(match[1])
+          );
+
+      }
+
+    }
+  );
+
+
+  let confirmed = 0;
+  let cancelled = 0;
+  let invalid = 0;
+
+
+  rows.forEach(
+    row => {
+
+      /*
+       * Dòng chỉ có giá trị dropdown mặc định thì chưa phải dòng thật.
+       */
+      if (
+        !flowManualInRowHasInput_(row, h)
+      ) {
+        return;
+      }
+
+
+      let entryKey =
+        flowCell_(row, h, 'Entry Key');
+
+
+      if (!entryKey) {
+
+        maxKeyNumber++;
+
+        entryKey =
+          'ME-' +
+          String(maxKeyNumber).padStart(6, '0');
+
+
+        row[h['Entry Key']] = entryKey;
+
+      }
+
+
+      if (
+        h['Created At'] &&
+        !row[h['Created At']]
+      ) {
+        row[h['Created At']] = new Date();
+      }
+
+
+      const uniqueKey =
+        'MANUAL|' + entryKey;
+
+
+      const existingTx =
+        flowFindTransactionByUnique_(
+          state,
+          uniqueKey
+        );
+
+
+      const fail = reason => {
+
+        if (h['Validation']) {
+          row[h['Validation']] = reason;
+        }
+
+        flowSetExistingPayoutTxState_(
+          existingTx,
+          th,
+          'INVALID'
+        );
+
+        invalid++;
+
+      };
+
+
+      const provider =
+        flowCell_(row, h, 'Provider')
+          .toUpperCase();
+
+
+      if (provider) {
+        row[h['Provider']] = provider;
+      }
+
+
+      const status =
+        flowCell_(row, h, 'Status')
+          .toUpperCase();
+
+
+      /********************************************************
+       * CANCELLED
+       *
+       * Giữ dòng, huỷ tác dụng. flowTransactionCounts_ loại nó khỏi mọi số dư.
+       ********************************************************/
+
+      if (status === 'CANCELLED') {
+
+        if (h['Validation']) {
+          row[h['Validation']] = 'CANCELLED';
+        }
+
+        flowSetExistingPayoutTxState_(
+          existingTx,
+          th,
+          'CANCELLED'
+        );
+
+        cancelled++;
+
+        return;
+
+      }
+
+
+      if (status !== 'CONFIRMED') {
+
+        fail(
+          status
+            ? 'INVALID STATUS'
+            : 'MISSING STATUS'
+        );
+
+        return;
+
+      }
+
+
+      if (
+        provider !== 'USDT' &&
+        provider !== 'PINGPONG'
+      ) {
+
+        fail(
+          provider
+            ? 'INVALID PROVIDER'
+            : 'MISSING PROVIDER'
+        );
+
+        return;
+
+      }
+
+
+      const accountKey =
+        flowCell_(row, h, 'Account Key');
+
+
+      if (!accountKey) {
+        fail('MISSING ACCOUNT');
+        return;
+      }
+
+
+      const account =
+        (
+          providerMaps[provider] ||
+          {}
+        )[accountKey];
+
+
+      if (!account) {
+        fail('ACCOUNT NOT FOUND');
+        return;
+      }
+
+
+      if (account.status === 'DISABLED') {
+        fail('ACCOUNT DISABLED');
+        return;
+      }
+
+
+      const amount =
+        flowNullableNumber_(
+          row[h['Amount']]
+        );
+
+
+      if (
+        amount === null ||
+        amount <= 0
+      ) {
+        fail('INVALID AMOUNT');
+        return;
+      }
+
+
+      /*
+       * Không có ngày thì lấy hôm nay, giống cách Payouts xử lý — thiếu ngày
+       * không đáng để chặn một khoản tiền đã thật sự vào ví.
+       */
+      let date =
+        flowDate_(row[h['Date']]);
+
+
+      if (!date) {
+        date = new Date();
+        row[h['Date']] = date;
+      }
+
+
+      const currency =
+        flowPayoutCurrencyForProvider_(provider);
+
+
+      if (h['Currency']) {
+        row[h['Currency']] = currency;
+      }
+
+
+      const transactionKey =
+        'MITX|' + entryKey;
+
+
+      flowUpsertTransaction_(
+        state,
+        th,
+        {
+
+          'Transaction Key':
+            transactionKey,
+
+          'Transaction Date':
+            date,
+
+          'Provider':
+            provider,
+
+          'Account Key':
+            accountKey,
+
+          'Label':
+            account.label ||
+            accountKey,
+
+          /*
+           * Type riêng, KHÔNG dùng lại USDT_RECEIVED: khoản này không đến từ
+           * Grey, và tổng trên sheet USDT tách "từ PayPal" với "nhận thêm"
+           * đúng bằng cách nhìn vào Type này.
+           */
+          'Type':
+            'MANUAL_IN',
+
+          'Direction':
+            'IN',
+
+          'Gross Amount':
+            amount,
+
+          'Net Amount':
+            amount,
+
+          'Fee Amount':
+            0,
+
+          'Currency':
+            currency,
+
+          'Reference':
+            flowCell_(row, h, 'From'),
+
+          'Counterparty Provider':
+            '',
+
+          'Counterparty Account Key':
+            '',
+
+          'Reconcile Status':
+            'ARRIVED',
+
+          'Matched Transaction Key':
+            '',
+
+          'Source':
+            'MANUAL IN',
+
+          'Source ID':
+            entryKey,
+
+          'Sync Time':
+            new Date(),
+
+          'Unique Key':
+            uniqueKey
+
+        }
+      );
+
+
+      if (h['Transaction Key']) {
+        row[h['Transaction Key']] = transactionKey;
+      }
+
+
+      if (h['Validation']) {
+        row[h['Validation']] = 'OK';
+      }
+
+
+      confirmed++;
+
+    }
+  );
+
+
+  Logger.log(
+    'Manual In: ' + confirmed + ' confirmed · ' +
+    cancelled + ' cancelled · ' + invalid + ' invalid'
+  );
+
+
+  return {
+    confirmed: confirmed,
+    cancelled: cancelled,
+    invalid: invalid
+  };
+
+}
+
+
+/*
+ * Provider/Status có thể là giá trị dropdown mặc định trên một dòng trống, nên
+ * riêng chúng không đủ để coi dòng là có dữ liệu — giống hệt lý do bên Payouts.
+ */
+function flowManualInRowHasInput_(
+  row,
+  h
+) {
+
+  return [
+    'Entry Key',
+    'Date',
+    'Account Key',
+    'Amount',
+    'From',
+    'Note',
+    'Transaction Key'
+  ].some(
+    header =>
+
+      Object.prototype.hasOwnProperty.call(
+        h,
+        header
+      ) &&
+
+      flowString_(
+        row[h[header]]
+      ) !== ''
+  );
+
+}
+
 
 function flowSetExistingPayoutTxState_(
   tx,
@@ -2681,14 +3682,29 @@ function flowPaypalType_(
 
     T0114: 'DISPUTE_FEE',
 
+    T0200: 'CURRENCY_CONVERSION',
+
     T0400: 'BANK_WITHDRAWAL',
     T0401: 'BANK_WITHDRAWAL',
     T0403: 'BANK_WITHDRAWAL',
 
+    /*
+     * T1101 là dòng PayPal ghi khi trả lại một khoản đã đi ra — gặp thực
+     * tế với khoản rút bị từ chối: cùng Transaction ID, ngược dấu, Status
+     * DENIED, còn dòng rút gốc vẫn nguyên PENDING. PASS 2 dựa vào cặp đó.
+     */
+    T1101: 'REVERSAL',
+
+    T1105: 'HOLD_RELEASE',
     T1106: 'PAYMENT_REVERSAL',
     T1107: 'PAYMENT_REFUND',
 
-    T1111: 'DISPUTE_HOLD_RELEASE'
+    T1110: 'HOLD',
+    T1111: 'DISPUTE_HOLD_RELEASE',
+
+    T1201: 'CHARGEBACK',
+
+    T1501: 'HOLD'
 
   };
 
@@ -2789,6 +3805,13 @@ function flowSyncPaypalToTransaction_(
   const withdrawalIds = {};
 
 
+  /*
+   * Số tiền của từng khoản rút, để PASS 2 đối chiếu được khi dòng trả về
+   * nối bằng Transaction ID chung thay vì bằng Reference ID.
+   */
+  const withdrawalAmounts = {};
+
+
   /**********************************************************
    * PASS 1 — WITHDRAWALS
    **********************************************************/
@@ -2857,6 +3880,22 @@ function flowSyncPaypalToTransaction_(
         transactionId
       ] =
         true;
+
+
+      withdrawalAmounts[
+        accountKey +
+        '|' +
+        transactionId
+      ] =
+        flowRoundMoney_(
+          Math.abs(
+            flowNumber_(
+              row[
+                ph['Transaction Amount']
+              ]
+            )
+          )
+        );
 
 
       const account =
@@ -3114,20 +4153,59 @@ function flowSyncPaypalToTransaction_(
 
       if (
         !accountKey ||
-        !transactionId ||
-        !referenceId
+        !transactionId
       ) {
         return;
       }
 
 
+      /*
+       * PayPal nối dòng trả về với khoản rút theo HAI cách khác nhau:
+       *
+       *   1. Reference ID trỏ tới Transaction ID của khoản rút.
+       *
+       *   2. Dòng trả về dùng CHÍNH Transaction ID của khoản rút và bỏ
+       *      trống Reference ID. Gặp thực tế với T1101: khoản rút và dòng
+       *      trả về chung một Transaction ID, chỉ khác Event Code, và
+       *      PayPal KHÔNG lật trạng thái dòng rút gốc — nó vẫn là PENDING.
+       *
+       * Chỉ có nhánh 1 thì khoản rút bị trả về nằm IN_TRANSIT vĩnh viễn:
+       * nó vẫn giữ chỗ nguồn của khách nên tiền đó không bao giờ phân bổ
+       * lại được cho lần rút sau, mà cũng không ai hay biết.
+       *
+       * Nhánh 2 mới nên siết chặt hơn nhánh 1: đòi số tiền khớp đúng
+       * khoản rút. Cùng Transaction ID, ngược dấu, cùng số tiền thì gần
+       * như không thể là thứ gì khác.
+       */
+      let linkedId = '';
+      let linkedBySharedId = false;
+
       if (
-        !withdrawalIds[
+        referenceId &&
+        withdrawalIds[
           accountKey +
           '|' +
           referenceId
         ]
       ) {
+
+        linkedId = referenceId;
+
+      } else if (
+        withdrawalIds[
+          accountKey +
+          '|' +
+          transactionId
+        ]
+      ) {
+
+        linkedId = transactionId;
+        linkedBySharedId = true;
+
+      }
+
+
+      if (!linkedId) {
         return;
       }
 
@@ -3167,6 +4245,38 @@ function flowSyncPaypalToTransaction_(
         amount <= 0
       ) {
         return;
+      }
+
+
+      /*
+       * Siết nhánh Transaction ID chung: chỉ nhận khi số tiền khớp đúng
+       * khoản rút. Nhánh Reference ID cũ giữ nguyên, không siết thêm, để
+       * không đổi cách đọc dữ liệu lịch sử.
+       */
+      if (
+        linkedBySharedId &&
+        !flowAmountEqual_(
+          withdrawalAmounts[
+            accountKey +
+            '|' +
+            linkedId
+          ],
+          amount
+        )
+      ) {
+        return;
+      }
+
+
+      if (linkedBySharedId) {
+
+        Logger.log(
+          '  ↩ trả về khoản rút (Transaction ID chung) · ' +
+          accountKey + ' ' + transactionId +
+          ' · ' + eventCode +
+          ' · ' + flowRoundMoney_(amount).toFixed(2)
+        );
+
       }
 
 
@@ -3237,8 +4347,14 @@ function flowSyncPaypalToTransaction_(
             )
               .toUpperCase(),
 
+          /*
+           * Matcher ghép chính xác bằng Reference của khoản rút, mà khoản
+           * rút lấy Transaction ID của nó làm Reference. Nên phải ghi
+           * linkedId chứ không phải referenceId — nhánh Transaction ID
+           * chung có referenceId rỗng.
+           */
           'Reference':
-            referenceId,
+            linkedId,
 
           'Counterparty Provider':
             '',
@@ -4844,6 +5960,28 @@ function flowFinalizePaypalStatus_(
       }
 
 
+      /*
+       * Đã khai đích đến nhưng reconcile không biết provider đó. Không được để
+       * rơi vào IN_TRANSIT/OVERDUE: hai trạng thái đó nói rằng tiền đang trên
+       * đường về và sẽ tự khớp, trong khi thực tế không có ai đi đón. Nó sẽ
+       * nằm OVERDUE vĩnh viễn mà không ai biết tại sao.
+       */
+      if (
+        FLOW_CFG.RECEIVING_PROVIDERS.indexOf(
+          destinationProvider.toUpperCase()
+        ) === -1
+      ) {
+
+        row[
+          h['Reconcile Status']
+        ] =
+          'UNSUPPORTED_PROVIDER';
+
+        return;
+
+      }
+
+
       const date =
         flowMillis_(
           row[
@@ -4873,6 +6011,122 @@ function flowFinalizePaypalStatus_(
  * WHETHER TX COUNTS IN BALANCE
  ************************************************************/
 
+/************************************************************
+ * SETTLEMENT STATUS (READ-ONLY)
+ *
+ * Flow reads the Settlements sheet itself rather than calling into
+ * Customer.gs. A guard must not depend on the runtime behaviour of the very
+ * layer it is guarding: the Customer sweeper only cancels DRAFT payouts, so it
+ * cannot be the last line of defence for real treasury movement.
+ *
+ * Returns null when there is no usable Settlements sheet, which tells the
+ * caller to skip the guard entirely and behave exactly as before.
+ ************************************************************/
+
+function flowReadSettlementStatusMap_(
+  ss
+) {
+
+  const sheet =
+    flowOptionalSheet_(
+      ss,
+      FLOW_CFG.SETTLEMENTS_SHEET
+    );
+
+
+  if (!sheet) {
+    return null;
+  }
+
+
+  const h =
+    flowHeaderMap_(
+      sheet
+    );
+
+
+  if (
+    !h['Settlement Key'] ||
+    !h['Status']
+  ) {
+    return null;
+  }
+
+
+  const map = {};
+
+
+  flowReadRows_(
+    sheet
+  ).forEach(
+    row => {
+
+      const key =
+        flowCell_(
+          row,
+          h,
+          'Settlement Key'
+        );
+
+
+      if (!key) {
+        return;
+      }
+
+
+      map[key] =
+        flowCell_(
+          row,
+          h,
+          'Status'
+        )
+          .toUpperCase();
+
+    }
+  );
+
+
+  return map;
+
+}
+
+
+/*
+ * Settlement status is owned by Customer.gs. Defer to its helper so the list of
+ * real-invoice statuses lives in exactly one place, and fall back to the same
+ * three only if that file is somehow unavailable.
+ */
+function flowIsEffectiveSettlementStatus_(
+  status
+) {
+
+  if (
+    typeof custIsEffectiveSettlementStatus_ ===
+    'function'
+  ) {
+
+    return custIsEffectiveSettlementStatus_(
+      status
+    );
+
+  }
+
+
+  const s =
+    String(status || '')
+      .trim()
+      .toUpperCase();
+
+
+  return (
+    s === 'ISSUED' ||
+    s === 'PARTIALLY_PAID' ||
+    s === 'PAID'
+  );
+
+}
+
+
 function flowTransactionCounts_(
   row,
   h
@@ -4885,6 +6139,33 @@ function flowTransactionCounts_(
       'Source'
     )
       .toUpperCase();
+
+
+  /*
+   * Manual In: chỉ đếm khi còn hiệu lực. Dòng bị huỷ vẫn nằm lại trong
+   * Transaction để giữ dấu vết, nên phải loại ở đây — không thì một khoản đã
+   * huỷ vẫn cộng vào số dư mãi mãi.
+   */
+  if (
+    source ===
+    'MANUAL IN'
+  ) {
+
+    const state =
+      flowCell_(
+        row,
+        h,
+        'Reconcile Status'
+      )
+        .toUpperCase();
+
+
+    return (
+      state !== 'CANCELLED' &&
+      state !== 'INVALID'
+    );
+
+  }
 
 
   /*
@@ -5292,6 +6573,23 @@ function flowUpdateUsdtSummary_(
   const rows =
     flowReadRows_(sheet);
 
+  /*
+   * Tổng toàn hệ thống, cộng qua mọi ví.
+   *
+   * Con số theo từng ví trả lời "đường ống đã giao về ví nào", và nó sai ngay
+   * khi tiền bị xáo giữa các ví — việc hệ thống không có cách nào nhìn thấy.
+   * Tổng thì miễn nhiễm, vì nó không nhìn vào ví nào cả.
+   *
+   * Và nó KHÔNG phải số dư ví thật. Nó là "đường ống PayPal giao về bao nhiêu,
+   * đã chi ra bao nhiêu, còn lại bao nhiêu" — cả hai vế đều suy từ nguồn có
+   * thật, nên đúng tuyệt đối miễn là mọi khoản chi đều có dòng Payouts. Muốn
+   * biết ví thật có bao nhiêu thì mở ví; hệ thống không dùng số đó để quyết
+   * định bất cứ điều gì.
+   */
+  let poolPipeline = 0;
+  let poolManual = 0;
+  let poolWithdrawn = 0;
+
 
   rows.forEach(
     row => {
@@ -5309,7 +6607,13 @@ function flowUpdateUsdtSummary_(
       }
 
 
-      let totalReceived = 0;
+      /*
+       * Tách nguồn tiền vào: MANUAL_IN là khoản gõ tay, còn lại là tiền chảy
+       * qua đường ống PayPal → Grey. Estimated Balance vẫn là tổng của cả hai;
+       * việc tách chỉ để dòng tổng nói được tiền từ đâu tới.
+       */
+      let pipelineReceived = 0;
+      let manualReceived = 0;
       let totalWithdrawn = 0;
 
       let lastActivity = null;
@@ -5373,12 +6677,27 @@ function flowUpdateUsdtSummary_(
             'IN'
           ) {
 
-            totalReceived +=
+            const amount =
               flowNumber_(
                 tx[
                   th['Net Amount']
                 ]
               );
+
+
+            if (
+              flowCell_(
+                tx,
+                th,
+                'Type'
+              )
+                .toUpperCase() ===
+                'MANUAL_IN'
+            ) {
+              manualReceived += amount;
+            } else {
+              pipelineReceived += amount;
+            }
 
           }
 
@@ -5429,6 +6748,12 @@ function flowUpdateUsdtSummary_(
       );
 
 
+      /* Cột này vẫn là TỔNG tiền vào, không phân biệt nguồn. */
+      const totalReceived =
+        pipelineReceived +
+        manualReceived;
+
+
       row[
         uh['Total Received USDT']
       ] =
@@ -5460,6 +6785,11 @@ function flowUpdateUsdtSummary_(
         lastActivity ||
         '';
 
+
+      poolPipeline += pipelineReceived;
+      poolManual += manualReceived;
+      poolWithdrawn += totalWithdrawn;
+
     }
   );
 
@@ -5469,12 +6799,150 @@ function flowUpdateUsdtSummary_(
     rows
   );
 
+
+  flowWriteUsdtPoolTotal_(
+    sheet,
+    poolPipeline,
+    poolManual,
+    poolWithdrawn
+  );
+
+}
+
+
+/*
+ * Hàng 1 là hàng ghi chú theo quy ước của workbook: header ở hàng 2, dữ liệu từ
+ * hàng 3. flowWriteRows_ chỉ đụng từ DATA_START_ROW trở xuống, nên hàng 1 là
+ * chỗ duy nhất ghi được mà không bao giờ bị vòng ghi dữ liệu xoá mất.
+ */
+function flowWriteUsdtPoolTotal_(
+  sheet,
+  pipeline,
+  manual,
+  withdrawn
+) {
+
+  const remaining =
+    flowRoundMoney_(
+      pipeline +
+      manual -
+      withdrawn
+    );
+
+
+  /*
+   * Tách "từ PayPal" và "nhận thêm" thay vì gộp một cục: không tốn gì mà giữ
+   * được con số cũ, nên vẫn biết bao nhiêu là tiền chảy qua đường ống khách
+   * hàng, bao nhiêu đến từ chỗ khác.
+   *
+   * Dòng "nhận thêm" chỉ hiện khi có, để sheet không bị rác khi chưa dùng tới.
+   */
+  sheet
+    .getRange(1, 1)
+    .setValue(
+      'TỔNG USDT TRONG HỆ THỐNG · từ PayPal ' +
+      flowRoundMoney_(pipeline).toFixed(2) +
+      (
+        Math.abs(manual) > 0.0001
+          ? ' · nhận thêm ' +
+            flowRoundMoney_(manual).toFixed(2)
+          : ''
+      ) +
+      ' · đã chi ' +
+      flowRoundMoney_(withdrawn).toFixed(2) +
+      ' · CÒN LẠI ' +
+      remaining.toFixed(2) +
+      '   (chỉ tính phần hệ thống ghi nhận, không phải số dư ví thật)'
+    );
+
 }
 
 
 /************************************************************
  * ACCOUNT MAP
  ************************************************************/
+
+/*
+ * Cột Enabled không nằm trong hợp đồng header của Flow (chỉ Paypal.gs đọc nó),
+ * nên phải kiểm tra sự tồn tại trước: thiếu cột thì coi như account đang bật,
+ * đừng nuốt mất cảnh báo chỉ vì workbook chưa có cột đó.
+ */
+function flowWarnUnsupportedLink_(
+  key,
+  row,
+  h
+) {
+
+  const provider =
+    flowString_(
+      row[
+        h['Provider']
+      ]
+    )
+      .toUpperCase();
+
+
+  if (provider !== 'PAYPAL') {
+    return;
+  }
+
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      h,
+      'Enabled'
+    )
+  ) {
+
+    const enabled =
+      flowString_(
+        row[
+          h['Enabled']
+        ]
+      )
+        .toUpperCase();
+
+
+    if (
+      enabled &&
+      enabled !== 'TRUE' &&
+      enabled !== 'YES' &&
+      enabled !== '1' &&
+      enabled !== 'ACTIVE'
+    ) {
+      return;
+    }
+
+  }
+
+
+  const linked =
+    flowString_(
+      row[
+        h['Linked Provider']
+      ]
+    )
+      .toUpperCase();
+
+
+  if (
+    !linked ||
+    FLOW_CFG.RECEIVING_PROVIDERS.indexOf(linked) !== -1
+  ) {
+    return;
+  }
+
+
+  Logger.log(
+    'CẢNH BÁO: PayPal account "' + key +
+    '" khai Linked Provider = "' + linked +
+    '" mà reconcile chưa hỗ trợ. Withdrawal của nó sẽ mang trạng thái ' +
+    'UNSUPPORTED_PROVIDER và tiền nằm lại Pending in PayPal cho tới khi ' +
+    'có collector cho provider đó.'
+  );
+
+}
+
 
 function flowReadAccountMap_(
   sheet,
@@ -5526,9 +6994,24 @@ function flowReadAccountMap_(
 
         };
 
+
+        /*
+         * Cảnh báo ngay khi vừa cấu hình sai, đừng đợi tới lần rút đầu tiên
+         * rồi mới phát hiện tiền kẹt. Reconcile chỉ biết đường tới các
+         * provider trong FLOW_CFG.RECEIVING_PROVIDERS.
+         *
+         * Chỉ soi account PayPal đang bật: Linked Provider của dòng Grey hay
+         * của account đã tắt không nói lên điều gì về đường rút đang chạy, báo
+         * chúng chỉ tạo nhiễu rồi người ta thôi đọc log.
+         */
+        flowWarnUnsupportedLink_(
+          key,
+          row,
+          h
+        );
+
       }
     );
-
 
   return result;
 
@@ -6652,6 +8135,16 @@ function flowNumber_(
  * NULLABLE NUMBER
  ************************************************************/
 
+/*
+ * Không dùng instanceof: nó so theo constructor của từng realm, nên hỏng khi
+ * chạy trong sandbox test — và một phép kiểm mà test không xác minh được thì
+ * chẳng bảo vệ được gì. toString đúng ở mọi realm.
+ */
+function flowIsDate_(value) {
+  return Object.prototype.toString.call(value) === '[object Date]';
+}
+
+
 function flowNullableNumber_(
   value
 ) {
@@ -6665,6 +8158,16 @@ function flowNullableNumber_(
       ? null
       : value;
 
+  }
+
+
+  /*
+   * Ngày tháng không phải số tiền. Ô định dạng kiểu ngày chứa số 0 sẽ về đây
+   * dưới dạng Date, và bóc chữ số khỏi chuỗi ngày cho ra rác. null nghĩa là
+   * "không có giá trị", đúng hơn hẳn một con số bịa.
+   */
+  if (flowIsDate_(value)) {
+    return null;
   }
 
 

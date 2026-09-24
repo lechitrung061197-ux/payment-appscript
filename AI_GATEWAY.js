@@ -14,6 +14,7 @@
  *   - sync both
  *   - invoice preview
  *   - generate/regenerate invoice PDF
+ *   - create a DRAFT manual payout (an intention; only a human can set it PAID)
  *
  * PROTECTED actions (PIN required; PIN is NEVER sent to OpenAI):
  *   - create invoice
@@ -167,20 +168,29 @@ function payAiToolDefinitions_() {
     {
       type: 'function',
       name: 'run_safe_action',
-      description: 'Run an approved non-destructive operational action. Invoice preview is safe. PDF generation changes PDF metadata only. Use empty strings for parameters not used by the selected action.',
+      description: 'Run an approved non-destructive operational action. Invoice preview is safe. PDF generation changes PDF metadata only. create_manual_payout writes a DRAFT payout row for money the owner is about to spend from a treasury account: it is an intention, not a payment — no balance changes and no transaction exists until the owner sets Status to PAID by hand. Use empty strings and 0 for parameters not used by the selected action.',
       strict: true,
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['sync_flow','sync_customers','sync_both','preview_invoice','generate_invoice_pdf','validate_customer_system'] },
+          action: { type: 'string', enum: ['sync_flow','sync_customers','sync_both','preview_invoice','generate_invoice_pdf','validate_customer_system','create_manual_payout'] },
           customer_key: { type: 'string' },
           from_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty when unused.' },
           to_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty when unused.' },
           as_of_date: { type: 'string', description: 'YYYY-MM-DD or DD/MM/YYYY; empty means today for preview.' },
           settlement_key: { type: 'string' },
-          force: { type: 'boolean' }
+          force: { type: 'boolean' },
+          advance_amount: { type: 'number', description: 'preview_invoice only: money to advance to the customer on this invoice, on top of what they earned. It increases Amount Due now and is recovered from later invoices. Use 0 for a normal invoice.' },
+          advance_note: { type: 'string', description: 'preview_invoice only: why the advance is being given. Empty otherwise.' },
+          provider: { type: 'string', description: 'create_manual_payout only: USDT or PINGPONG. Empty otherwise.' },
+          account_key: { type: 'string', description: 'create_manual_payout only: which treasury account the money will leave, e.g. USDT1. Must already exist and not be disabled. Empty otherwise.' },
+          amount: { type: 'number', description: 'create_manual_payout only: amount to pay out, greater than 0. Use 0 otherwise.' },
+          fee: { type: 'number', description: 'create_manual_payout only: known fee, 0 if none.' },
+          payee: { type: 'string', description: 'create_manual_payout only: who or what is being paid. Empty otherwise.' },
+          category: { type: 'string', description: 'create_manual_payout only: OWNER_DRAW (the owner taking their own service-fee earnings), EXPENSE, REFUND, TRANSFER, ADJUSTMENT or OTHER. Never CUSTOMER_PAYOUT — invoices own that. Empty otherwise.' },
+          note: { type: 'string', description: 'create_manual_payout only: what this payment is for, in the owner\'s own words. Empty otherwise.' }
         },
-        required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force'],
+        required: ['action','customer_key','from_date','to_date','as_of_date','settlement_key','force','advance_amount','advance_note','provider','account_key','amount','fee','payee','category','note'],
         additionalProperties: false
       }
     },
@@ -197,9 +207,11 @@ function payAiToolDefinitions_() {
           from_date: { type: 'string' },
           to_date: { type: 'string' },
           as_of_date: { type: 'string' },
+          advance_amount: { type: 'number', description: 'create_invoice only: money to advance to the customer on this invoice, recovered from later invoices. Use 0 unless the owner explicitly asked for an advance.' },
+          advance_note: { type: 'string', description: 'create_invoice only: why the advance is being given. Empty otherwise.' },
           payout_fee_percent: { type: 'number', minimum: 0, maximum: 100 }
         },
-        required: ['action','customer_key','from_date','to_date','as_of_date','payout_fee_percent'],
+        required: ['action','customer_key','from_date','to_date','as_of_date','advance_amount','advance_note','payout_fee_percent'],
         additionalProperties: false
       }
     }
@@ -568,9 +580,8 @@ function payAiRunSafeAction_(args) {
   }
 
   if (action === 'preview_invoice') {
-    payAiRequireFunction_('previewCustomerInvoiceFromControl');
-    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
-    const preview = previewCustomerInvoiceFromControl();
+    payAiRequireFunction_('previewCustomerInvoice');
+    const preview = previewCustomerInvoice(payAiInvoiceParamsFromArgs_(args));
     return payAiSummarizePreview_(preview);
   }
 
@@ -586,31 +597,208 @@ function payAiRunSafeAction_(args) {
     return { action: action, result: payAiJsonSafe_(validateCustomerSystem()) };
   }
 
+  if (action === 'create_manual_payout') {
+    return payAiCreateManualPayout_(args);
+  }
+
   throw new Error('Unsupported safe action: ' + action);
 }
 
-function payAiSetInvoiceControl_(customerKey, fromDate, toDate, asOfDate) {
-  const ss = payAiActivateSpreadsheet_();
-  const sh = ss.getSheetByName('Invoice Control');
-  if (!sh) throw new Error('Missing Invoice Control sheet.');
 
-  const from = payAiParseDateInput_(fromDate);
-  const to = payAiParseDateInput_(toDate);
-  const asOf = asOfDate ? payAiParseDateInput_(asOfDate) : new Date();
-  if (!from || !to) throw new Error('from_date and to_date are required (YYYY-MM-DD or DD/MM/YYYY).');
+/************************* MANUAL PAYOUT *************************/
 
-  sh.getRange('B3').setValue('INVOICE PREVIEW');
-  sh.getRange('B4').setValue(String(customerKey || '').trim().toUpperCase());
-  sh.getRange('B5').setValue(from).setNumberFormat('dd/MM/yyyy');
-  sh.getRange('B6').setValue(to).setNumberFormat('dd/MM/yyyy');
-  sh.getRange('B7').setValue(asOf).setNumberFormat('dd/MM/yyyy');
+/*
+ * Chỉ những loại này. CUSTOMER_PAYOUT cố tình vắng mặt: đó là lãnh địa của
+ * engine hoá đơn, nơi mỗi đồng phải truy được về allocation đã tiêu. Một dòng
+ * tay đội lốt payout khách sẽ trốn được cổng settlement của Flow.
+ *
+ * Danh sách gốc nằm ở flowPayoutManualCategories_ trong Flow.gs, dùng chung
+ * với dropdown trên sheet. Đọc qua HÀM chứ không giữ một bản sao: hai danh
+ * sách rời nhau thì sớm muộn cũng lệch, và lệch ở đây nghĩa là AI ghi được
+ * giá trị mà dropdown không cho phép.
+ */
+function payAiManualCategories_() {
+  return flowPayoutManualCategories_();
+}
+
+
+/*
+ * Lệnh chi viết tay, luôn dừng ở DRAFT.
+ *
+ * Vì sao không cần PIN: DRAFT không phải giao dịch, nó là ý định. Flow loại
+ * DRAFT khỏi mọi số dư (flowTransactionCounts_), và không có transaction nào
+ * được sinh ra cho tới khi có người đổi Status thành PAID trong sheet. Nên thứ
+ * hàm này tạo ra là một tờ giấy chờ ký, không phải tiền rời đi.
+ *
+ * Điều đó chỉ đúng chừng nào các bất biến dưới đây còn nguyên. Chúng không
+ * phải kiểm tra phòng hờ — chúng là toàn bộ lý do action này được xếp loại an
+ * toàn. Ai đó thêm đường cho AI ghi Status khác DRAFT là phá vỡ lập luận này.
+ */
+function payAiCreateManualPayout_(args) {
+  const ss = payAiSpreadsheet_();
+  payAiActivateSpreadsheet_();
+
+  const provider = String(args.provider || '').trim().toUpperCase();
+  if (provider !== 'USDT' && provider !== 'PINGPONG') {
+    throw new Error('provider must be USDT or PINGPONG (Flow only settles those). Got: ' + (provider || '(empty)'));
+  }
+
+  const category = String(args.category || 'EXPENSE').trim().toUpperCase();
+  if (category === 'CUSTOMER_PAYOUT') {
+    throw new Error('CUSTOMER_PAYOUT belongs to the invoice engine. Create an invoice instead; a manual row cannot carry a settlement.');
+  }
+  if (payAiManualCategories_().indexOf(category) === -1) {
+    throw new Error('category must be one of: ' + payAiManualCategories_().join(', ') + '. Got: ' + category);
+  }
+
+  const amount = payAiToNumber_(args.amount);
+  if (amount === null || !(amount > 0)) throw new Error('amount must be greater than 0.');
+
+  const feeRaw = payAiToNumber_(args.fee);
+  const fee = feeRaw === null ? 0 : feeRaw;
+  if (fee < 0) throw new Error('fee cannot be negative.');
+
+  const payee = String(args.payee || '').trim();
+  if (!payee) throw new Error('payee is required: say who or what is being paid.');
+
+  const note = String(args.note || '').trim();
+  if (!note) throw new Error('note is required: say what this payment is for.');
+
+  /*
+   * Tài khoản phải có thật và đang bật. Kiểm ở đây để hỏng thì hỏng ngay lúc
+   * hỏi, thay vì đẻ ra một dòng mà lần sync sau mới dán nhãn ACCOUNT NOT FOUND
+   * rồi nằm đó chờ ai đó tình cờ nhìn thấy.
+   */
+  const accountKey = String(args.account_key || '').trim().toUpperCase();
+  if (!accountKey) throw new Error('account_key is required: which treasury account does the money leave from?');
+  const known = payAiTreasuryAccountKeys_(ss, provider);
+  if (known.indexOf(accountKey) === -1) {
+    throw new Error('Account not found or disabled on the ' + provider + ' sheet: ' + accountKey +
+      '. Enabled accounts: ' + (known.length ? known.join(', ') : '(none)'));
+  }
+
+  const sh = ss.getSheetByName('Payouts');
+  if (!sh) throw new Error('Missing Payouts sheet.');
+  if (typeof custHeaderMap_ !== 'function' || typeof custWritePayoutDraftRow_ !== 'function' ||
+      typeof custNextKey_ !== 'function') {
+    throw new Error('Customer module is not loaded; manual payout needs its Payouts helpers.');
+  }
+  const h = custHeaderMap_(sh);
+  ['Payout Key','Provider','Account Key','Payee','Category','Amount','Fee','Currency','Status','Note']
+    .forEach(function(k) { if (!h[k]) throw new Error('Payouts sheet missing header: ' + k); });
+
+  const now = new Date();
+  const payoutKey = custNextKey_(sh, h, 'Payout Key', 'PO-', 6);
+  const currency = provider === 'USDT' ? 'USDT' : 'USD';
+
+  const obj = {
+    'Payout Key': payoutKey,
+    'Payout Date': '',
+    'Provider': provider,
+    'Account Key': accountKey,
+    'Payee': payee,
+    'Category': category,
+    'Amount': amount,
+    'Fee': fee,
+    'Total Deducted': payAiRound_(amount + fee, 2),
+    'Currency': currency,
+    'Reference': '',
+    /* Bất biến 1: không bao giờ là gì khác DRAFT. */
+    'Status': 'DRAFT',
+    'Validation': 'DRAFT',
+    'Transaction Key': '',
+    'Created At': now,
+    'Paid At': '',
+    'Note': note + ' | MANUAL VIA AI ' + Utilities.formatDate(now, 'Asia/Ho_Chi_Minh', 'yyyy-MM-dd HH:mm'),
+    /* Bất biến 2: không đội lốt được payout khách. */
+    'Customer Key': '',
+    'Settlement Key': ''
+  };
+
+  const row = custWritePayoutDraftRow_(ss, sh, h, obj);
   SpreadsheetApp.flush();
+
+  /*
+   * Cố tình KHÔNG tạo dòng Transaction. Flow sở hữu sheet đó và sẽ dựng
+   * POTX|<payoutKey> đúng cách vào lúc Status thành PAID. Viết trước một dòng
+   * DRAFT ở đây là đoán trước ngữ nghĩa của Flow cho một khoản chi mà nó chưa
+   * từng thấy.
+   */
+  return {
+    action: 'create_manual_payout',
+    payout_key: payoutKey,
+    row: row,
+    provider: provider,
+    account_key: accountKey,
+    payee: payee,
+    category: category,
+    amount: amount,
+    fee: fee,
+    total_deducted: obj['Total Deducted'],
+    currency: currency,
+    status: 'DRAFT',
+    message: 'DRAFT payout ' + payoutKey + ' created on row ' + row + '. Nothing has moved and no balance changed: ' +
+      'it stays an intention until the owner sets Status to PAID on the Payouts sheet. ' +
+      'Report the payout key and say plainly that it is still DRAFT.'
+  };
+}
+
+
+/*
+ * Khoá tài khoản đang bật của một provider chi tiền. Sheet Pingpong viết hoa
+ * kiểu khác USDT, nên tra tên sheet chứ đừng suy ra từ tên provider.
+ */
+function payAiTreasuryAccountKeys_(ss, provider) {
+  const sheetName = provider === 'USDT' ? 'USDT' : (provider === 'PINGPONG' ? 'Pingpong' : '');
+  const sh = sheetName ? ss.getSheetByName(sheetName) : null;
+  if (!sh) return [];
+
+  const map = payAiHeaderMap_(sh);
+  if (!map['Account Key']) return [];
+
+  const out = [];
+  payAiReadObjects_(sh, map).forEach(function(r) {
+    const key = String(r['Account Key'] || '').trim().toUpperCase();
+    const status = map['Status'] ? String(r['Status'] || '').trim().toUpperCase() : '';
+    if (key && status !== 'DISABLED') out.push(key);
+  });
+  return out;
+}
+
+function payAiInvoiceParamsFromArgs_(args) {
+  const out = {
+    customer_key: String(args.customer_key || '').trim().toUpperCase(),
+    from_date: String(args.from_date || '').trim(),
+    to_date: String(args.to_date || '').trim(),
+    as_of_date: String(args.as_of_date || '').trim()
+  };
+
+  /*
+   * Chỉ gắn khi thật sự có số. Để advance_amount = 0 lọt vào cũng vô hại, nhưng
+   * bỏ hẳn thì các đường gọi cũ giữ nguyên hình dạng params như trước.
+   *
+   * Số này đi thẳng vào fingerprint bên Customer.gs, nên preview và create bắt
+   * buộc thấy cùng một con số — không có cách nào duyệt 0 rồi tạo 1000.
+   */
+  const advance = payAiToNumber_(args.advance_amount);
+  if (advance !== null && advance > 0) {
+    out.advance_amount = advance;
+    out.advance_note = String(args.advance_note || '').trim();
+  }
+
+  return out;
 }
 
 function payAiSummarizePreview_(p) {
   if (!p) return { action: 'preview_invoice', message: 'Preview completed.', preview: null };
   return {
     action: 'preview_invoice',
+    /*
+     * Dấu vân tay của chính bộ số dưới đây. Nó đi kèm ra tới Telegram và được
+     * cất vào pending action, để lúc gõ PIN còn có thứ mà đối chiếu: cái được
+     * tạo phải đúng là cái người ta đã nhìn.
+     */
+    fingerprint: p.fingerprint,
     customer_key: p.customer && p.customer.customerKey,
     customer_name: p.customer && p.customer.customerName,
     period_from: p.params && p.params.fromKey,
@@ -637,6 +825,10 @@ function payAiSummarizePreview_(p) {
     carry_forward_amount: p.carryForwardAmount,
     late_refund_applied: p.lateRefundApplied,
     late_refund_carry_forward: p.lateRefundCarryForward,
+    advance_given: p.advanceGiven,
+    advance_recovered: p.advanceRecovered,
+    advance_outstanding_before: p.advanceOutstandingBefore,
+    advance_outstanding_after: p.advanceOutstandingAfter,
     message: 'Invoice preview completed. No invoice was created.'
   };
 }
@@ -652,9 +844,8 @@ function payAiRequestProtectedAction_(ctx, args) {
   payAiActivateSpreadsheet_();
 
   if (action === 'create_invoice') {
-    payAiRequireFunction_('previewCustomerInvoiceFromControl');
-    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
-    previewInfo = payAiSummarizePreview_(previewCustomerInvoiceFromControl());
+    payAiRequireFunction_('previewCustomerInvoice');
+    previewInfo = payAiSummarizePreview_(previewCustomerInvoice(payAiInvoiceParamsFromArgs_(args)));
   } else if (action === 'set_customer_payout_fee') {
     const current = payAiGetCustomerRow_(args.customer_key);
     previewInfo = {
@@ -671,6 +862,16 @@ function payAiRequestProtectedAction_(ctx, args) {
     action: action,
     args: args,
     preview: previewInfo,
+    /*
+     * PIN xác nhận Ý ĐỊNH, không xác nhận SỐ TIỀN: giữa lúc xem preview và lúc
+     * gõ PIN có thể trôi qua vài phút, mà createCustomerInvoice() gọi
+     * syncCustomers_() trước khi dựng lại preview — và trigger giờ đồng bộ hai
+     * lần mỗi ngày. Dữ liệu PayPal mới rơi vào khoảng đó là hoá đơn được tạo
+     * khác với hoá đơn đã được duyệt, im lặng.
+     *
+     * Cất vân tay lúc duyệt để lúc thực thi có thể từ chối thay vì tạo bừa.
+     */
+    fingerprint: previewInfo && previewInfo.fingerprint ? String(previewInfo.fingerprint) : '',
     createdAt: Date.now(),
     expiresAt: Date.now() + PAYMENT_AI_CFG.PENDING_ACTION_TTL_MS,
     attempts: 0
@@ -718,15 +919,32 @@ function payAiExecutePendingAction_(chatId, rawPin) {
     return { ok: false, error: 'Wrong action PIN. Attempts remaining: ' + (PAYMENT_AI_CFG.MAX_PIN_ATTEMPTS - pending.attempts) };
   }
 
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    const result = payAiPerformProtectedAction_(pending.action, pending.args);
+  const execute = function() {
+    let result;
+    try {
+      result = payAiPerformProtectedAction_(pending.action, pending.args, pending.fingerprint);
+    } catch (err) {
+      /*
+       * Hỏng thì bỏ luôn pending, kể cả lỗi tạm như hết giờ chờ lock. Sau một
+       * lần tạo hoá đơn thất bại, không ai biết chắc nó đã đi tới đâu, nên bắt
+       * xem lại số rồi duyệt lại là đúng — dùng lại chữ ký duyệt cũ cho lần thử
+       * sau là biến PIN thành tấm séc khống.
+       */
+      props.deleteProperty(key);
+      throw err;
+    }
     props.deleteProperty(key);
     return { ok: true, action: pending.action, result: payAiJsonSafe_(result) };
-  } finally {
-    lock.releaseLock();
+  };
+
+  if (typeof paymentAllWithScriptLock_ === 'function') {
+    return paymentAllWithScriptLock_('payAiExecutePendingAction', execute);
   }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try { return execute(); }
+  finally { lock.releaseLock(); }
 }
 
 function payAiCancelPendingAction_(chatId) {
@@ -734,16 +952,28 @@ function payAiCancelPendingAction_(chatId) {
   return { ok: true, message: 'Pending protected action cancelled.' };
 }
 
-function payAiPerformProtectedAction_(action, args) {
+function payAiPerformProtectedAction_(action, args, approvedFingerprint) {
   payAiActivateSpreadsheet_();
 
   if (action === 'create_invoice') {
-    payAiRequireFunction_('previewCustomerInvoiceFromControl');
-    payAiRequireFunction_('createCustomerInvoiceFromControl');
-    payAiSetInvoiceControl_(args.customer_key, args.from_date, args.to_date, args.as_of_date);
-    const preview = previewCustomerInvoiceFromControl();
+    payAiRequireFunction_('previewCustomerInvoice');
+    payAiRequireFunction_('createCustomerInvoice');
+    const params = payAiInvoiceParamsFromArgs_(args);
+    const preview = previewCustomerInvoice(params);
     const previewSummary = payAiSummarizePreview_(preview);
-    const created = createCustomerInvoiceFromControl();
+
+    /*
+     * Chữ ký của bộ số đã được duyệt bằng PIN. createCustomerInvoice() dựng
+     * preview của riêng nó sau khi sync rồi so với chữ ký này; lệch thì nó ném
+     * lỗi thay vì tạo một hoá đơn khác với hoá đơn đã duyệt.
+     *
+     * Chỉ gắn khi thật sự có chữ ký. Đường gọi cũ không có thì hành vi giữ
+     * nguyên như trước — nhưng đường Telegram thì luôn có.
+     */
+    const expected = String(approvedFingerprint || '').trim();
+    if (expected) params.expected_fingerprint = expected;
+
+    const created = createCustomerInvoice(params);
     return { preview: previewSummary, created: payAiJsonSafe_(created) };
   }
 
@@ -802,6 +1032,8 @@ function payAiRequireFunction_(name) {
   const available = {
     syncFlow: typeof syncFlow === 'function',
     syncCustomers: typeof syncCustomers === 'function',
+    previewCustomerInvoice: typeof previewCustomerInvoice === 'function',
+    createCustomerInvoice: typeof createCustomerInvoice === 'function',
     previewCustomerInvoiceFromControl: typeof previewCustomerInvoiceFromControl === 'function',
     validateCustomerSystem: typeof validateCustomerSystem === 'function',
     createCustomerInvoiceFromControl: typeof createCustomerInvoiceFromControl === 'function'
@@ -824,9 +1056,21 @@ function payAiJsonSafe_(v) {
   catch (_) { return String(v); }
 }
 
+/*
+ * Không dùng instanceof: nó so theo constructor của từng realm, nên hỏng khi
+ * chạy trong sandbox test — và một phép kiểm mà test không xác minh được thì
+ * chẳng bảo vệ được gì. toString đúng ở mọi realm.
+ */
+function payAiIsDate_(v) {
+  return Object.prototype.toString.call(v) === '[object Date]';
+}
+
+
 function payAiToNumber_(v) {
   if (typeof v === 'number' && isFinite(v)) return v;
   if (v === null || v === undefined || v === '') return null;
+  /* Ngày tháng không phải số — xem chú thích ở custNum_ bên Customer.gs. */
+  if (payAiIsDate_(v)) return null;
   let s = String(v).trim().replace(/[^\d,.-]/g, '');
   if (!s) return null;
   if (s.indexOf(',') !== -1 && s.indexOf('.') !== -1) {

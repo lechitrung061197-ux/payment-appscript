@@ -2,3 +2,6 @@
 .clasprc.json
 node_modules/
 .DS_Store
+
+# Sheet exports carry Client ID / Client Secret in the Account tab.
+*.xlsx
